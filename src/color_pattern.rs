@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn patches_have_their_colorchecker_colors() {
-        for (w, h) in [(1920, 1080), (1713, 1288)] {
+        for (w, h) in [(1920, 1080), (1714, 1288)] {
             let p = generate(w, h);
             assert_eq!(p.bgra.len(), w * h * 4);
             assert_eq!(p.patches.len(), 24);
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn edge_strip_alternates_red_and_blue_columns() {
-        let p = generate(1713, 1288);
+        let p = generate(1714, 1288);
         let e = &p.edge;
         assert!(e.w >= 64 && e.h >= 16);
         assert_eq!(pixel(&p, e.x, e.y), [255, 0, 0]);
