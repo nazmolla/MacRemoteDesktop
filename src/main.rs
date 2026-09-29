@@ -38,6 +38,7 @@ mod keyboard_layout;
 mod lock_activity;
 mod logging;
 mod multitransport;
+mod negotiator;
 mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
