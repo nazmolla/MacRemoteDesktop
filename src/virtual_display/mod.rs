@@ -25,14 +25,15 @@ pub struct AppliedMode {
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    screen_is_locked, shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary,
-    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    online_display_facts, screen_is_locked, shield_keeps_physical_main,
+    take_detach_reenable_failed, virtual_display_available, CapturedPrimary, DetachedPrimary,
+    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    screen_is_locked, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
-    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    online_display_facts, screen_is_locked, take_detach_reenable_failed, virtual_display_available,
+    CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(target_os = "macos")]
@@ -53,6 +54,35 @@ mod macos {
     // it's fully applied — back-to-back configures on the same display can
     // race and reject the second with CGError 1001.
     const TX_SETTLE: Duration = Duration::from_millis(200);
+
+    /// Every online display with the facts the negotiator classifies on.
+    pub fn online_display_facts() -> Vec<crate::negotiator::host::OnlineDisplay> {
+        extern "C" {
+            fn CGGetOnlineDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+            fn CGDisplayIsBuiltin(display: u32) -> u32;
+            fn CGDisplayVendorNumber(display: u32) -> u32;
+        }
+        let mut ids = [0u32; 32];
+        let mut count = 0u32;
+        unsafe {
+            if CGGetOnlineDisplayList(32, ids.as_mut_ptr(), &mut count) != 0 {
+                return Vec::new();
+            }
+            ids[..count as usize]
+                .iter()
+                .map(|&id| crate::negotiator::host::OnlineDisplay {
+                    id,
+                    builtin: CGDisplayIsBuiltin(id) != 0,
+                    vendor: CGDisplayVendorNumber(id),
+                })
+                .collect()
+        }
+    }
+
+    /// Whether the private `CGVirtualDisplay` class exists on this macOS.
+    pub fn virtual_display_available() -> bool {
+        objc2::runtime::AnyClass::get("CGVirtualDisplay").is_some()
+    }
 
     /// Set true by `DetachedPrimary::drop` when its re-enable transaction is
     /// exhausted (the panel is left disabled). On macOS 26.x the CGS app-scoped
@@ -1682,6 +1712,13 @@ mod macos {
 #[cfg(not(target_os = "macos"))]
 mod stub {
     use anyhow::{anyhow, Result};
+
+    pub fn online_display_facts() -> Vec<crate::negotiator::host::OnlineDisplay> {
+        Vec::new()
+    }
+    pub fn virtual_display_available() -> bool {
+        false
+    }
 
     /// No detach path off macOS, so nothing ever leaves a panel stuck.
     pub fn take_detach_reenable_failed() -> bool {
