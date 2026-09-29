@@ -31,3 +31,11 @@ PASS 0 (manual stub)
 - Clipboard copy from Mac→Windows (text, image, file).
 - Visual sharpness at 150% scaling.
 - Lock screen with the privacy shield active.
+
+## Loopback run (2026-09-29, zero server flags)
+```
+PASS 1920x1080@100%
+PASS 3840x2160@200%
+PASS 3000x2000@150%
+PASS 1714x1288@100%
+```
