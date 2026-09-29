@@ -19,3 +19,5 @@ Cargo.lock.bak
 
 # Soak run logs (scripts/soak-lossy.sh)
 /soak-lossy-*.log
+
+perf-results/
