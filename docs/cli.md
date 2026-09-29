@@ -1,4 +1,6 @@
-# Commands & CLI reference
+# Commands & CLI reference - Fork note
+
+Fork note: This CLI documentation is forked from the original project.
 
 ```bash
 cargo build                    # debug build
