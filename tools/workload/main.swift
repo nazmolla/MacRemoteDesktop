@@ -71,6 +71,13 @@ guard args.count >= 3, let mode = Mode(rawValue: args[1]), let seconds = Double(
     FileHandle.standardError.write("usage: workload idle|typing|scroll|motion <seconds> [screen-name-substring]\n".data(using: .utf8)!)
     exit(2)
 }
+// A locked session never draws our window, so any measurement would be of the
+// lock screen. Refuse instead of producing plausible-looking numbers.
+if let session = CGSessionCopyCurrentDictionary() as? [String: Any],
+   (session["CGSSessionScreenIsLocked"] as? Bool) == true {
+    FileHandle.standardError.write("screen is locked; unlock the session before running a workload\n".data(using: .utf8)!)
+    exit(4)
+}
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 let screen: NSScreen
