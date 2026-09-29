@@ -189,6 +189,12 @@ impl ConnectionHandler for ActivityHandler {
             h.on_client_fingerprint(client_name, rdp_version, client_build, platform);
         }
     }
+
+    fn on_client_display(&mut self, info: &ironrdp_acceptor::ClientDisplayInfo) {
+        if let Some(h) = self.inner.as_mut() {
+            h.on_client_display(info);
+        }
+    }
 }
 
 #[cfg(test)]
