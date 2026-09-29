@@ -191,3 +191,11 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     upstreamable later. Heuristics: mstsc sends the real Windows build (e.g.
     22621) + its hostname; FreeRDP hardcodes build 2600. Informational
     fingerprinting only — a client can claim anything.
+
+(5) Client display info from GCC Client Core Data (MacRemoteDesktop fork, 2026-09-29;
+    upstreamable): new `ClientDisplayInfo { desktop_width, desktop_height,
+    desktop_scale_factor, device_scale_factor, physical_width_mm, physical_height_mm }`
+    (re-exported from lib.rs), captured in `BasicSettingsWaitInitial` next to divergence
+    (4), carried across `new_deactivation_reactivation`, and exposed as
+    `AcceptorResult::client_display`. Input for the fork's Session Negotiator (scale-aware
+    display sizing). Pure addition; no behavior change.

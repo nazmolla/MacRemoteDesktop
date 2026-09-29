@@ -171,6 +171,13 @@ pub trait ConnectionHandler: Send {
     fn on_client_fingerprint(&mut self, client_name: &str, rdp_version: u32, client_build: u32, platform: &str) {
         let _ = (client_name, rdp_version, client_build, platform);
     }
+
+    /// (vendored) Client display info from the GCC Core Data (scale factors,
+    /// physical size, requested desktop size), once per connection, right after
+    /// `on_client_fingerprint`. Default: ignore.
+    fn on_client_display(&mut self, info: &ironrdp_acceptor::ClientDisplayInfo) {
+        let _ = info;
+    }
 }
 
 #[derive(Clone)]
@@ -3415,6 +3422,7 @@ impl RdpServer {
                     result.client_build,
                     &platform,
                 );
+                handler.borrow_mut().on_client_display(&result.client_display);
             }
         }
 

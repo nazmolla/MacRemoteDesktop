@@ -1926,3 +1926,9 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     (live session + a silent candidate + session end → a later client must
     still be served), verified to fail without the fix — it times out with
     "the loop never accepted it" — and pass with it.
+
+(24-fork) `ConnectionHandler::on_client_display(&ClientDisplayInfo)` (MacRemoteDesktop
+    fork, 2026-09-29; upstreamable). Default no-op trait method, called once per
+    non-reactivation connection immediately after `on_client_fingerprint`, delivering
+    acceptor divergence (5). Numbered "-fork" to avoid colliding with upstream macrdp's
+    own pending (24)/(25) claims (see TODO.md).
