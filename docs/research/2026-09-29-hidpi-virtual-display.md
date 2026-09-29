@@ -31,3 +31,12 @@ Result (variant a): `current = 800×600 points @ 1600×1200 pixels`,
 | 100% | `P × Q` | 1× `P×Q` | as is |
 | 200% | `P/2 × Q/2` | Retina twin (`P×Q` pixels) | as is — pixel-exact |
 | 125–175% | `P/s × Q/s` | Retina twin (`2P/s × 2Q/s` pixels) | ScreenCaptureKit output size `P×Q` (GPU downscale) |
+
+## Integration findings (Phase 1, Task 4)
+- `core_graphics` 0.24 `CGDisplayMode::all_display_modes` double-releases modes (SIGSEGV); raw FFI with balanced retains is used instead.
+- Without a descriptor `queue`, display updates target the main run loop, which a tokio process never pumps; a global dispatch queue is set.
+- `CGDisplayPixelsWide` reports points for Retina modes; backing size is read from the current mode's pixel width.
+- Selecting a mode with `kCGConfigureForSession` pins the mode list — later re-modes never publish new modes. App scope is used.
+- While an app-scoped mode override exists, re-applying settings has no effect; `CGRestorePermanentDisplayConfiguration()` is called before each re-apply. Side effect: it also resets other app-scoped display configs of the process (e.g. `--detach-primary`'s panel disable). The Negotiator blanks physical panels with the window-based shield instead, so only the hidden `--detach-primary` override is affected.
+- A second virtual display created in the same process after the first is released never comes online (also reproduced in Swift). Multi-monitor (Phase 4) must create all displays up front or run displays out of process. Display integration tests therefore run one per process.
+- Mode lists publish asynchronously (tens of ms to ~5 s); selection polls for up to 2 s per attempt.
