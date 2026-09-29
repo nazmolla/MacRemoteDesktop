@@ -14,3 +14,5 @@ Resolve conflicts in favor of upstream unless the file appears in the divergence
 |---|------|--------|--------|---------------|
 | F1 | `.github/workflows/*.yml` | macOS jobs on PR/dispatch only; release on dispatch only; security weekly | Private-repo CI minutes (macOS bills 10×) | No |
 | F2 | `src/h264.rs` | `avcc_to_annex_b` → `pub(crate)` | Reused by the color round-trip harness | Yes (trivial) |
+| F3 | `vendor/ironrdp-acceptor` | divergence (5): `ClientDisplayInfo` on `AcceptorResult` | Negotiator needs client scale/physical size | Yes |
+| F4 | `vendor/ironrdp-server` | `ConnectionHandler::on_client_display` hook (24-fork) | Deliver `ClientDisplayInfo` to the app | Yes |

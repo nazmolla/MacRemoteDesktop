@@ -349,11 +349,20 @@ async fn connect_client<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
+    connect_client_cfg(client_io, client_config(client_w, client_h)).await
+}
+
+/// [`connect_client`] with a caller-built client `Config` (e.g. to send a
+/// desktop scale factor).
+async fn connect_client_cfg<S>(
+    client_io: S,
+    config: Config,
+) -> anyhow::Result<((u16, u16), TokioFramed<tokio_rustls::client::TlsStream<S>>)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
     // pre-TLS negotiation
-    let mut connector = ClientConnector::new(
-        client_config(client_w, client_h),
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-    );
+    let mut connector = ClientConnector::new(config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     let mut framed = TokioFramed::new(client_io);
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
     let initial = framed.into_inner_no_leftover();
@@ -1138,4 +1147,63 @@ fn wheel_rotation_survives_the_pdu_round_trip_in_both_directions() {
             other => panic!("expected VerticalScroll for {units}, got {other:?}"),
         }
     }
+}
+
+/// Records the `ClientDisplayInfo` the server hands to the application.
+struct RecordClientDisplay {
+    seen: Arc<std::sync::Mutex<Option<ironrdp_acceptor::ClientDisplayInfo>>>,
+}
+
+impl ConnectionHandler for RecordClientDisplay {
+    fn on_client_display(&mut self, info: &ironrdp_acceptor::ClientDisplayInfo) {
+        *self.seen.lock().unwrap() = Some(info.clone());
+    }
+}
+
+/// The client's GCC Core Data scale factor and requested size must reach the
+/// application's `ConnectionHandler` (the Negotiator's input, spec §6).
+#[tokio::test]
+async fn client_display_info_reaches_the_connection_handler() -> anyhow::Result<()> {
+    init_tracing();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 0))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(TestInput)
+        .with_display_handler(TestDisplay {
+            size: ServerDesktopSize {
+                width: 1024,
+                height: 768,
+            },
+        })
+        .with_bitmap_codecs(crate::bitmap_codecs())
+        .with_connection_handler(Some(Box::new(RecordClientDisplay {
+            seen: Arc::clone(&seen),
+        })))
+        .build();
+    server.set_honor_client_desktop_size(true);
+
+    let mut cfg = client_config(1920, 1080);
+    cfg.desktop_scale_factor = 150;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let r = connect_client_cfg(client_io, cfg).await;
+            server_task.abort();
+            r.map(|_| ())
+        })
+        .await?;
+
+    let got = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("on_client_display called");
+    assert_eq!(got.desktop_scale_factor, Some(150));
+    assert_eq!((got.desktop_width, got.desktop_height), (1920, 1080));
+    Ok(())
 }

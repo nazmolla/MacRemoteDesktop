@@ -25,6 +25,20 @@ use crate::util::{self, wrap_share_data};
 const IO_CHANNEL_ID: u16 = 1003;
 const USER_CHANNEL_ID: u16 = 1002;
 
+/// (vendored) divergence (5): the client's display description from its GCC
+/// Client Core Data. Informational — the server decides what to honor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientDisplayInfo {
+    pub desktop_width: u16,
+    pub desktop_height: u16,
+    /// Desktop scale factor in percent (100–500), if sent.
+    pub desktop_scale_factor: Option<u32>,
+    /// Device scale factor in percent (100, 140 or 180), if sent.
+    pub device_scale_factor: Option<u32>,
+    pub physical_width_mm: Option<u32>,
+    pub physical_height_mm: Option<u32>,
+}
+
 pub struct Acceptor {
     pub(crate) state: AcceptorState,
     security: SecurityProtocol,
@@ -48,6 +62,9 @@ pub struct Acceptor {
     client_name: String,
     client_version: u32,
     client_build: u32,
+    // (vendored) divergence (5): client display info (GCC Core Data) for
+    // server-side session negotiation (scale factors, physical size).
+    client_display: ClientDisplayInfo,
     // (vendored) The UDP multitransport (MS-RDPEMT) offer to send, if any. When
     // set, the acceptor advertises SC_MULTITRANSPORT and emits a Server Initiate
     // Multitransport Request after licensing (before Demand Active) on the message
@@ -137,6 +154,9 @@ pub struct AcceptorResult {
     pub client_name: String,
     pub client_version: u32,
     pub client_build: u32,
+    /// (vendored) divergence (5): what the client told us about its display in
+    /// the GCC Client Core Data (requested size, scale factors, physical size).
+    pub client_display: ClientDisplayInfo,
     /// (vendored) The UDP multitransport offer the acceptor actually emitted
     /// (offer set AND client advertised the transport); `None` if nothing sent.
     pub multitransport_offered: Option<MultitransportOffer>,
@@ -185,6 +205,7 @@ impl Acceptor {
             client_name: String::new(),
             client_version: 0,
             client_build: 0,
+            client_display: ClientDisplayInfo::default(),
             multitransport_offer: None,
             multitransport_offered: None,
         }
@@ -286,6 +307,7 @@ impl Acceptor {
             client_name: consumed.client_name,
             client_version: consumed.client_version,
             client_build: consumed.client_build,
+            client_display: consumed.client_display,
             multitransport_offer: consumed.multitransport_offer,
             multitransport_offered: consumed.multitransport_offered,
         })
@@ -377,6 +399,7 @@ impl Acceptor {
                 client_name: self.client_name.clone(),
                 client_version: self.client_version,
                 client_build: self.client_build,
+                client_display: self.client_display.clone(),
                 multitransport_offered: self.multitransport_offered,
                 reactivation: self.reactivation,
                 credentials: self.received_credentials.take(),
@@ -646,6 +669,16 @@ impl Sequence for Acceptor {
                 self.client_name = gcc_blocks.core.client_name.clone();
                 self.client_version = gcc_blocks.core.version.0;
                 self.client_build = gcc_blocks.core.client_build;
+                // (vendored) divergence (5): client display info for server-side negotiation.
+                let od = &gcc_blocks.core.optional_data;
+                self.client_display = ClientDisplayInfo {
+                    desktop_width: gcc_blocks.core.desktop_width,
+                    desktop_height: gcc_blocks.core.desktop_height,
+                    desktop_scale_factor: od.desktop_scale_factor,
+                    device_scale_factor: od.device_scale_factor,
+                    physical_width_mm: od.desktop_physical_width,
+                    physical_height_mm: od.desktop_physical_height,
+                };
 
                 // Adopt the client's requested desktop size (from its Client
                 // Core Data) before Demand Active is sent, so the session is
