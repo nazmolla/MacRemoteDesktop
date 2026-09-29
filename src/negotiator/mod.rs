@@ -3,3 +3,5 @@
 //! every decision. No macOS calls, no I/O — everything here is unit-tested.
 
 pub mod display;
+pub mod host;
+pub mod session;
