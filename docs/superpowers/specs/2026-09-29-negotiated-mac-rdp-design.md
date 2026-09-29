@@ -80,14 +80,15 @@ The user is whoever authenticated via NLA/CredSSP. The broker validates credenti
 | 1 | User A connects; nobody logged in | Broker authenticates A, creates A's session headless, hands off |
 | 2 | A connects; A's session exists | Attach; apps remain as left |
 | 3 | A connects from a second client | Take over; older connection closed with a reason |
-| 4 | B connects while A is active | **Goal:** separate simultaneous session. **Guaranteed fallback:** B's session brought forward, A's keeps running in background (Fast User Switching) |
+| 4 | B connects while A is active | **Target:** separate simultaneous session (shipped by ARD and Jump Desktop, so expected achievable). **Fallback only if the mechanism proves unusable for us:** B's session brought forward, A's keeps running in background (Fast User Switching) |
 | 5 | Bad credentials / user not allowed | Rejected at NLA; rate-limit + lockout (inherited) |
 | 6 | Client disconnects | Session persists; lock-on-disconnect per policy; reconnect resumes |
 | 7 | User logs out in-session | Session ends; connection closes cleanly |
 | 8 | Reboot with FileVault on | Unreachable until unlocked; status app + docs explain `fdesetup authrestart` and SSH FileVault unlock |
 
 ### 5.3 Risks to resolve in the Phase 0 spike
-- Creating simultaneous non-console GUI sessions (private API, as used by Apple Screen Sharing).
+Simultaneous multi-user remoting is **proven feasible on macOS by existing products**: Apple Remote Desktop / Screen Sharing and Jump Desktop both support multiple users connected in parallel, each in their own session. The spike therefore answers **how** (which mechanism, what it costs us), not **whether**.
+- Mechanism for creating simultaneous non-console GUI sessions (study how Screen Sharing and Jump Desktop Connect do it; private API expected).
 - Creating `CGVirtualDisplay`s and injecting input inside a background session.
 - Per-user TCC (Screen Recording, Accessibility) and whether a product needs an MDM PPPC profile.
 - Apple macOS license terms on remote/multi-user access (legal review before sale).
@@ -233,7 +234,7 @@ Default in personal mode: all on. Any row can be disabled by policy.
 ## 14. Delivery phases (each gets its own implementation plan)
 | Phase | Scope | Exit criterion |
 |---|---|---|
-| 0 Foundation + spike | Fork into this repo; working branding; CI; color harness; performance harness with baselines incl. Jump Desktop; **throwaway spike** for §5.3 risks; submit Apple entitlement requests | Baselines recorded; spike verdict on simultaneous sessions |
+| 0 Foundation + spike | Fork into this repo; working branding; CI; color harness; performance harness with baselines incl. Jump Desktop; **throwaway spike** for §5.3 risks; submit Apple entitlement requests | Baselines recorded; spike identifies the working mechanism for simultaneous sessions |
 | 1 Negotiator + headless single user | Negotiator replaces flags; sRGB virtual displays; windowed resize; mixed-DPI scaling; headless detection; clipboard verified both ways | Daily use from the ultrawide windowed setup with no config |
 | 2 Color + speed | Dirty-region encode; AVC444 end-to-end; lossless refinement; low-latency encoder; zero-copy GPU path; client-load feedback; color + perf gates in CI | Bit-exact static content; budgets met; lighter than Jump on the client |
 | 3 Broker + multi-user | Root broker; PAM login as credentialed user; socket handoff; scenarios 1–8 (simultaneous or fallback per spike) | All §5.2 scenarios pass on real mstsc |
