@@ -18,6 +18,10 @@ mod capture;
 mod clipboard;
 mod clipboard_rich;
 #[cfg(test)]
+mod color_metrics;
+#[cfg(test)]
+mod color_pattern;
+#[cfg(test)]
 mod conn_test;
 mod cursor;
 #[cfg(target_os = "macos")]
