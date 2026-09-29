@@ -2543,6 +2543,35 @@ fn args_from_config(path: &Path) -> Result<Args> {
         .with_context(|| format!("config file {} produced invalid settings", path.display()))
 }
 
+/// Turn on the features the Session Negotiator chooses by default (spec §2,
+/// §6.3). Flags can only switch features ON, so an explicit flag is never
+/// overridden; `MACRDP_NEGOTIATE=0` keeps upstream's flag-only behaviour.
+/// Returns the reasons to log.
+fn apply_negotiated_defaults(args: &mut Args, host: &negotiator::session::HostCaps) -> Vec<String> {
+    let d = negotiator::session::connect_defaults(host);
+    let mut reasons = d.reasons.clone();
+    args.enable_h264 |= d.enable_h264;
+    args.adaptive_bitrate |= d.adaptive_bitrate;
+    args.enable_udp_multitransport |= d.udp_multitransport;
+    let size_pinned = args.width.is_some() || args.height.is_some() || args.hidpi;
+    if d.virtual_display && !size_pinned {
+        args.virtual_display = true;
+        // Placeholder until a client connects; its requested size replaces it
+        // (client-resolution auto-adopt re-modes the virtual display).
+        args.width = Some(1920);
+        args.height = Some(1080);
+    }
+    let mode_chosen = args.detach_primary || args.capture_primary || args.shield_primary;
+    if args.virtual_display && host.physical_displays > 0 && !mode_chosen {
+        args.shield_primary = true;
+        reasons.push(format!(
+            "privacy: shielding {} physical display(s) while a client is connected",
+            host.physical_displays
+        ));
+    }
+    reasons
+}
+
 async fn async_main() -> Result<()> {
     let mut args = Args::parse();
     // If launched with `--config <file>` (the LaunchAgent path), the file is the
@@ -2550,6 +2579,18 @@ async fn async_main() -> Result<()> {
     if let Some(cfg_path) = args.config.clone() {
         args = args_from_config(&cfg_path)?;
     }
+    let negotiation_reasons = if std::env::var("MACRDP_NEGOTIATE").as_deref() == Ok("0") {
+        vec!["negotiation disabled (MACRDP_NEGOTIATE=0): flags only".to_owned()]
+    } else {
+        let host = negotiator::session::HostCaps {
+            physical_displays: negotiator::host::physical_displays(
+                &virtual_display::online_display_facts(),
+            )
+            .len(),
+            virtual_display_available: virtual_display::virtual_display_available(),
+        };
+        apply_negotiated_defaults(&mut args, &host)
+    };
 
     // Research spike (Phase-1b USB-redirection go/no-go): run the UserHCI probe
     // and exit before any server/auth/capture setup. Requires the signed+
@@ -2598,6 +2639,9 @@ async fn async_main() -> Result<()> {
         }
     });
     logging::init(filter, args.log_dir.as_deref(), audit_file.as_deref());
+    for reason in &negotiation_reasons {
+        tracing::info!(target: "macrdp::negotiator", "{reason}");
+    }
 
     // Sweep leftovers from a PRIOR macrdp that died uncleanly (SIGKILL / panic /
     // power-loss skip Drop AND the signal handler, stranding NFS mounts + paste
@@ -3747,6 +3791,68 @@ mod lock_on_disconnect_tests {
 
 #[cfg(test)]
 mod auto_unlock_flag_tests {
+    #[test]
+    fn negotiated_defaults_turn_features_on_and_respect_pins() {
+        use crate::negotiator::session::HostCaps;
+        use clap::Parser as _;
+        let mut a = super::Args::try_parse_from(["macrdp"]).unwrap();
+        let r = super::apply_negotiated_defaults(
+            &mut a,
+            &HostCaps {
+                physical_displays: 0,
+                virtual_display_available: true,
+            },
+        );
+        assert!(
+            a.enable_h264 && a.adaptive_bitrate && a.enable_udp_multitransport && a.virtual_display
+        );
+        assert!(!a.shield_primary);
+        assert!(!r.is_empty());
+
+        let mut a = super::Args::try_parse_from(["macrdp"]).unwrap();
+        super::apply_negotiated_defaults(
+            &mut a,
+            &HostCaps {
+                physical_displays: 1,
+                virtual_display_available: true,
+            },
+        );
+        assert!(a.shield_primary);
+
+        let mut a =
+            super::Args::try_parse_from(["macrdp", "--capture-primary", "--virtual-display"])
+                .unwrap();
+        super::apply_negotiated_defaults(
+            &mut a,
+            &HostCaps {
+                physical_displays: 1,
+                virtual_display_available: true,
+            },
+        );
+        assert!(!a.shield_primary, "an explicit headless mode is kept");
+
+        let mut a =
+            super::Args::try_parse_from(["macrdp", "--width", "1920", "--height", "1080"]).unwrap();
+        super::apply_negotiated_defaults(
+            &mut a,
+            &HostCaps {
+                physical_displays: 0,
+                virtual_display_available: true,
+            },
+        );
+        assert!(!a.virtual_display, "a pinned size keeps mirror capture");
+
+        let mut a = super::Args::try_parse_from(["macrdp"]).unwrap();
+        super::apply_negotiated_defaults(
+            &mut a,
+            &HostCaps {
+                physical_displays: 1,
+                virtual_display_available: false,
+            },
+        );
+        assert!(!a.virtual_display && !a.shield_primary);
+    }
+
     #[test]
     fn parses_as_a_plain_opt_in_flag() {
         use clap::Parser;
