@@ -1,0 +1,32 @@
+[package]
+name = "ironrdp-rdpeudp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "MS-RDPEUDP / MS-RDPEUDP2 wire types + reliability state machine for RDP UDP multitransport (macrdp, candidate for upstream)"
+publish = false
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+# Property-based testing of the reliability state machine: randomized adversarial
+# scheduling (loss / reorder / dup / window / sequence-wraparound) with shrinking,
+# complementing the hand-written fixed-seed simulation in `state.rs`.
+proptest = "1"
+
+[dependencies]
+# Resolved to the same git-pinned IronRDP rev as the rest of macrdp: in the
+# macrdp build, the ROOT Cargo.toml's [patch.crates-io] redirects this; built
+# STANDALONE (cargo test --manifest-path …) the [patch] block below applies. The
+# two resolve to the same rev, so the crate behaves identically either way.
+# `alloc` gives encode_vec / decode (used by the codecs + tests). macrdp's build
+# enables it transitively; the standalone build needs it explicitly.
+ironrdp-core = { version = "0.2", features = ["alloc"] }
+bitflags = "2"
+
+[patch.crates-io]
+# Honored only when this crate is built as the top-level (standalone tests).
+# Ignored when it's a path dependency of macrdp (the root's [patch] wins). Keep
+# the rev in sync with the root Cargo.toml.
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }

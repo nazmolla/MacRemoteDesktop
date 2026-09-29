@@ -1,0 +1,12 @@
+MacRemoteDesktop (working name)
+Copyright (c) 2026 Mohamed Abdelsalam
+
+This product is a fork of macrdp (https://github.com/clintcan/macrdp),
+Copyright (c) the macrdp contributors, licensed under MIT OR Apache-2.0.
+
+It includes vendored and modified crates from IronRDP
+(https://github.com/Devolutions/IronRDP), Copyright (c) Devolutions Inc.,
+licensed under MIT OR Apache-2.0.
+
+Portions of src/avc444.rs are ported from FreeRDP
+(https://github.com/FreeRDP/FreeRDP), licensed under Apache-2.0.
