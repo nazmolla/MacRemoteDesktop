@@ -1,3 +1,7 @@
+> **Fork notice.** This is a private fork of [macrdp](https://github.com/clintcan/macrdp) being restructured into a negotiated, headless-first RDP server for macOS. See [FORK.md](FORK.md) and the [design spec](docs/superpowers/specs/2026-09-29-negotiated-mac-rdp-design.md). Upstream README follows unchanged.
+
+---
+
 # macrdp
 
 [![Latest release](https://img.shields.io/github/v/release/clintcan/macrdp?sort=semver&label=release)](https://github.com/clintcan/macrdp/releases/latest)

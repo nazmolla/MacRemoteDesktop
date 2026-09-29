@@ -1,3 +1,13 @@
+# Fork context (read first)
+
+- This repo is a fork of clintcan/macrdp. The target architecture is in `docs/superpowers/specs/2026-09-29-negotiated-mac-rdp-design.md`; the active plan is under `docs/superpowers/plans/`.
+- Record every deliberate difference from upstream code in `FORK.md` → Divergence log.
+- Guiding rule: sessions are configured by negotiation with the client, not flags. New code must not add user-facing flags.
+- Performance and color accuracy are hard requirements (spec §8, §9).
+- Upstream's own guidance follows unchanged.
+
+---
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.

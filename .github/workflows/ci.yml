@@ -10,6 +10,7 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -77,6 +78,7 @@ jobs:
   test-macos:
     name: test (macos)
     runs-on: macos-14   # Apple Silicon
+    if: github.event_name != 'push'
     timeout-minutes: 30
     steps:
       - name: Harden runner
@@ -119,6 +121,7 @@ jobs:
   audit-integration:
     name: audit log (macos integration)
     runs-on: macos-14
+    if: github.event_name != 'push'
     timeout-minutes: 25
     steps:
       - name: Harden runner

@@ -35,7 +35,7 @@ on:
       - '.github/workflows/security.yml'
   schedule:
     # 07:12 UTC daily. Off the hour so it isn't in the top-of-hour runner surge.
-    - cron: '12 7 * * *'
+    - cron: '12 7 * * 1'
   workflow_dispatch:
 
 permissions:
