@@ -3249,6 +3249,9 @@ async fn async_main() -> Result<()> {
     // `vendor/ironrdp-server` `display_suppressed` plumbing.
     let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Negotiator (spec §6): what the client advertised at handshake, shared
+    // between the connection-handler decorator and the display path.
+    let client_advert = std::sync::Arc::new(negotiator::handler::ClientAdvert::default());
     let display = CaptureDisplay {
         desktop_size: desktop_size.clone(),
         auto_size,
@@ -3296,6 +3299,8 @@ async fn async_main() -> Result<()> {
         } else {
             None
         },
+        client_advert: Some(client_advert.clone()),
+        applied_plan: None,
     };
 
     // Shared cell the server fills with the connecting client's keyboard-layout
@@ -3391,6 +3396,16 @@ async fn async_main() -> Result<()> {
         )),
         None => conn_handler,
     };
+    let conn_handler = Some(negotiator::handler::NegotiationHandler::wrap(
+        conn_handler,
+        client_advert.clone(),
+        if args.map_ctrl_to_cmd {
+            Some(true)
+        } else {
+            None
+        },
+        input::set_map_ctrl_to_cmd,
+    ));
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)

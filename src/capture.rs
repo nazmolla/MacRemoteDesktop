@@ -431,6 +431,11 @@ pub struct CaptureDisplay {
     /// `--shield-primary` is active.
     pub shielded_primary:
         Option<Arc<std::sync::Mutex<Option<crate::virtual_display::ShieldedPrimary>>>>,
+    /// Client-advertised scale/platform from the negotiator's handshake hook.
+    /// `None` = negotiator not wired (tests / legacy paths).
+    pub client_advert: Option<Arc<crate::negotiator::handler::ClientAdvert>>,
+    /// Display plan currently applied to the virtual display.
+    pub applied_plan: Option<crate::negotiator::display::DisplayPlan>,
 }
 
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
@@ -583,6 +588,16 @@ impl RdpServerDisplay for CaptureDisplay {
         };
 
         let (w, h) = monitor.dimensions();
+        // Record the scale the client reports for this monitor (spec §7.2) and,
+        // when only the scale changed (window dragged to a monitor with another
+        // DPI), still request a re-mode at the current size.
+        let scale_changed = match self.client_advert.as_ref() {
+            Some(advert) => {
+                let new_scale = monitor.desktop_scale_factor().unwrap_or(0);
+                advert.scale_pct.swap(new_scale, Ordering::Relaxed) != new_scale
+            }
+            None => false,
+        };
         let (Ok(mut width), Ok(mut height)) = (u16::try_from(w), u16::try_from(h)) else {
             tracing::warn!(
                 w,
@@ -601,6 +616,14 @@ impl RdpServerDisplay for CaptureDisplay {
         let Some(adopted) =
             adopt_client_size(resizable, (cur_w, cur_h), DesktopSize { width, height })
         else {
+            if scale_changed {
+                tracing::info!(
+                    cur_w,
+                    cur_h,
+                    "client scale changed — re-planning the display (debounced)"
+                );
+                self.pending_resize.request(cur_w, cur_h);
+            }
             return; // no-op: unchanged, or outside the protocol-legal band
         };
 
@@ -641,11 +664,41 @@ impl CaptureDisplay {
             return (width, height);
         };
         let mut vd = vd.lock().expect("virtual display mutex poisoned");
-        let (cur_w, cur_h) = vd.size_pts();
-        if (cur_w as u16, cur_h as u16) == (width, height) {
-            return (width, height);
+        let plan = self.client_advert.as_ref().map(|advert| {
+            crate::negotiator::display::plan_display(crate::negotiator::display::ClientMonitor {
+                width_px: u32::from(width),
+                height_px: u32::from(height),
+                desktop_scale_pct: advert.scale_pct.load(Ordering::Relaxed),
+            })
+        });
+        let result = match plan.as_ref() {
+            Some(p) => {
+                if self.applied_plan.as_ref() == Some(p) {
+                    return (width, height);
+                }
+                vd.apply_plan(p).map(|applied| {
+                    tracing::info!(
+                        target: "macrdp::negotiator",
+                        reason = %p.reason,
+                        fell_back_to_one_x = applied.fell_back_to_one_x,
+                        pixels_w = applied.pixels_w,
+                        pixels_h = applied.pixels_h,
+                        "display: plan applied"
+                    );
+                })
+            }
+            None => {
+                let (cur_w, cur_h) = vd.size_pts();
+                if (cur_w as u16, cur_h as u16) == (width, height) {
+                    return (width, height);
+                }
+                vd.resize(u32::from(width), u32::from(height))
+            }
+        };
+        if result.is_ok() {
+            self.applied_plan = plan;
         }
-        match vd.resize(u32::from(width), u32::from(height)) {
+        match result {
             Ok(()) => {
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
@@ -787,7 +840,15 @@ impl CaptureDisplay {
                 (width, height)
             }
             Err(e) => {
-                let (w, h) = (cur_w as u16, cur_h as u16);
+                // Keep serving what the display currently shows: the last applied
+                // plan's client-pixel size, else the display's own size.
+                let (w, h) = match self.applied_plan.as_ref() {
+                    Some(p) => (p.capture_w as u16, p.capture_h as u16),
+                    None => {
+                        let (cur_w, cur_h) = vd.size_pts();
+                        (cur_w as u16, cur_h as u16)
+                    }
+                };
                 tracing::warn!(
                     error = ?e,
                     requested_w = width,
