@@ -10,6 +10,10 @@
 @property (nonatomic) unsigned int productID;
 @property (nonatomic) unsigned int vendorID;
 @property (nonatomic) unsigned int serialNum;
+@property (nonatomic) CGPoint redPrimary;
+@property (nonatomic) CGPoint greenPrimary;
+@property (nonatomic) CGPoint bluePrimary;
+@property (nonatomic) CGPoint whitePoint;
 @end
 
 @interface CGVirtualDisplayMode : NSObject

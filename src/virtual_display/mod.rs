@@ -12,6 +12,17 @@
 #[cfg(target_os = "macos")]
 mod private_api;
 
+/// The virtual display mode actually in effect after [`VirtualDisplay::apply_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedMode {
+    pub points_w: u32,
+    pub points_h: u32,
+    pub pixels_w: u32,
+    pub pixels_h: u32,
+    /// The Retina switch failed and the display was set to 1× at client pixels.
+    pub fell_back_to_one_x: bool,
+}
+
 #[cfg(target_os = "macos")]
 pub use macos::{
     screen_is_locked, shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary,
@@ -146,6 +157,65 @@ mod macos {
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
             })
+        }
+
+        /// Create a display sized and scaled per a negotiated [`DisplayPlan`]
+        /// (Retina twin selected when `plan.hidpi`, sRGB primaries always).
+        pub fn new_planned(plan: &crate::negotiator::display::DisplayPlan) -> Result<Self> {
+            let mut vd = Self::new(plan.points_w, plan.points_h, 60)?;
+            vd.apply_plan(plan)?;
+            Ok(vd)
+        }
+
+        /// Switch to a negotiated plan. If the Retina variant can't be made
+        /// active, fall back to 1× at the client's pixel size (never a silently
+        /// mis-sized display) and report it.
+        pub fn apply_plan(
+            &mut self,
+            plan: &crate::negotiator::display::DisplayPlan,
+        ) -> Result<super::AppliedMode> {
+            let first = self
+                ._handle
+                .apply_points_mode(plan.points_w, plan.points_h, plan.hidpi);
+            let (mode, fell_back) = match first {
+                Ok(m) => (m, false),
+                Err(e) if plan.hidpi => {
+                    tracing::warn!(
+                        error = %e,
+                        points_w = plan.points_w,
+                        points_h = plan.points_h,
+                        "Retina mode unavailable — falling back to 1× at client pixels"
+                    );
+                    let m = self
+                        ._handle
+                        .apply_mode_one_x_legacy(plan.capture_w, plan.capture_h)
+                        .context("1× fallback mode")?;
+                    (m, true)
+                }
+                Err(e) => return Err(e.context("applying virtual display plan")),
+            };
+            self.refresh_bounds();
+            Ok(super::AppliedMode {
+                points_w: mode.0,
+                points_h: mode.1,
+                pixels_w: mode.2,
+                pixels_h: mode.3,
+                fell_back_to_one_x: fell_back,
+            })
+        }
+
+        /// The display's framebuffer size in pixels (2× points in Retina modes).
+        pub fn backing_pixels(&self) -> (u32, u32) {
+            // Not CGDisplayPixelsWide: it reports points for Retina modes.
+            private_api::current_mode(self.display_id)
+                .map(|(_, _, pw, ph)| (pw, ph))
+                .unwrap_or((0, 0))
+        }
+
+        fn refresh_bounds(&mut self) {
+            let bounds = CGDisplay::new(self.display_id).bounds();
+            self.origin_pts = (bounds.origin.x, bounds.origin.y);
+            self.size_pts = (bounds.size.width, bounds.size.height);
         }
 
         pub fn display_id(&self) -> u32 {
@@ -1633,6 +1703,18 @@ mod stub {
                  different target"
             ))
         }
+        pub fn new_planned(_plan: &crate::negotiator::display::DisplayPlan) -> Result<Self> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
+        pub fn apply_plan(
+            &mut self,
+            _plan: &crate::negotiator::display::DisplayPlan,
+        ) -> Result<super::AppliedMode> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
+        pub fn backing_pixels(&self) -> (u32, u32) {
+            (0, 0)
+        }
         pub fn display_id(&self) -> u32 {
             0
         }
@@ -1686,5 +1768,99 @@ mod stub {
         pub fn reassert_blanking(&self) -> usize {
             0
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod planned_tests {
+    use super::VirtualDisplay;
+    use crate::negotiator::display::{plan_display, ClientMonitor, DisplayPlan};
+
+    fn plan(w: u32, h: u32, s: u32) -> DisplayPlan {
+        plan_display(ClientMonitor {
+            width_px: w,
+            height_px: h,
+            desktop_scale_pct: s,
+        })
+    }
+
+    /// Convert pure red from the display's colour space into sRGB.
+    fn srgb_red_in_display_space(id: u32) -> [f64; 3] {
+        use core_foundation::base::TCFType;
+        use core_foundation::string::CFString;
+        type CGColorSpaceRef = *const std::ffi::c_void;
+        type CGColorRef = *const std::ffi::c_void;
+        extern "C" {
+            fn CGDisplayCopyColorSpace(display: u32) -> CGColorSpaceRef;
+            fn CGColorSpaceCreateWithName(
+                name: core_foundation::string::CFStringRef,
+            ) -> CGColorSpaceRef;
+            fn CGColorCreate(space: CGColorSpaceRef, components: *const f64) -> CGColorRef;
+            fn CGColorCreateCopyByMatchingToColorSpace(
+                space: CGColorSpaceRef,
+                intent: i32,
+                color: CGColorRef,
+                options: *const std::ffi::c_void,
+            ) -> CGColorRef;
+            fn CGColorGetComponents(color: CGColorRef) -> *const f64;
+        }
+        unsafe {
+            let disp = CGDisplayCopyColorSpace(id);
+            let srgb = CGColorSpaceCreateWithName(
+                CFString::new("kCGColorSpaceSRGB").as_concrete_TypeRef(),
+            );
+            let red = CGColorCreate(disp, [1.0, 0.0, 0.0, 1.0].as_ptr());
+            // 1 = kCGRenderingIntentRelativeColorimetric
+            let conv = CGColorCreateCopyByMatchingToColorSpace(srgb, 1, red, std::ptr::null());
+            let c = CGColorGetComponents(conv);
+            [*c, *c.add(1), *c.add(2)]
+        }
+    }
+
+    #[test]
+    #[ignore = "needs WindowServer; run: cargo test -- --ignored planned_tests --test-threads=1"]
+    fn retina_plan_gets_2x_backing() {
+        let vd = VirtualDisplay::new_planned(&plan(2560, 1440, 200)).expect("create");
+        assert_eq!(vd.size_pts(), (1280.0, 720.0));
+        assert_eq!(vd.backing_pixels(), (2560, 1440));
+    }
+
+    #[test]
+    #[ignore = "needs WindowServer"]
+    fn one_x_plan_is_one_to_one() {
+        let vd = VirtualDisplay::new_planned(&plan(1714, 1288, 100)).expect("create");
+        assert_eq!(vd.backing_pixels(), (1714, 1288));
+    }
+
+    #[test]
+    #[ignore = "needs WindowServer"]
+    fn select_mode_verifies_and_falls_back() {
+        let mut vd = VirtualDisplay::new_planned(&plan(1920, 1080, 100)).expect("create");
+        let applied = vd.apply_plan(&plan(3000, 2000, 150)).expect("apply");
+        if applied.fell_back_to_one_x {
+            assert_eq!((applied.pixels_w, applied.pixels_h), (3000, 2000));
+        } else {
+            assert_eq!(
+                (
+                    applied.points_w,
+                    applied.points_h,
+                    applied.pixels_w,
+                    applied.pixels_h
+                ),
+                (2000, 1333, 4000, 2666)
+            );
+        }
+        assert_eq!(vd.backing_pixels(), (applied.pixels_w, applied.pixels_h));
+    }
+
+    #[test]
+    #[ignore = "needs WindowServer"]
+    fn display_colorspace_is_srgb() {
+        let vd = VirtualDisplay::new_planned(&plan(1920, 1080, 100)).expect("create");
+        let red = srgb_red_in_display_space(vd.display_id());
+        assert!(
+            (red[0] - 1.0).abs() < 0.01 && red[1].abs() < 0.01 && red[2].abs() < 0.01,
+            "{red:?}"
+        );
     }
 }
