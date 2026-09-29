@@ -21,6 +21,8 @@ mod clipboard_rich;
 mod color_metrics;
 #[cfg(test)]
 mod color_pattern;
+#[cfg(all(test, target_os = "macos"))]
+mod color_roundtrip_test;
 #[cfg(test)]
 mod conn_test;
 mod cursor;

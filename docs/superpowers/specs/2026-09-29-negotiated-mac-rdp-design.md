@@ -127,7 +127,7 @@ live events (resize, scale change, network change, client lag, device plug, supp
 ## 7. Displays
 
 ### 7.1 Layout
-- **Windowed client (the primary case):** exactly one virtual display equal to the client **window** size (arbitrary sizes, e.g. 1713×1288; encoder pads to 16-px internally, invisible to the user). Never assumes the client's full screen.
+- **Windowed client (the primary case):** exactly one virtual display equal to the client **window** size (arbitrary sizes, e.g. 1714×1287; widths are always even per MS-RDPEDISP, heights may be odd). The encoder pads to even/16-px internally and the client crops, invisible to the user. Phase 0 found that today's path drops the last row of an odd-height frame (encoder is given the odd size); Phase 2 must pad. Never assumes the client's full screen.
 - **Full-screen spanning chosen in the client:** one virtual display per client monitor, same arrangement.
 - **Stable serials** derived from (user, client monitor index) so macOS restores arrangement and window positions on reconnect.
 

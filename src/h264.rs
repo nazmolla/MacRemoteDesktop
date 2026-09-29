@@ -3183,7 +3183,11 @@ impl GraphicsPipelineHandler for StubHandler {
 /// Rewrite AVCC (4-byte length-prefixed NALs) to Annex-B (`00 00 00 01` start
 /// codes), prepending SPS/PPS on keyframes. Only used when `MACRDP_H264_ANNEXB`
 /// selects Annex-B framing.
-fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -> Vec<u8> {
+pub(crate) fn avcc_to_annex_b(
+    avcc: &[u8],
+    parameter_sets: &[Vec<u8>],
+    is_keyframe: bool,
+) -> Vec<u8> {
     const START_CODE: [u8; 4] = [0, 0, 0, 1];
     let mut out = Vec::with_capacity(avcc.len() + 64);
 
