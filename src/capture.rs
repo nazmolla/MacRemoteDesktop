@@ -407,6 +407,9 @@ pub struct CaptureDisplay {
     /// very next call to skip re-adopting the client's reactivation-echo
     /// size. See `request_initial_size`'s doc comment for why this exists.
     pub suppress_next_adopt: Arc<AtomicBool>,
+    /// The Ctrl+Alt+Shift+R resync request (raised by the input handler);
+    /// the capture loop consumes its video half by forcing an IDR.
+    pub resync: crate::resync::ResyncSignal,
     /// The `--virtual-display` this session serves, when there is one.
     /// Shared with `main.rs`, which created it. Enables live client-driven
     /// resize on the virtual-display path:
@@ -893,6 +896,7 @@ impl CaptureDisplay {
                 self.desktop_size.clone(),
                 self.pending_resize.clone(),
                 self.suppress_next_adopt.clone(),
+                self.resync.clone(),
             )
             .await?,
         );
@@ -1102,6 +1106,8 @@ mod macos {
         /// reactivation's `request_initial_size` call doesn't re-adopt
         /// whatever size the client's Confirm Active echoes.
         suppress_next_adopt: Arc<AtomicBool>,
+        /// See `CaptureDisplay::resync`.
+        resync: crate::resync::ResyncSignal,
     }
 
     impl ScreenCaptureUpdates {
@@ -1124,6 +1130,7 @@ mod macos {
             desktop_size: SharedDesktopSize,
             pending_resize: PendingResize,
             suppress_next_adopt: Arc<AtomicBool>,
+            resync: crate::resync::ResyncSignal,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -1302,6 +1309,7 @@ mod macos {
                 pending_resize,
                 desktop_size,
                 suppress_next_adopt,
+                resync,
             })
         }
     }
@@ -1381,13 +1389,13 @@ mod macos {
                 // forced IDR was already armed on the ctx.
                 if let Some(gfx) = self.gfx.as_ref() {
                     // Manual A/V resync hotkey (Ctrl+Alt+Shift+R, set in
-                    // input.rs via crate::RESYNC_VIDEO): force a clean IDR
+                    // input.rs through the shared ResyncSignal): force a clean IDR
                     // keyframe to repaint a stale/idle-blanked mstsc presentation.
                     // Deliberately lighter than the full core reactivation
                     // (gfx.request_reactivation), which on the headless
                     // virtual-display path cascades into a visible session
                     // re-cycle — see Gfx::force_keyframe.
-                    if crate::RESYNC_VIDEO.swap(false, Ordering::Relaxed) {
+                    if self.resync.take_video() {
                         gfx.force_keyframe();
                     }
                     if let Some((w, h)) = gfx.take_reactivate_request() {
