@@ -185,7 +185,7 @@ pub fn run_roundtrip(width: usize, height: usize) -> Result<RoundTripReport, Str
 fn color_roundtrip_avc420_baseline() {
     // Widths are always even (MS-RDPEDISP forbids odd widths). 1714x1288 is the
     // windowed-client case: even, but not a multiple of 16.
-    for (w, h) in [(1920, 1080), (1714, 1288)] {
+    for (w, h) in [(1920, 1080), (1714, 1288), (1714, 1287)] {
         let report = run_roundtrip(w, h).unwrap_or_else(|e| panic!("{w}x{h}: {e}"));
         println!("COLOR_REPORT {}", report.to_json());
         // Sanity gate only: flat patches must survive AVC420 nearly intact.

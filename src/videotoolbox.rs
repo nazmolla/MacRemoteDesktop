@@ -60,6 +60,8 @@ pub struct Encoder {
     /// Frame duration as a `CMTime` ratio (numerator, denominator).
     /// VT uses this for rate control even when we drive PTS manually.
     fps: u32,
+    /// Reused buffer for odd-height padding (see `encode_bgra`).
+    pad_buf: Vec<u8>,
     /// When true (the default), convert BGRA → full-range (0-255) NV12 ourselves
     /// and feed VT a `420f` buffer, so the encoded stream is full-range. mstsc
     /// reads AVC420 luma as full-range regardless of the VUI flag, so
@@ -97,6 +99,11 @@ impl Encoder {
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
         let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
+        // H.264 4:2:0 can't signal an odd picture height (SPS cropping works in
+        // 2-row units), so an odd height lost its last row (Phase 0 finding).
+        // Encode one replicated row more; callers keep the true height in their
+        // region rects, so the client never shows the extra row.
+        let height = height + (height & 1);
         let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
         Ok(Self {
             inner: session,
@@ -106,6 +113,7 @@ impl Encoder {
             height,
             next_pts: 0,
             fps,
+            pad_buf: Vec::new(),
             full_range,
         })
     }
@@ -155,6 +163,18 @@ impl Encoder {
     /// `drain()`. VT calls our output callback on its own thread, so
     /// the channel decouples producer and consumer cleanly.
     pub fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<()> {
+        // Odd source height: the session is one row taller (see `new`) than
+        // the caller's buffer, so replicate its last row into a reused buffer.
+        let src_rows = if stride == 0 { 0 } else { bgra.len() / stride };
+        let mut padded: Option<Vec<u8>> = None;
+        if src_rows > 0 && src_rows + 1 == usize::from(self.height) {
+            let mut buf = std::mem::take(&mut self.pad_buf);
+            buf.clear();
+            buf.extend_from_slice(&bgra[..stride * src_rows]);
+            buf.extend_from_slice(&bgra[stride * (src_rows - 1)..stride * src_rows]);
+            padded = Some(buf);
+        }
+        let bgra = padded.as_deref().unwrap_or(bgra);
         let expected = stride
             .checked_mul(self.height.into())
             .ok_or_else(|| anyhow!("stride*height overflows usize"))?;
@@ -169,7 +189,7 @@ impl Encoder {
         }
         let pts = self.next_pts;
         self.next_pts = self.next_pts.wrapping_add(1);
-        ffi::encode_frame(
+        let r = ffi::encode_frame(
             &self.inner,
             bgra,
             self.width,
@@ -179,7 +199,11 @@ impl Encoder {
             self.fps,
             force_keyframe,
             self.full_range,
-        )
+        );
+        if let Some(buf) = padded {
+            self.pad_buf = buf;
+        }
+        r
     }
 
     /// Pull every encoded frame the callback has produced so far.
