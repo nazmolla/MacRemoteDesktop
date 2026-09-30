@@ -366,6 +366,7 @@ pub(crate) use macos::gather_windows_onto_display;
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use crate::sync_ext::LockExt;
     use std::collections::HashSet;
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -1453,7 +1454,7 @@ mod macos {
             return;
         }
         let mru = mru_bundles();
-        let mut guard = mru.lock().expect("MRU bundles mutex poisoned");
+        let mut guard = mru.lock_or_recover();
         guard.retain(|b| b != bundle);
         guard.insert(0, bundle.to_string());
     }
@@ -1588,12 +1589,8 @@ mod macos {
         workspace_pid: libc::pid_t,
         is_alive: impl FnOnce(libc::pid_t) -> bool,
     ) -> libc::pid_t {
-        let mut lie = WORKSPACE_LIE_FRONT
-            .lock()
-            .expect("workspace lie front mutex poisoned");
-        let mut last_ax = LAST_AX_ACTIVATED_PID
-            .lock()
-            .expect("last AX activated pid mutex poisoned");
+        let mut lie = WORKSPACE_LIE_FRONT.lock_or_recover();
+        let mut last_ax = LAST_AX_ACTIVATED_PID.lock_or_recover();
         if let (Some(lie_pid), Some(ax_pid)) = (*lie, *last_ax) {
             if lie_pid == workspace_pid && is_alive(ax_pid) {
                 return ax_pid;
@@ -1977,10 +1974,7 @@ mod macos {
             // activations are causing the focus changes the poller is
             // seeing, and we don't want them double-counted into MRU.
             // (Cmd-release commit already promotes the final target.)
-            let cycle_active = CYCLE_SESSION
-                .lock()
-                .expect("cycle session mutex poisoned")
-                .is_some();
+            let cycle_active = CYCLE_SESSION.lock_or_recover().is_some();
             if cycle_active {
                 continue;
             }
@@ -2024,7 +2018,7 @@ mod macos {
         // already `take()`n, so a racing cycle_apps just starts a fresh one — the
         // correct outcome after a commit.
         let session = {
-            let mut guard = CYCLE_SESSION.lock().expect("cycle session mutex poisoned");
+            let mut guard = CYCLE_SESSION.lock_or_recover();
             match guard.take() {
                 Some(s) => s,
                 None => return,
@@ -2147,7 +2141,7 @@ mod macos {
             // land on later.
             {
                 let mru = mru_map();
-                let mut guard = mru.lock().expect("MRU mutex poisoned");
+                let mut guard = mru.lock_or_recover();
                 if let Some(m) = metas.iter().find(|m| m.pid == front_pid) {
                     if m.bundle != "<no-bundle-id>" {
                         guard.insert(m.bundle.clone(), m.pid);
@@ -2158,7 +2152,7 @@ mod macos {
             }
             let mru_snapshot: std::collections::HashMap<String, libc::pid_t> = {
                 let mru = mru_map();
-                mru.lock().expect("MRU mutex poisoned").clone()
+                mru.lock_or_recover().clone()
             };
 
             // Pass 2: dedup by bundle, preferring the MRU instance. Apps
@@ -2247,7 +2241,7 @@ mod macos {
             let now = Instant::now();
             let current_release_gen =
                 CMD_RELEASE_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
-            let mut session_guard = CYCLE_SESSION.lock().expect("cycle session mutex poisoned");
+            let mut session_guard = CYCLE_SESSION.lock_or_recover();
             // Continue if the session's stored release-generation
             // matches *and* the session is younger than the safety
             // bound. Generation matching is the real authority —
@@ -2302,7 +2296,7 @@ mod macos {
                     // is stale relative to our last AX activation.
                     {
                         let mru = mru_bundles();
-                        let mut guard = mru.lock().expect("MRU bundles mutex poisoned");
+                        let mut guard = mru.lock_or_recover();
                         for (bundle, _, _) in &regular {
                             if bundle != "<no-bundle-id>" && !guard.iter().any(|b| b == bundle) {
                                 guard.push(bundle.clone());
@@ -2318,10 +2312,7 @@ mod macos {
                     // it lands at index 0 of the snapshot — the cursor
                     // starts there and the first Tab press advances
                     // to index 1 = previous-MRU app.
-                    let mru_order: Vec<String> = mru_bundles()
-                        .lock()
-                        .expect("MRU bundles mutex poisoned")
-                        .clone();
+                    let mru_order: Vec<String> = mru_bundles().lock_or_recover().clone();
                     let mut ordered = regular.clone();
                     ordered.sort_by_key(|(bundle, _, _)| {
                         mru_order
@@ -2396,8 +2387,7 @@ mod macos {
             // dedup keeps the same instance.
             if target_bundle != "<no-bundle-id>" {
                 mru_map()
-                    .lock()
-                    .expect("MRU mutex poisoned")
+                    .lock_or_recover()
                     .insert(target_bundle.clone(), target_pid);
             }
             // Dump the snapshot order (the actual cycle order, with
@@ -2408,10 +2398,7 @@ mod macos {
                 .iter()
                 .map(|(b, _, p)| format!("{b}#{p}"))
                 .collect();
-            let mru_order: Vec<String> = mru_bundles()
-                .lock()
-                .expect("MRU bundles mutex poisoned")
-                .clone();
+            let mru_order: Vec<String> = mru_bundles().lock_or_recover().clone();
             debug!(
                 reverse,
                 continuing,
@@ -2459,9 +2446,7 @@ mod macos {
             // cycle activations don't change what workspace is lying
             // about.
             {
-                let mut lie = WORKSPACE_LIE_FRONT
-                    .lock()
-                    .expect("workspace lie front mutex poisoned");
+                let mut lie = WORKSPACE_LIE_FRONT.lock_or_recover();
                 if lie.is_none() {
                     *lie = Some(workspace_front_pid);
                 }
@@ -2477,9 +2462,7 @@ mod macos {
                 false,
             );
             if ax_err == AX_ERROR_SUCCESS {
-                *LAST_AX_ACTIVATED_PID
-                    .lock()
-                    .expect("last AX activated pid mutex poisoned") = Some(target_pid);
+                *LAST_AX_ACTIVATED_PID.lock_or_recover() = Some(target_pid);
                 // Promote on every successful activation, not just on
                 // Cmd-release commit. Our cycle has no switcher UI, so
                 // each Tab press visibly switches apps and the user

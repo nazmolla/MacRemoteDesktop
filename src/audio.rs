@@ -6,6 +6,7 @@
 //! configured sample rate; we convert to 16-bit signed PCM interleaved and
 //! ship via `RdpsndServerMessage::Wave`.
 
+use crate::sync_ext::LockExt;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -103,7 +104,7 @@ impl MacRdpsnd {
 
 impl ServerEventSender for MacRdpsnd {
     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
-        *self.sender.lock().unwrap() = Some(sender);
+        *self.sender.lock_or_recover() = Some(sender);
     }
 }
 
@@ -127,7 +128,7 @@ impl SoundServerFactory for MacRdpsnd {
     }
 
     fn set_audio_sender(&mut self, audio_sender: mpsc::Sender<AudioWave>) {
-        *self.audio_sender.lock().unwrap() = Some(audio_sender);
+        *self.audio_sender.lock_or_recover() = Some(audio_sender);
     }
 }
 
@@ -728,7 +729,7 @@ async fn capture_loop(
                     // next iteration — at 48 kHz / 1024 samples this is ~21 ms
                     // later.
                     if audio_s.is_none() {
-                        audio_s = audio_sender.lock().unwrap().clone();
+                        audio_s = audio_sender.lock_or_recover().clone();
                     }
                     if let Some(audio_ref) = audio_s.as_ref() {
                         // Bounded channel: send().await applies backpressure if
@@ -751,7 +752,7 @@ async fn capture_loop(
                         // over it would mistime — but our vendored server always
                         // wires the audio sender, so AAC never takes this branch.
                         if s.is_none() {
-                            s = sender.lock().unwrap().clone();
+                            s = sender.lock_or_recover().clone();
                         }
                         let Some(s_ref) = s.as_ref() else { continue };
                         if s_ref

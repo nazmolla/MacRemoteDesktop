@@ -51,6 +51,7 @@ mod runloop_thread;
 mod shield;
 mod stats;
 mod switcher_hud;
+mod sync_ext;
 mod usb_redirect;
 mod videotoolbox;
 mod virtual_display;
@@ -67,6 +68,7 @@ pub(crate) static RESYNC_VIDEO: std::sync::atomic::AtomicBool =
 pub(crate) static RESYNC_AUDIO: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+use crate::sync_ext::{LockExt, RwLockExt};
 use std::fs;
 use std::io::{BufReader, IsTerminal};
 use std::net::SocketAddr;
@@ -1832,7 +1834,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                 "RDP client connected — Mac is now headless via the \
                                  virtual display"
                             );
-                            *slot.lock().expect("overlay mutex poisoned") = Some(ovr);
+                            *slot.lock_or_recover() = Some(ovr);
                             // (--restore-windows-on-disconnect) Auto-gather any
                             // windows stranded on the built-in panel (e.g. swept
                             // there by a previous disconnect) onto the virtual
@@ -1864,11 +1866,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                 let password = Arc::clone(&password);
                                 std::thread::spawn(move || {
                                     use std::sync::atomic::Ordering as AtomicOrdering;
-                                    let Some(password) = password
-                                        .read()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .clone()
-                                    else {
+                                    let Some(password) = password.read_or_recover().clone() else {
                                         warn!(
                                             label,
                                             "auto-unlock: skipped, the password was revoked"
@@ -1958,7 +1956,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             tokio::time::sleep(wait).await;
                         }
                     }
-                    if let Some(ovr) = slot.lock().expect("overlay mutex poisoned").take() {
+                    if let Some(ovr) = slot.lock_or_recover().take() {
                         // Drop runs the actual restore + emits its own
                         // success/warn logs; don't claim a result here.
                         drop(ovr);
@@ -2832,24 +2830,16 @@ async fn async_main() -> Result<()> {
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("shutdown signal received — exiting");
-        if let Some(ovr) = cleanup_detach.lock().expect("detach mutex poisoned").take() {
+        if let Some(ovr) = cleanup_detach.lock_or_recover().take() {
             drop(ovr); // re-enables the built-in display
         }
-        if let Some(ovr) = cleanup_capture
-            .lock()
-            .expect("capture mutex poisoned")
-            .take()
-        {
+        if let Some(ovr) = cleanup_capture.lock_or_recover().take() {
             drop(ovr); // releases captured displays
         }
-        if let Some(ovr) = cleanup_shield.lock().expect("shield mutex poisoned").take() {
+        if let Some(ovr) = cleanup_shield.lock_or_recover().take() {
             drop(ovr); // lowers the shield windows
         }
-        if let Some(ovr) = cleanup_primary
-            .lock()
-            .expect("primary mutex poisoned")
-            .take()
-        {
+        if let Some(ovr) = cleanup_primary.lock_or_recover().take() {
             drop(ovr); // restores display arrangement
         }
         // Lazy paste leaves NSFilePresenters registered + a temp dir on
@@ -2998,8 +2988,7 @@ async fn async_main() -> Result<()> {
         let vd_id = virtual_display
             .as_ref()
             .expect("checked above when --detach-primary")
-            .lock()
-            .expect("virtual display mutex poisoned")
+            .lock_or_recover()
             .display_id();
         spawn_primary_overlay_watcher(
             "detach",
@@ -3017,8 +3006,7 @@ async fn async_main() -> Result<()> {
         let vd_id = virtual_display
             .as_ref()
             .expect("checked above when --capture-primary")
-            .lock()
-            .expect("virtual display mutex poisoned")
+            .lock_or_recover()
             .display_id();
         spawn_primary_overlay_watcher(
             "capture",
@@ -3036,8 +3024,7 @@ async fn async_main() -> Result<()> {
         let vd_id = virtual_display
             .as_ref()
             .expect("checked above when --shield-primary")
-            .lock()
-            .expect("virtual display mutex poisoned")
+            .lock_or_recover()
             .display_id();
         spawn_primary_overlay_watcher(
             "shield",
@@ -3055,8 +3042,7 @@ async fn async_main() -> Result<()> {
         let vd_id = virtual_display
             .as_ref()
             .expect("checked above when --make-primary")
-            .lock()
-            .expect("virtual display mutex poisoned")
+            .lock_or_recover()
             .display_id();
         match virtual_display::PrimaryOverride::install(vd_id)
             .context("promoting virtual display to primary")?
@@ -3067,7 +3053,7 @@ async fn async_main() -> Result<()> {
                      windows move there. Original layout restored on exit \
                      (or at next logout)."
                 );
-                *primary_override.lock().expect("override mutex poisoned") = Some(ovr);
+                *primary_override.lock_or_recover() = Some(ovr);
             }
             None => {
                 info!(
@@ -3104,7 +3090,7 @@ async fn async_main() -> Result<()> {
     //     native size and use CGDisplay::main() for the point-space bounds.
     //   - primary panel with override: use the override + main geometry.
     let (width, height, capture_display_id, screen_size_pts) = if let Some(vd) = &virtual_display {
-        let vd = vd.lock().expect("virtual display mutex poisoned");
+        let vd = vd.lock_or_recover();
         // Both required earlier, so the unwraps can't fire.
         let w = args
             .width

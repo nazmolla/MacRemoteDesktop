@@ -13,6 +13,7 @@
 //! Mac-side clipboard changes via `NSPasteboard.changeCount` and signals
 //! the protocol layer.
 
+use crate::sync_ext::LockExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -463,7 +464,7 @@ impl MacCliprdr {
 
 impl ServerEventSender for MacCliprdr {
     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
-        *self.sender.lock().unwrap() = Some(sender);
+        *self.sender.lock_or_recover() = Some(sender);
 
         // Spawn a poller that notices Mac-side copies and tells the RDP
         // server to advertise the new content to the remote.
@@ -685,7 +686,7 @@ impl ironrdp_core::AsAny for MacCliprdrBackend {
 
 impl MacCliprdrBackend {
     fn push(&self, msg: ClipboardMessage) {
-        if let Some(s) = self.sender.lock().unwrap().as_ref() {
+        if let Some(s) = self.sender.lock_or_recover().as_ref() {
             let _ = s.send(ServerEvent::Clipboard(msg));
         }
     }
@@ -756,7 +757,7 @@ impl MacCliprdrBackend {
     ) -> Option<FileContentsResponse<'static>> {
         let idx = usize::try_from(request.index).ok()?;
         let path = {
-            let guard = self.file_paths.lock().unwrap();
+            let guard = self.file_paths.lock_or_recover();
             guard.get(idx).cloned()?
         };
         let meta = std::fs::metadata(&path)
@@ -838,7 +839,7 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
                 files.push(fd);
                 snapshot.push(e.path);
             }
-            *paths.lock().unwrap() = snapshot;
+            *paths.lock_or_recover() = snapshot;
             debug!(
                 file_count = files.len(),
                 "advertising file copy to client (recursive)"
@@ -879,7 +880,7 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
     }
     // Clear any stale file-paths snapshot so a leftover index can't be
     // exploited by a slow follow-up FileContentsRequest.
-    paths.lock().unwrap().clear();
+    paths.lock_or_recover().clear();
     send(
         sender,
         ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)),
@@ -887,7 +888,7 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
 }
 
 fn send(sender: &Sender, event: ServerEvent) -> bool {
-    let guard = sender.lock().unwrap();
+    let guard = sender.lock_or_recover();
     match guard.as_ref() {
         Some(s) => s.send(event).is_ok(),
         None => false,

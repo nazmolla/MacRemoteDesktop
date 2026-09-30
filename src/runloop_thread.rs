@@ -14,6 +14,7 @@
 
 #![cfg(target_os = "macos")]
 
+use crate::sync_ext::LockExt;
 use std::ffi::c_void;
 use std::sync::mpsc::sync_channel;
 use std::sync::{Mutex, OnceLock};
@@ -56,7 +57,7 @@ static STATE: OnceLock<&'static State> = OnceLock::new();
 /// can't kill the runloop.
 extern "C" fn perform(_info: *const c_void) {
     let Some(state) = STATE.get() else { return };
-    let drained: Vec<Job> = std::mem::take(&mut *state.queue.lock().unwrap());
+    let drained: Vec<Job> = std::mem::take(&mut *state.queue.lock_or_recover());
     for job in drained {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
     }
@@ -122,7 +123,7 @@ fn ensure_started() -> &'static State {
 /// `f` runs asynchronously the next time the runloop pumps.
 pub fn submit<F: FnOnce() + Send + 'static>(f: F) {
     let state = ensure_started();
-    state.queue.lock().unwrap().push(Box::new(f));
+    state.queue.lock_or_recover().push(Box::new(f));
     unsafe {
         CFRunLoopSourceSignal(state.source.0);
         CFRunLoopWakeUp(state.runloop.0.as_concrete_TypeRef());
