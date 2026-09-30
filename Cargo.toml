@@ -160,6 +160,12 @@ ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git",
 [patch."https://github.com/Devolutions/IronRDP.git"]
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
 
+[lints.clippy]
+# New in rustc 1.98: suggests rewriting fixed-size `chunks_exact` loops as `as_chunks`.
+# Those loops are the per-pixel hot paths (encode, cursor, clipboard, audio) and are
+# measured as they are; keep them rather than churn them for a style lint.
+chunks_exact_to_as_chunks = "allow"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
