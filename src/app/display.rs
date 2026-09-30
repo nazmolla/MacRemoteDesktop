@@ -1,9 +1,122 @@
-//! The main display's geometry and the bitmap codecs advertised to clients.
+//! The session's display: creating the virtual display, resolving the
+//! desktop size and geometry, and the bitmap codecs advertised to clients.
 
 use super::*;
 
 pub(super) const FALLBACK_WIDTH: u16 = 1280;
 pub(super) const FALLBACK_HEIGHT: u16 = 720;
+
+/// Shared handle to the virtual display (see where it is created in `run`).
+pub(super) type SharedVirtualDisplay = Arc<std::sync::Mutex<virtual_display::VirtualDisplay>>;
+
+/// Create the virtual display when `--virtual-display` is set.
+pub(super) fn create_virtual_display(args: &Args) -> Result<Option<SharedVirtualDisplay>> {
+    if !args.virtual_display {
+        return Ok(None);
+    }
+    let w = args
+        .width
+        .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
+    let h = args
+        .height
+        .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
+    // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
+    // metadata here (capture cadence is governed by --fps); pass a
+    // safe value so CGVirtualDisplay doesn't reject the mode.
+    let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
+        .context("attaching virtual display")?;
+    info!(
+        display_id = vd.display_id(),
+        origin = ?vd.origin_pts(),
+        size = ?vd.size_pts(),
+        "virtual display attached — the RDP session uses this surface; \
+         your primary panel is untouched"
+    );
+    Ok(Some(Arc::new(std::sync::Mutex::new(vd))))
+}
+
+/// Resolve desktop dimensions + geometry. Three paths:
+///   - virtual display: width/height are required by
+///     [`create_virtual_display`]; geometry comes from the vdisplay's CGDisplayBounds.
+///   - primary panel, no --width/--height override: query SCK for
+///     native size and use CGDisplay::main() for the point-space bounds.
+///   - primary panel with override: use the override + main geometry.
+pub(super) async fn resolve_desktop(
+    args: &Args,
+    virtual_display: Option<&SharedVirtualDisplay>,
+) -> Result<(u16, u16, Option<u32>, (f64, f64))> {
+    let geometry = if let Some(vd) = virtual_display {
+        let vd = vd.lock_or_recover();
+        // Both required earlier, so the unwraps can't fire.
+        let w = args
+            .width
+            .expect("checked above when --virtual-display set");
+        let h = args
+            .height
+            .expect("checked above when --virtual-display set");
+        // Re-query CGDisplayBounds rather than trusting the cached
+        // values from VirtualDisplay creation: if --make-primary
+        // moved the display to (0, 0), the cached size is fine but
+        // we want a fresh read for parity with the input handler.
+        #[cfg(target_os = "macos")]
+        let size = {
+            let b = core_graphics::display::CGDisplay::new(vd.display_id()).bounds();
+            (b.size.width, b.size.height)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let size = vd.size_pts();
+        info!(
+            width = w,
+            height = h,
+            display_id = vd.display_id(),
+            "desktop size (virtual display)"
+        );
+        (w, h, Some(vd.display_id()), size)
+    } else {
+        let detected = primary_display_size().await?;
+        let mut w = args
+            .width
+            .or(detected.map(|(w, _)| w))
+            .unwrap_or(FALLBACK_WIDTH);
+        let mut h = args
+            .height
+            .or(detected.map(|(_, h)| h))
+            .unwrap_or(FALLBACK_HEIGHT);
+        // --hidpi: capture at the display's backing (Retina) pixel resolution
+        // instead of logical points, unless the user pinned an explicit
+        // --width/--height (in which case they've chosen the size themselves).
+        #[cfg(target_os = "macos")]
+        if args.hidpi && args.width.is_none() && args.height.is_none() {
+            if let Some((bw, bh)) = primary_backing_size() {
+                info!(
+                    points_w = w,
+                    points_h = h,
+                    backing_w = bw,
+                    backing_h = bh,
+                    "--hidpi: capturing at backing pixel resolution"
+                );
+                w = bw;
+                h = bh;
+            } else {
+                warn!("--hidpi: could not read backing pixel size; staying at logical points");
+            }
+        }
+        if let Some((dw, dh)) = detected {
+            info!(
+                width = w,
+                height = h,
+                detected_w = dw,
+                detected_h = dh,
+                "desktop size"
+            );
+        } else {
+            info!(width = w, height = h, "desktop size (no display detected)");
+        }
+        let (_origin, size) = primary_screen_geometry();
+        (w, h, None, size)
+    };
+    Ok(geometry)
+}
 
 /// Codecs advertised to the client. The actual encoder picks the one the
 /// client also speaks; on conflict, the negotiation prefers (in order)

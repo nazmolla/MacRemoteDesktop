@@ -3,31 +3,130 @@
 
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
+/// Guard slots for the headless-display modes. Shared by the session watcher
+/// (which fills and empties them), the capture side (which re-asserts the
+/// capture or shield blanking after a re-mode) and the signal handler.
+#[derive(Clone, Default)]
+pub(super) struct HeadlessSlots {
+    pub(super) primary_override: Arc<std::sync::Mutex<Option<virtual_display::PrimaryOverride>>>,
+    pub(super) detached: Arc<std::sync::Mutex<Option<virtual_display::DetachedPrimary>>>,
+    pub(super) captured: Arc<std::sync::Mutex<Option<virtual_display::CapturedPrimary>>>,
+    pub(super) shielded: Arc<std::sync::Mutex<Option<virtual_display::ShieldedPrimary>>>,
+}
+
+impl HeadlessSlots {
+    /// Drop every guard, in the order that restores the user's layout.
+    /// Taking each guard out of its slot drops it right here; their Drop
+    /// impls do the restoring on macOS (the non-macOS stubs are empty).
+    pub(super) fn release_all(&self) {
+        let _ = self.detached.lock_or_recover().take(); // re-enables the built-in display
+        let _ = self.captured.lock_or_recover().take(); // releases captured displays
+        let _ = self.shielded.lock_or_recover().take(); // lowers the shield windows
+        let _ = self.primary_override.lock_or_recover().take(); // restores display arrangement
+    }
+}
+
+/// What the session watcher does around connect and disconnect, besides
+/// engaging its mode.
+pub(super) struct WatcherOptions {
+    pub(super) tracker: capture::SessionTracker,
+    /// (--restore-windows-on-disconnect) When true, make windows follow the
+    /// session: sweep them onto `physical_main_id` on real disconnect (so the
+    /// Mac is usable locally) and auto-gather them onto the virtual display on
+    /// reconnect (so the client sees them without Ctrl+Alt+G). No-op otherwise.
+    pub(super) restore_windows: bool,
+    pub(super) physical_main_id: u32,
+    /// (--lock-on-disconnect) When set, lock the local session on a genuine
+    /// last-client-disconnect (after an extra safety buffer beyond the
+    /// REACTIVATION_GRACE poll), holding it while a reconnect is still
+    /// handshaking (see lock_activity). None = feature off.
+    pub(super) lock_on_disconnect: Option<Arc<lock_activity::ConnectionActivity>>,
+    /// (--auto-unlock) The validated credential, kept current by the
+    /// credential monitor (empty once it revokes the password).
+    pub(super) secret: credential_monitor::SecretCell,
+    /// (--auto-unlock) When true, try to unlock the local session on
+    /// reconnect using that credential. A no-op if the screen isn't locked.
+    pub(super) auto_unlock: bool,
+}
+
+/// Engage the headless mode the flags ask for: start the session watcher for
+/// detach, capture or shield, or promote the virtual display for
+/// `--make-primary`. `validate` has already checked that a virtual display
+/// exists for each of these.
+pub(super) fn engage_headless_mode(
+    args: &Args,
+    virtual_display: Option<&SharedVirtualDisplay>,
+    slots: &HeadlessSlots,
+    opts: WatcherOptions,
+) -> Result<()> {
+    let vd_id = |flag: &str| -> u32 {
+        virtual_display
+            .unwrap_or_else(|| panic!("validate requires --virtual-display with {flag}"))
+            .lock_or_recover()
+            .display_id()
+    };
+    if args.detach_primary {
+        spawn_primary_overlay_watcher(
+            "detach",
+            vd_id("--detach-primary"),
+            slots.detached.clone(),
+            virtual_display::DetachedPrimary::install,
+            opts,
+        );
+    } else if args.capture_primary {
+        spawn_primary_overlay_watcher(
+            "capture",
+            vd_id("--capture-primary"),
+            slots.captured.clone(),
+            virtual_display::CapturedPrimary::install,
+            opts,
+        );
+    } else if args.shield_primary {
+        spawn_primary_overlay_watcher(
+            "shield",
+            vd_id("--shield-primary"),
+            slots.shielded.clone(),
+            virtual_display::ShieldedPrimary::install,
+            opts,
+        );
+    } else if args.make_primary {
+        match virtual_display::PrimaryOverride::install(vd_id("--make-primary"))
+            .context("promoting virtual display to primary")?
+        {
+            Some(ovr) => {
+                info!(
+                    "virtual display promoted to primary — menu bar and new \
+                     windows move there. Original layout restored on exit \
+                     (or at next logout)."
+                );
+                *slots.primary_override.lock_or_recover() = Some(ovr);
+            }
+            None => {
+                info!(
+                    "virtual display is already the system primary (macOS \
+                     auto-placed it at origin) — no override needed"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
     vd_id: u32,
-    tracker: capture::SessionTracker,
     slot: Arc<std::sync::Mutex<Option<T>>>,
     install: fn(u32) -> Result<T>,
-    // (--restore-windows-on-disconnect) When true, make windows follow the
-    // session: sweep them onto `physical_main_id` on real disconnect (so the
-    // Mac is usable locally) and auto-gather them onto the virtual display on
-    // reconnect (so the client sees them without Ctrl+Alt+G). No-op otherwise.
-    restore_windows: bool,
-    physical_main_id: u32,
-    // (--lock-on-disconnect) When set, lock the local session on a genuine
-    // last-client-disconnect (after an extra safety buffer beyond the
-    // REACTIVATION_GRACE poll above), holding it while a reconnect is still
-    // handshaking (see lock_activity). None = feature off.
-    lock_on_disconnect: Option<Arc<lock_activity::ConnectionActivity>>,
-    // (--auto-unlock) When true, try to unlock the local session on
-    // reconnect using the exact same validated credential used for RDP
-    // auth. A no-op if the screen isn't locked, or if the credential monitor
-    // has revoked the password (the cell is then empty).
-    password: credential_monitor::SecretCell,
-    auto_unlock: bool,
+    opts: WatcherOptions,
 ) {
+    let WatcherOptions {
+        tracker,
+        restore_windows,
+        physical_main_id,
+        lock_on_disconnect,
+        secret: password,
+        auto_unlock,
+    } = opts;
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
