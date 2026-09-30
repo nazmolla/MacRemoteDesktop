@@ -37,10 +37,10 @@ mod input;
 mod keyboard_layout;
 mod lock_activity;
 mod logging;
+#[allow(dead_code)]
+mod lossless;
 mod multitransport;
 mod negotiator;
-#[allow(dead_code)]
-mod planar;
 mod rdpdr;
 mod reaper;
 mod refine;
