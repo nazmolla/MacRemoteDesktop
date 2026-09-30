@@ -64,6 +64,20 @@ pub struct ListenerConfig {
     pub server_isn_seed: u32,
     /// Retransmit timeout, milliseconds (passed to the reliability SM).
     pub rto_ms: u64,
+    /// (P2.2, experimental) A lossy (`SYN_LOSSY`) flow uses deliver-on-arrival,
+    /// send-once delivery instead of the reliable policy. The reliable flow is
+    /// never affected. Default off.
+    pub lossy_delivery: bool,
+    /// (P2.3, experimental) On a lossy flow, send each source datagram twice so
+    /// an independent-loss link costs only p². Needs `lossy_delivery`. Default off.
+    pub lossy_duplicate: bool,
+    /// A bound peer with no inbound datagram for this long is declared dead
+    /// (mstsc's idle keepalive is ~15 s, so 30 s = two missed keepalives). Must
+    /// stay below the 60 s idle GC; larger values are clamped. 0 disables.
+    pub tunnel_dead_secs: u64,
+    /// How long multitransport offers are suppressed after a tunnel death, so the
+    /// client's reconnect lands on plain TCP. 0 = no suppression.
+    pub offer_cooldown_secs: u64,
 }
 
 impl Default for ListenerConfig {
@@ -73,6 +87,10 @@ impl Default for ListenerConfig {
             mtu: 1232,
             server_isn_seed: 0x5052_4400, // "PRD\0"-ish; replaced by a CSPRNG seed in M3c
             rto_ms: 300,
+            lossy_delivery: false,
+            lossy_duplicate: false,
+            tunnel_dead_secs: 30,
+            offer_cooldown_secs: 600,
         }
     }
 }
@@ -692,33 +710,14 @@ async fn run_recv_loop(
     let start = tokio::time::Instant::now();
     let mut buf = vec![0u8; 2048];
 
-    // (P2.2 step 2, EXPERIMENTAL) When set, a lossy (`SYN_LOSSY`) flow drives the
-    // SM in `DeliveryMode::Lossy` (deliver-on-arrival, send-once-no-retransmit)
-    // instead of the reliable policy. Default OFF — the lossy flow keeps riding the
-    // reliable SM (the proven P2.1a/P2.4a path), so this is a one-env-var A/B and a
-    // clean fallback. The reliable (`UdpFecR`) flow is never affected.
-    let lossy_delivery = super::env_truthy("MACRDP_UDP_LOSSY_DELIVERY");
+    // Experimental switches and thresholds, supplied by the application (see
+    // `ListenerConfig`).
+    let lossy_delivery = cfg.lossy_delivery;
     if lossy_delivery {
-        debug!("MACRDP_UDP_LOSSY_DELIVERY set — lossy (SYN_LOSSY) flows will use DeliveryMode::Lossy");
+        debug!("lossy delivery on — lossy (SYN_LOSSY) flows will use DeliveryMode::Lossy");
     }
-
-    // (P2.3 FEC pivot, EXPERIMENTAL) Real FEC is structurally unavailable (modern
-    // Windows negotiates RDPUDP2, which has no FEC — see the feasibility doc "P2.3
-    // FEC capture RESULT"). This is the protocol-safe stand-in: on a lossy flow,
-    // ship each source datagram twice (same seq) so an independent-loss link costs
-    // us only at p²; the peer de-dups by sequence number, so the upper layer (audio)
-    // never sees the copy. Only meaningful with MACRDP_UDP_LOSSY_DELIVERY (it needs
-    // the lossy SM); default OFF.
-    let lossy_dup = super::env_truthy("MACRDP_UDP_LOSSY_AUDIO_DUP");
-    // Tunnel-death threshold: a BOUND peer with no inbound datagram for this
-    // long is declared dead (mstsc's idle keepalive cadence is ~15 s, so the
-    // 30 s default = two missed keepalives; must stay < the 60 s idle GC so
-    // death is detected before the peer is evicted). 0 disables detection.
-    let tunnel_dead_ms: u64 = std::env::var("MACRDP_UDP_TUNNEL_DEAD_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|s| s * 1000)
-        .unwrap_or(30_000);
+    let lossy_dup = cfg.lossy_duplicate;
+    let tunnel_dead_ms: u64 = cfg.tunnel_dead_secs.saturating_mul(1000);
     // Clamp below the idle GC: at >= PEER_IDLE_TIMEOUT_MS the GC would evict the
     // peer before death is ever declared — audio would still fall back (the GC
     // lowers the flag) but the offer COOLDOWN would silently never engage,
@@ -728,7 +727,7 @@ async fn run_recv_loop(
         warn!(
             requested_ms = tunnel_dead_ms,
             clamped_ms = clamped,
-            "MACRDP_UDP_TUNNEL_DEAD_SECS must stay below the {}s idle GC — clamped",
+            "tunnel_dead_secs must stay below the {}s idle GC — clamped",
             PEER_IDLE_TIMEOUT_MS / 1000
         );
         clamped
@@ -736,12 +735,9 @@ async fn run_recv_loop(
         tunnel_dead_ms
     };
     // Multitransport-offer cooldown after a tunnel death (0 = no suppression).
-    let mt_cooldown_secs: u64 = std::env::var("MACRDP_UDP_MT_COOLDOWN_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(600);
+    let mt_cooldown_secs: u64 = cfg.offer_cooldown_secs;
     if lossy_dup {
-        debug!("MACRDP_UDP_LOSSY_AUDIO_DUP set — lossy flows will duplicate each source datagram (1+1 redundancy)");
+        debug!("lossy duplication on — lossy flows will duplicate each source datagram (1+1 redundancy)");
     }
 
     // (Soak fix) Periodic clock for the reliability state machines. The SM only
@@ -895,7 +891,7 @@ async fn run_recv_loop(
             session_counter = session_counter.wrapping_add(1);
             let initial_seq = cfg.server_isn_seed.wrapping_add(session_counter);
             let mode = if use_lossy {
-                debug!(%peer_addr, "RDPEUDP peer using LOSSY delivery (SYN_LOSSY flow, MACRDP_UDP_LOSSY_DELIVERY)");
+                debug!(%peer_addr, "RDPEUDP peer using LOSSY delivery (SYN_LOSSY flow)");
                 DeliveryMode::Lossy
             } else {
                 DeliveryMode::Reliable
@@ -904,7 +900,7 @@ async fn run_recv_loop(
             // RTO retransmit instead and never duplicates).
             let duplicate_lossy_sends = use_lossy && lossy_dup;
             if duplicate_lossy_sends {
-                debug!(%peer_addr, "RDPEUDP lossy peer will duplicate source datagrams (MACRDP_UDP_LOSSY_AUDIO_DUP)");
+                debug!(%peer_addr, "RDPEUDP lossy peer will duplicate source datagrams");
             }
             Peer {
                 sm: RdpeudpState::new(

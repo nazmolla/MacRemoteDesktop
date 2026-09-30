@@ -93,7 +93,7 @@ impl Encoder {
         // image while keeping FreeRDP correct. Opt back out to video-range (let
         // VT convert from BGRA) with MACRDP_H264_FULL_RANGE=0 for debugging.
         let full_range = !matches!(
-            std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
+            crate::tunables::var("MACRDP_H264_FULL_RANGE").as_deref(),
             Ok("0") | Ok("false") | Ok("FALSE")
         );
         // Keyframe interval is a frame count; derive it from the requested

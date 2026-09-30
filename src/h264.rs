@@ -158,7 +158,7 @@ impl WireFormat {
     /// The legacy `MACRDP_H264_ANNEXB=1` is still accepted (now a no-op since
     /// Annex-B is the default).
     fn from_env() -> Self {
-        match std::env::var("MACRDP_H264_LENGTH_PREFIXED") {
+        match crate::tunables::var("MACRDP_H264_LENGTH_PREFIXED") {
             Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Self::LengthPrefixed,
             _ => Self::AnnexB,
         }
@@ -1318,13 +1318,13 @@ struct AdaptiveActions {
 /// `MACRDP_UDP_EGFX_ACK_ACTIVE_MS` (500), `MACRDP_UDP_EGFX_ACK_RECOVERY_MS` (1000).
 fn recovery_config_from_env() -> (bool, RecoveryParams) {
     let ms = |name: &str, default: u64| -> Duration {
-        let v = std::env::var(name)
+        let v = crate::tunables::var(name)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(default);
         Duration::from_millis(v)
     };
-    let enabled = crate::multitransport::env_truthy("MACRDP_UDP_EGFX_ACK_RECOVERY");
+    let enabled = crate::tunables::truthy("MACRDP_UDP_EGFX_ACK_RECOVERY");
     let params = RecoveryParams {
         active_window: ms("MACRDP_UDP_EGFX_ACK_ACTIVE_MS", 500),
         ack_stall: ms("MACRDP_UDP_EGFX_ACK_STALL_MS", 200),
@@ -1511,18 +1511,18 @@ impl Gfx {
     ) -> Self {
         let wire_format = WireFormat::from_env();
         let (recovery_enabled, recovery_params) = recovery_config_from_env();
-        let max_frame_lag = std::env::var("MACRDP_UDP_EGFX_MAX_FRAME_LAG")
+        let max_frame_lag = crate::tunables::var("MACRDP_UDP_EGFX_MAX_FRAME_LAG")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(16);
-        let watchdog_enabled = match std::env::var("MACRDP_UDP_EGFX_WATCHDOG") {
+        let watchdog_enabled = match crate::tunables::var("MACRDP_UDP_EGFX_WATCHDOG") {
             Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
             Err(_) => true, // default on (no-op unless EGFX is on the reliable UDP tunnel)
         };
         let watchdog_ms = |name: &str, default: u64| -> Duration {
             Duration::from_millis(
-                std::env::var(name)
+                crate::tunables::var(name)
                     .ok()
                     .and_then(|s| s.trim().parse::<u64>().ok())
                     .filter(|&n| n > 0)
@@ -1534,9 +1534,9 @@ impl Gfx {
         // Adaptive bitrate (P1). Enabled by the --adaptive-bitrate flag OR the env
         // fallback; the controller still only acts while EGFX is on a UDP tunnel.
         let adaptive_enabled =
-            adaptive_bitrate || crate::multitransport::env_truthy("MACRDP_UDP_ADAPTIVE_BITRATE");
+            adaptive_bitrate || crate::tunables::truthy("MACRDP_UDP_ADAPTIVE_BITRATE");
         let env_u32 = |name: &str, default: u32| -> u32 {
-            std::env::var(name)
+            crate::tunables::var(name)
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .filter(|&n| n > 0)
@@ -1555,7 +1555,7 @@ impl Gfx {
             "MACRDP_UDP_ADAPTIVE_INCREASE_BPS",
             (bitrate_bps / 16).max(250_000),
         );
-        let adaptive_decrease = std::env::var("MACRDP_UDP_ADAPTIVE_DECREASE")
+        let adaptive_decrease = crate::tunables::var("MACRDP_UDP_ADAPTIVE_DECREASE")
             .ok()
             .and_then(|s| s.trim().parse::<f32>().ok())
             .filter(|&f| f > 0.0 && f < 1.0)
@@ -1566,13 +1566,13 @@ impl Gfx {
         // per-transport frame-count lag thresholds, which read a long-but-clean
         // pipe (high-RTT VPN/ZeroTier) as permanent congestion. 100 ms of queue
         // is unambiguous at any RTT; exit hysteresis at half.
-        let adaptive_queue_high_ms = std::env::var("MACRDP_ADAPTIVE_QUEUE_HIGH_MS")
+        let adaptive_queue_high_ms = crate::tunables::var("MACRDP_ADAPTIVE_QUEUE_HIGH_MS")
             .ok()
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|&n| n > 0.0)
             .unwrap_or(100.0);
         // EWMA smoothing weight for the queue-delay signal (clamped to (0,1]); default 0.3.
-        let adaptive_ewma_alpha = std::env::var("MACRDP_ADAPTIVE_EWMA_ALPHA")
+        let adaptive_ewma_alpha = crate::tunables::var("MACRDP_ADAPTIVE_EWMA_ALPHA")
             .ok()
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|&a| a > 0.0 && a <= 1.0)
@@ -1580,7 +1580,7 @@ impl Gfx {
         // Retransmit tolerance per control interval for the UDP loss signal (0 = the
         // old "any retransmit = loss" behaviour). Default 2 so sporadic single
         // wireless retransmits don't ratchet the bitrate down on WiFi. See the field.
-        let adaptive_retx_tolerance = std::env::var("MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE")
+        let adaptive_retx_tolerance = crate::tunables::var("MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(2);
@@ -1607,14 +1607,14 @@ impl Gfx {
         // remap was live-verified never to heal mstsc; ≥2 re-enables
         // remap-first). max_consecutive_drops caps the cross-connection
         // drop → reconnect → blank → drop loop on a truly-stuck client.
-        let blank_recovery_enabled = match std::env::var("MACRDP_BLANK_RECOVERY") {
+        let blank_recovery_enabled = match crate::tunables::var("MACRDP_BLANK_RECOVERY") {
             Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
             Err(_) => true,
         };
         // These two RTT knobs allow an explicit 0 (= "disable"), unlike env_u32
         // whose zero-filter falls back to the default.
         let env_u32_zero_ok = |name: &str, default: u32| -> u32 {
-            std::env::var(name)
+            crate::tunables::var(name)
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(default)
@@ -1627,7 +1627,7 @@ impl Gfx {
         // remap-first (never healed) and the drop (kills the session): it
         // re-maps the client's retained surface with no disconnect. Set
         // `MACRDP_BLANK_RECOVERY_REACTIVATE=0` to fall back to the drop path.
-        let blank_reactivate = std::env::var("MACRDP_BLANK_RECOVERY_REACTIVATE")
+        let blank_reactivate = crate::tunables::var("MACRDP_BLANK_RECOVERY_REACTIVATE")
             .ok()
             .map(|s| !matches!(s.trim(), "0" | "false" | "off" | "no"))
             .unwrap_or(true);
@@ -3459,7 +3459,7 @@ impl GraphicsPipelineHandler for GfxHandler {
             "EGFX: client advertised capabilities"
         );
         let avc444 = crate::negotiator::video::caps_from_egfx(&typed).avc444
-            && std::env::var("MACRDP_AVC444").as_deref() != Ok("0");
+            && crate::tunables::var("MACRDP_AVC444").as_deref() != Ok("0");
         info!(target: "macrdp::negotiator", avc444, "video: AVC444 {}", if avc444 { "on (client advertises it)" } else { "off" });
         if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             ctx.client_supports_avc = supports_avc;

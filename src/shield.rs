@@ -67,7 +67,7 @@ const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn port() -> u16 {
-    std::env::var("MACRDP_SHIELD_PORT")
+    crate::tunables::var("MACRDP_SHIELD_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PORT)
