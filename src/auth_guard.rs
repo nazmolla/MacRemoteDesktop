@@ -1129,6 +1129,7 @@ mod tests {
             .finish();
 
         let peer = std::net::SocketAddr::from((Ipv4Addr::new(203, 0, 113, 5), 51000));
+        crate::logging::catch_all_for_tests();
         tracing::subscriber::with_default(subscriber, || {
             let mut handler = AuthGuardHandler {
                 core: AuthGuardCore::with_config(test_cfg()),
@@ -1160,6 +1161,7 @@ mod tests {
             .finish();
 
         let peer = std::net::SocketAddr::from((Ipv4Addr::new(203, 0, 113, 5), 51000));
+        crate::logging::catch_all_for_tests();
         tracing::subscriber::with_default(subscriber, || {
             let mut handler = AuthGuardHandler {
                 core: AuthGuardCore::with_config(test_cfg()),
