@@ -1525,7 +1525,12 @@ mod macos {
                 // last frame, and a settled resize gets picked up promptly
                 // instead of stalling until the next real desktop change).
                 // (Neither pending — the common idle case — blocks normally.)
-                let sample = if self.flush_remaining > 0 || self.pending_resize.has_pending() {
+                let refine_pending = self.flush_remaining == 0
+                    && self.gfx.as_ref().is_some_and(|g| g.refine_pending());
+                let sample = if self.flush_remaining > 0
+                    || self.pending_resize.has_pending()
+                    || refine_pending
+                {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(Some(sample)) => sample,
                         Ok(None) => return Ok(None),
@@ -1542,6 +1547,18 @@ mod macos {
                                         ) {
                                             tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                                         }
+                                    }
+                                }
+                            }
+                            if self.flush_remaining == 0
+                                && refine_pending
+                                && !self.last_frame.is_empty()
+                            {
+                                if let Some(gfx) = self.gfx.as_ref() {
+                                    if let Err(e) =
+                                        gfx.refine_tick(&self.last_frame, self.last_stride)
+                                    {
+                                        tracing::warn!(error = ?e, "lossless refinement failed");
                                     }
                                 }
                             }

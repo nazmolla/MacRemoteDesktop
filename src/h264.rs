@@ -179,6 +179,11 @@ pub(crate) enum FrameRegions {
     SameAsLast,
 }
 
+/// A tile unchanged this long is re-sent losslessly (spec §8.3: ~150–300 ms).
+const REFINE_IDLE: std::time::Duration = std::time::Duration::from_millis(200);
+/// Tiles per refinement tick (64×64 each) — bounds one tick's burst.
+const REFINE_BUDGET_TILES: usize = 48;
+
 /// Cap before collapsing a frame's regions into their bounding box.
 const MAX_AVC_REGIONS: usize = 16;
 
@@ -188,6 +193,10 @@ struct ConnectionContext {
     region_queue: std::collections::VecDeque<(i64, Option<Vec<crate::refine::Rect>>)>,
     /// Regions of the last submitted frame (for `FrameRegions::SameAsLast`).
     last_regions: Option<Vec<crate::refine::Rect>>,
+    /// Tiles changed by AVC frames and not yet re-sent losslessly.
+    refine: crate::refine::Tracker,
+    /// Per-connection ClearCodec encoder (its glyph cache mirrors the client's).
+    clearcodec: ironrdp_graphics::clearcodec::ClearCodecEncoder,
     server_handle: GfxServerHandle,
     encoder: Option<Encoder>,
     surface_id: Option<u16>,
@@ -2058,6 +2067,19 @@ impl Gfx {
                 }
             };
             ctx.last_regions = resolved.clone();
+            let (dw, dh) = (u32::from(ctx.dims.0), u32::from(ctx.dims.1));
+            if ctx.refine.size() != (dw, dh) {
+                ctx.refine.resize(dw, dh);
+            }
+            let full = [crate::refine::Rect {
+                x: 0,
+                y: 0,
+                w: dw,
+                h: dh,
+            }];
+            ctx.refine
+                .mark_dirty(resolved.as_deref().unwrap_or(&full), Instant::now());
+            trace!(dims = ?ctx.dims, rects = resolved.as_ref().map(Vec::len), pending = ctx.refine.has_pending(), "refine: marked");
             ctx.region_queue.push_back((pts, resolved));
             while ctx.region_queue.len() > 128 {
                 ctx.region_queue.pop_front();
@@ -2541,6 +2563,104 @@ impl Gfx {
     /// client-requested resize/reactivation window where the client expects
     /// a graphics reset — the same position it occupies on every fresh
     /// connection.
+    /// Whether lossless refinement still has tiles to send (capture keeps
+    /// ticking while this is true).
+    pub(crate) fn refine_pending(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| ctx.refine.has_pending())
+    }
+
+    /// Re-send tiles that have been idle for [`REFINE_IDLE`] losslessly
+    /// (ClearCodec), so static content ends bit-exact (spec §8.3). `bgra` is the
+    /// last captured frame. Skips while AVC frames are in flight so a tile never
+    /// lands before the lossy frame it corrects; the ctx lock is held across the
+    /// send so no newer AVC frame can be submitted in between.
+    pub(crate) fn refine_tick(&self, bgra: &[u8], stride: usize) -> Result<()> {
+        let mut guard = self.ctx.lock().unwrap();
+        let Some(ctx) = guard.as_mut() else {
+            return Ok(());
+        };
+        let Some(surface_id) = ctx.surface_id else {
+            return Ok(());
+        };
+        let (sub, shp) = (
+            ctx.submitted.load(Ordering::Relaxed),
+            ctx.shipped.load(Ordering::Relaxed),
+        );
+        if !ctx.is_ready || sub != shp {
+            info!(
+                ready = ctx.is_ready,
+                submitted = sub,
+                shipped = shp,
+                "refine: waiting for in-flight frames"
+            );
+            return Ok(());
+        }
+        let (w, h) = ctx.dims;
+        if bgra.len() < stride * usize::from(h) || ctx.refine.size() != (u32::from(w), u32::from(h))
+        {
+            trace!(len = bgra.len(), stride, w, h, tracker = ?ctx.refine.size(), "refine: frame/tracker size mismatch");
+            return Ok(());
+        }
+        let ready = ctx
+            .refine
+            .take_ready(Instant::now(), REFINE_IDLE, REFINE_BUDGET_TILES);
+        if ready.is_empty() {
+            return Ok(());
+        }
+        let mut tiles = Vec::with_capacity(ready.len());
+        for r in &ready {
+            let data = crate::lossless::encode_region(
+                &mut ctx.clearcodec,
+                bgra,
+                stride,
+                u32::from(h),
+                *r,
+            )?;
+            tiles.push(ironrdp_egfx::server::MixedTilePayload::ClearCodec {
+                destination: ironrdp_pdu::geometry::ExclusiveRectangle {
+                    left: r.x as u16,
+                    top: r.y as u16,
+                    right: (r.x + r.w) as u16,
+                    bottom: (r.y + r.h) as u16,
+                },
+                bitmap_data: data,
+            });
+        }
+        let ts_ms =
+            u32::try_from(ctx.epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
+        let (dvc_messages, egfx_channel_id) = {
+            let mut server = ctx.server_handle.lock().unwrap();
+            let Some(channel) = server.channel_id() else {
+                return Ok(());
+            };
+            server.send_mixed_frame(surface_id, tiles, ts_ms);
+            (server.drain_output(), channel)
+        };
+        if dvc_messages.is_empty() {
+            return Ok(());
+        }
+        let svc_messages =
+            encode_dvc_messages(egfx_channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
+        let sender = self
+            .sender
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
+        sender
+            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                messages: svc_messages,
+            }))
+            .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
+        debug!(tiles = ready.len(), "lossless refinement sent");
+        Ok(())
+    }
+
     pub(crate) fn reset_for_live_resize(&self) {
         let mut guard = self.ctx.lock().unwrap();
         if let Some(ctx) = guard.as_mut() {
@@ -2908,6 +3028,8 @@ impl GfxServerFactory for Gfx {
         *self.ctx.lock().unwrap() = Some(ConnectionContext {
             region_queue: std::collections::VecDeque::new(),
             last_regions: None,
+            refine: crate::refine::Tracker::new(0, 0),
+            clearcodec: ironrdp_graphics::clearcodec::ClearCodecEncoder::new(),
             server_handle: handle.clone(),
             encoder: None,
             surface_id: None,
