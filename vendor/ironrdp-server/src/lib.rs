@@ -16,6 +16,7 @@ mod encoder;
 #[cfg(feature = "egfx")]
 mod gfx;
 mod handler;
+mod handshake;
 #[cfg(feature = "helper")]
 mod helper;
 #[cfg(feature = "multitransport")]
@@ -35,6 +36,7 @@ pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoSe
 #[cfg(feature = "egfx")]
 pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
 pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+pub use handshake::{HandshakeFailure, HandshakeLimits, source_key};
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;
 #[cfg(feature = "multitransport")]
@@ -59,8 +61,8 @@ pub use rdpeusb::{
     UsbHandle, UsbPipe,
 };
 pub use server::{
-    ConnectionHandler, Credentials, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
-    ServerEventSender, tcp_srtt_ms,
+    ConnectionHandler, Credentials, CredentialsHandle, PostConnectionAction, RdpServer, RdpServerOptions,
+    RdpServerSecurity, ServerEvent, ServerEventSender, tcp_srtt_ms,
 };
 pub use sound::{AudioWave, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 
