@@ -45,6 +45,15 @@ impl Tracker {
         t
     }
 
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Whether any tile is waiting to be refined (ready now or later).
+    pub fn has_pending(&self) -> bool {
+        self.tiles.iter().any(|t| matches!(t, TileState::Dirty(_)))
+    }
+
     /// Change the surface size; forgets all pending tiles.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width;
