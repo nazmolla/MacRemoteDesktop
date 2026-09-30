@@ -278,6 +278,63 @@ impl Avc444Buffers {
     }
 }
 
+// ---- Lock order ----------------------------------------------------------
+//
+// `server_handle` (the connection's `GraphicsPipelineServer`) may be locked and
+// then `ctx`, never the other way round: the vendored dispatcher holds the
+// server lock while it calls into `GfxHandler`, which locks `ctx`. Every ctx
+// lock goes through `lock_ctx` and every server lock through `lock_server`; in
+// debug builds the ctx locks held by the current thread are counted and
+// `lock_server` panics if any is alive, so a reversed order fails in tests
+// instead of deadlocking a session in the field.
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static CTX_LOCKS_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A held `ctx` lock. Derefs to the context slot.
+struct CtxGuard<'a>(std::sync::MutexGuard<'a, Option<ConnectionContext>>);
+
+impl std::ops::Deref for CtxGuard<'_> {
+    type Target = Option<ConnectionContext>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for CtxGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for CtxGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        CTX_LOCKS_HELD.with(|n| n.set(n.get() - 1));
+    }
+}
+
+fn lock_ctx(ctx: &Mutex<Option<ConnectionContext>>) -> CtxGuard<'_> {
+    let guard = ctx.lock_or_recover();
+    #[cfg(debug_assertions)]
+    CTX_LOCKS_HELD.with(|n| n.set(n.get() + 1));
+    CtxGuard(guard)
+}
+
+fn lock_server(server: &GfxServerHandle) -> std::sync::MutexGuard<'_, GraphicsPipelineServer> {
+    #[cfg(debug_assertions)]
+    CTX_LOCKS_HELD.with(|n| {
+        assert_eq!(
+            n.get(),
+            0,
+            "lock order: the EGFX server lock must not be taken while holding ctx"
+        )
+    });
+    server.lock_or_recover()
+}
+
 struct ConnectionContext {
     /// Client negotiated AVC444 (spec §8.2 codec ladder): frames are encoded as
     /// a main + auxiliary H.264 pair and shipped with `send_avc444_frame`.
@@ -338,7 +395,7 @@ struct ConnectionContext {
     submitted: Arc<AtomicU64>,
     shipped: Arc<AtomicU64>,
     /// Dimensions the surface + encoder were created with (in
-    /// `setup_locked`, from the live `SharedDesktopSize`). `ship_frames`
+    /// `ensure_surface`, from the live `SharedDesktopSize`). `ship_frames`
     /// builds its AVC420 regions from these — not from a fresh
     /// `SharedDesktopSize` read — so a size adoption between setup and ship
     /// can't tear the region away from the surface.
@@ -746,7 +803,7 @@ enum BlankAction {
     /// vendored server turns into `deactivate_all` +
     /// `Acceptor::new_deactivation_reactivation` — and that call PRESERVES the
     /// static channels, so the EGFX DVC (and our `ConnectionContext`/surface)
-    /// survive: `build_server_with_handle` is not re-run, `setup_locked` skips
+    /// survive: `build_server_with_handle` is not re-run, `ensure_surface` skips
     /// (`surface_id` already `Some`), so NO `resize_with_monitors` / NO
     /// DeleteSurface fires. A forced IDR follows. **LIVE-VERIFIED 2026-07-07 to
     /// HEAL the mstsc reconnect-blank** — 5/5 blanks on real mstsc/WiFi went
@@ -1284,7 +1341,7 @@ pub struct Gfx {
     sender: Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>,
     ctx: Arc<Mutex<Option<ConnectionContext>>>,
     /// Live session desktop size, shared with `CaptureDisplay` /
-    /// `MacInputHandler`. Read in `setup_locked` when the per-connection
+    /// `MacInputHandler`. Read in `ensure_surface` when the per-connection
     /// surface + encoder are created, so the H.264 pipeline tracks the
     /// client-resolution auto-adopt without rebuilding the factory.
     desktop_size: crate::capture::SharedDesktopSize,
@@ -1702,7 +1759,7 @@ impl Gfx {
         if !on_reliable_udp {
             return; // not on the reliable UDP tunnel → nothing to switch
         }
-        let mut guard = self.ctx.lock_or_recover();
+        let mut guard = lock_ctx(&self.ctx);
         let Some(ctx) = guard.as_mut() else {
             return;
         };
@@ -1753,7 +1810,7 @@ impl Gfx {
         regions: FrameRegions,
     ) -> Result<bool> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
-        // returns immediately; a dedicated ship thread (spawned in setup_locked)
+        // returns immediately; a dedicated ship thread (spawned in setup_encoder_locked)
         // pulls each encoded frame off VT's output channel and ships it the
         // instant it's ready. The capture thread never blocks on the encoder, so
         // it keeps pace with ScreenCaptureKit instead of falling behind under
@@ -1763,8 +1820,9 @@ impl Gfx {
         // `server_handle`, which is never taken while holding ctx — the ship/ack
         // lock-order invariant). The decision extracts what the action needs here.
         let mut blank_recovery: Option<(BlankAction, GfxServerHandle, u16, u16, u32)> = None;
+        self.ensure_surface()?;
         let force_keyframe = {
-            let mut guard = self.ctx.lock_or_recover();
+            let mut guard = lock_ctx(&self.ctx);
             let Some(ctx) = guard.as_mut() else {
                 return Ok(false); // no active connection
             };
@@ -1851,10 +1909,16 @@ impl Gfx {
                     );
                 }
             }
-            // Lazy one-time setup on the first ready frame (creates the encoder
-            // and spawns the ship thread).
-            if ctx.surface_id.is_none() || ctx.encoder.is_none() {
-                self.setup_locked(ctx)?;
+            // Lazy one-time setup on the first ready frame. The surface is
+            // created by `ensure_surface` before `ctx` is taken (it needs the
+            // server lock, which must come first); if the channel became ready
+            // only after that check, this frame is skipped and the next one
+            // creates it. The encoder and ship thread are set up here.
+            if ctx.surface_id.is_none() {
+                return Ok(true);
+            }
+            if ctx.encoder.is_none() {
+                self.setup_encoder_locked(ctx)?;
             }
             // Blank-presentation detector (the mstsc reconnect-blank): the client
             // is decoding + acking every frame (QoE reports flowing) but its
@@ -2148,7 +2212,7 @@ impl Gfx {
         // Submit to VideoToolbox (async). The ship thread delivers + ships the
         // output; we just count the submission for the drop-to-latest throttle.
         {
-            let mut guard = self.ctx.lock_or_recover();
+            let mut guard = lock_ctx(&self.ctx);
             let Some(ctx) = guard.as_mut() else {
                 return Ok(true);
             };
@@ -2494,14 +2558,33 @@ impl Gfx {
         debug!("EGFX ship loop exiting (output channel closed)");
     }
 
-    /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
-    fn setup_locked(&self, ctx: &mut ConnectionContext) -> Result<()> {
+    /// Create and map this connection's EGFX surface if it does not exist yet.
+    ///
+    /// Takes the server lock first and `ctx` second (see "Lock order" above).
+    /// `ctx` is only peeked at before that, to find the server handle, and
+    /// re-checked once both are held: a reconnect may have swapped the
+    /// context, or another frame may have created the surface meanwhile.
+    fn ensure_surface(&self) -> Result<()> {
+        let server_handle = {
+            let guard = lock_ctx(&self.ctx);
+            match guard.as_ref() {
+                Some(ctx) if ctx.is_ready && ctx.surface_id.is_none() => ctx.server_handle.clone(),
+                _ => return Ok(()),
+            }
+        };
+        let mut server = lock_server(&server_handle);
+        let mut guard = lock_ctx(&self.ctx);
+        let Some(ctx) = guard.as_mut() else {
+            return Ok(());
+        };
+        if !Arc::ptr_eq(&ctx.server_handle, &server_handle) || ctx.surface_id.is_some() {
+            return Ok(());
+        }
         // Read the live session size once and pin it for this connection's
         // surface + encoder + ship-side regions.
         let (width, height) = self.desktop_size.get();
         if ctx.surface_id.is_none() {
             ctx.dims = (width, height);
-            let mut server = ctx.server_handle.lock_or_recover();
             server.set_output_dimensions(width, height);
             // Emit RESET_GRAPHICS with an explicit single-monitor layout
             // covering the full desktop, BEFORE create_surface. The auto-reset
@@ -2544,6 +2627,12 @@ impl Gfx {
                 "EGFX surface created + mapped"
             );
         }
+        Ok(())
+    }
+
+    /// One-time per-connection encoder setup, once the surface exists (see
+    /// [`Self::ensure_surface`]). Caller holds `ctx`; never touches the server.
+    fn setup_encoder_locked(&self, ctx: &mut ConnectionContext) -> Result<()> {
         // Encoder dims always follow the surface's creation dims, so an
         // encoder (re)build can never disagree with an existing surface.
         let (width, height) = ctx.dims;
@@ -2640,7 +2729,7 @@ impl Gfx {
         height: u16,
     ) -> Result<()> {
         let (dvc_messages, egfx_channel_id, new_sid) = {
-            let mut server = server_handle.lock_or_recover();
+            let mut server = lock_server(server_handle);
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX blank remap: channel_id not assigned"))?;
@@ -2672,7 +2761,7 @@ impl Gfx {
         }
         // Publish the fresh surface to the connection — unless a reconnect
         // swapped the context out from under the remap.
-        let mut guard = self.ctx.lock_or_recover();
+        let mut guard = lock_ctx(&self.ctx);
         match guard.as_mut() {
             Some(ctx) if Arc::ptr_eq(&ctx.server_handle, server_handle) => {
                 ctx.surface_id = Some(new_sid);
@@ -2697,7 +2786,8 @@ impl Gfx {
     /// drives the core deactivation-reactivation.
     ///
     /// Just resets the per-connection surface/encoder state so the first
-    /// frame after the reactivation re-runs `setup_locked` from scratch —
+    /// frame after the reactivation re-runs `ensure_surface` and
+    /// `setup_encoder_locked` from scratch —
     /// `resize_with_monitors` at the new size (DeleteSurface of the old
     /// surfaces + RESET_GRAPHICS + fresh surface + map) + a fresh
     /// VideoToolbox encoder + ship thread + IDR — the exact sequence a
@@ -2721,8 +2811,7 @@ impl Gfx {
     /// Whether lossless refinement still has tiles to send (capture keeps
     /// ticking while this is true).
     pub(crate) fn refine_pending(&self) -> bool {
-        self.ctx
-            .lock_or_recover()
+        lock_ctx(&self.ctx)
             .as_ref()
             .is_some_and(|ctx| ctx.refine.has_pending())
     }
@@ -2737,7 +2826,7 @@ impl Gfx {
     pub(crate) fn refine_tick(&self, bgra: &[u8], stride: usize, piggyback: bool) -> Result<()> {
         let now = Instant::now();
         let (surface_id, server_handle, epoch, ready, tiles) = {
-            let mut guard = self.ctx.lock_or_recover();
+            let mut guard = lock_ctx(&self.ctx);
             let Some(ctx) = guard.as_mut() else {
                 return Ok(());
             };
@@ -2802,7 +2891,7 @@ impl Gfx {
         };
         let ts_ms = u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
         let sent = {
-            let mut server = server_handle.lock_or_recover();
+            let mut server = lock_server(&server_handle);
             match server.channel_id() {
                 Some(channel) if server.send_mixed_frame(surface_id, tiles, ts_ms).is_some() => {
                     Some((server.drain_output(), channel))
@@ -2811,7 +2900,7 @@ impl Gfx {
             }
         };
         let Some((dvc_messages, egfx_channel_id)) = sent else {
-            if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
+            if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
                 Self::refine_failed(ctx, &ready, now);
             }
             return Ok(());
@@ -2846,13 +2935,13 @@ impl Gfx {
     }
 
     pub(crate) fn reset_for_live_resize(&self) {
-        let mut guard = self.ctx.lock_or_recover();
+        let mut guard = lock_ctx(&self.ctx);
         if let Some(ctx) = guard.as_mut() {
             // Order matters only in that both must be cleared before the
             // post-reactivation submit: encoder drop tears down the old VT
             // session + ship thread now; surface_id=None makes the next
-            // `submit_bgra` run `setup_locked` (which also rebuilds the
-            // encoder and resets the throttle counters).
+            // `submit_bgra` run `ensure_surface` and `setup_encoder_locked`
+            // (which rebuilds the encoder and resets the throttle counters).
             ctx.encoder = None;
             ctx.aux_encoder = None;
             ctx.region_queue.clear();
@@ -2870,7 +2959,7 @@ impl Gfx {
     /// `reactivate_request`; the capture loop drains it and emits a no-op
     /// `DisplayUpdate::Resize` to that size, which the vendored server turns
     /// into Server Deactivate All → new Demand Active while PRESERVING the
-    /// static channels (so the EGFX DVC + our surface survive; `setup_locked`
+    /// static channels (so the EGFX DVC + our surface survive; `ensure_surface`
     /// skips, no `resize_with_monitors`/DeleteSurface). The post-reactivation
     /// IDR was already armed under ctx in the decision block.
     fn perform_blank_reactivate(&self, width: u16, height: u16) -> Result<()> {
@@ -2897,10 +2986,8 @@ impl Gfx {
     /// case on some client, [`request_reactivation`] is the heavier escalation.
     /// `capture.rs` calls this when it observes the flag.
     pub(crate) fn force_keyframe(&self) {
-        if let Ok(mut guard) = self.ctx.lock() {
-            if let Some(ctx) = guard.as_mut() {
-                ctx.need_keyframe = true;
-            }
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
+            ctx.need_keyframe = true;
         }
         info!("manual A/V resync (Ctrl+Alt+Shift+R): forcing an IDR keyframe");
     }
@@ -2915,10 +3002,8 @@ impl Gfx {
     pub(crate) fn request_reactivation(&self, width: u16, height: u16) {
         let packed = (u32::from(width) << 16) | u32::from(height);
         self.reactivate_request.store(packed, Ordering::Relaxed);
-        if let Ok(mut guard) = self.ctx.lock() {
-            if let Some(ctx) = guard.as_mut() {
-                ctx.need_keyframe = true;
-            }
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
+            ctx.need_keyframe = true;
         }
         info!(
             width,
@@ -2993,7 +3078,7 @@ impl Gfx {
                 ship_times,
                 frame_regions,
             ) = {
-                let mut guard = self.ctx.lock_or_recover();
+                let mut guard = lock_ctx(&self.ctx);
                 let ctx = guard
                     .as_mut()
                     .ok_or_else(|| anyhow!("EGFX: ctx vanished mid-submit"))?;
@@ -3062,7 +3147,7 @@ impl Gfx {
             };
 
             // Phase 2: lock `server_handle` ALONE (ctx already released).
-            let mut server = server_handle.lock_or_recover();
+            let mut server = lock_server(&server_handle);
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
@@ -3249,7 +3334,7 @@ impl GfxServerFactory for Gfx {
         } else {
             self.bitrate_bps
         };
-        *self.ctx.lock_or_recover() = Some(ConnectionContext {
+        *lock_ctx(&self.ctx) = Some(ConnectionContext {
             avc444: false,
             aux_encoder: None,
             avc444_buf: Avc444Buffers::default(),
@@ -3376,14 +3461,14 @@ impl GraphicsPipelineHandler for GfxHandler {
         let avc444 = crate::negotiator::video::caps_from_egfx(&typed).avc444
             && std::env::var("MACRDP_AVC444").as_deref() != Ok("0");
         info!(target: "macrdp::negotiator", avc444, "video: AVC444 {}", if avc444 { "on (client advertises it)" } else { "off" });
-        if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             ctx.client_supports_avc = supports_avc;
             ctx.avc444 = avc444;
         }
     }
 
     fn on_ready(&mut self, negotiated: &CapabilitySet) {
-        if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             // Only drive the H.264 path if the client advertised AVC420 decode
             // support. Otherwise leave is_ready false → submit_bgra returns
             // Ok(false) → capture.rs uses legacy BitmapUpdate. Shipping AVC420
@@ -3421,7 +3506,7 @@ impl GraphicsPipelineHandler for GfxHandler {
         // Feed ack-driven IDR recovery (EGFX-on-lossy): record liveness, and note
         // whether the client suspended acks (queueDepth == SUSPEND_FRAME_
         // ACKNOWLEDGEMENT 0xFFFFFFFF) — with acks off, loss can't be inferred.
-        if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             ctx.last_ack_at = Instant::now();
             ctx.acks_suspended = queue_depth == 0xFFFF_FFFF;
             // Record decode progress for the UDP frame-ack-lag backpressure gate.
@@ -3508,7 +3593,7 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// (like `on_frame_ack`), so it only touches ctx — never `server_handle`.
     fn on_qoe_metrics(&mut self, metrics: QoeMetrics) {
         trace!(?metrics, "EGFX on_qoe_metrics");
-        if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             let was = ctx.qoe;
             ctx.qoe.record(metrics.time_diff_dr);
             if metrics.time_diff_dr > 0 {
@@ -3578,7 +3663,7 @@ impl GraphicsPipelineHandler for GfxHandler {
         // We can only log our own per-connection view here: the
         // `GraphicsPipelineServer` mutex is held while this callback runs, so we
         // must not lock `server_handle`.
-        if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             debug!(
                 surface_id = ?ctx.surface_id,
                 dims = ?ctx.dims,
@@ -3651,6 +3736,44 @@ pub(crate) fn avcc_to_annex_b(
 
 #[cfg(test)]
 mod tests {
+    use super::{lock_ctx, lock_server, ConnectionContext, GfxHandler, GfxServerHandle};
+    use ironrdp_egfx::server::GraphicsPipelineServer;
+
+    fn server_and_ctx() -> (GfxServerHandle, std::sync::Mutex<Option<ConnectionContext>>) {
+        let handler = Box::new(GfxHandler {
+            ctx: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        });
+        let server =
+            std::sync::Arc::new(std::sync::Mutex::new(GraphicsPipelineServer::new(handler)));
+        (server, std::sync::Mutex::new(None))
+    }
+
+    /// The documented order (server, then ctx) is allowed.
+    #[test]
+    fn server_then_ctx_is_allowed() {
+        let (server, ctx) = server_and_ctx();
+        let _s = lock_server(&server);
+        let _c = lock_ctx(&ctx);
+    }
+
+    /// The reversed order panics in debug builds instead of deadlocking.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "lock order")]
+    fn server_under_ctx_panics_in_debug() {
+        let (server, ctx) = server_and_ctx();
+        let _c = lock_ctx(&ctx);
+        let _s = lock_server(&server);
+    }
+
+    /// Dropping the ctx guard lifts the restriction again.
+    #[test]
+    fn server_after_ctx_is_released_is_allowed() {
+        let (server, ctx) = server_and_ctx();
+        drop(lock_ctx(&ctx));
+        let _s = lock_server(&server);
+    }
+
     use super::*;
 
     fn recovery_params() -> RecoveryParams {
