@@ -1556,7 +1556,7 @@ mod macos {
                             {
                                 if let Some(gfx) = self.gfx.as_ref() {
                                     if let Err(e) =
-                                        gfx.refine_tick(&self.last_frame, self.last_stride)
+                                        gfx.refine_tick(&self.last_frame, self.last_stride, false)
                                     {
                                         tracing::warn!(error = ?e, "lossless refinement failed");
                                     }
@@ -1718,12 +1718,19 @@ mod macos {
                             None => crate::h264::FrameRegions::Full,
                         }
                     };
-                    match gfx.submit_bgra_regions(
+                    let submitted = gfx.submit_bgra_regions(
                         src,
                         stride_bytes,
                         big_change || resume_keyframe,
                         regions,
-                    ) {
+                    );
+                    // Refine static tiles even while something animates (review I4).
+                    if matches!(submitted, Ok(true)) && gfx.refine_pending() {
+                        if let Err(e) = gfx.refine_tick(src, stride_bytes, true) {
+                            tracing::warn!(error = ?e, "lossless refinement failed");
+                        }
+                    }
+                    match submitted {
                         Ok(true) => {
                             self.seeded = true;
                             // First-EGFX-frame milestone: arms the suppress

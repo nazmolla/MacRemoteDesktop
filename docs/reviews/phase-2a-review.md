@@ -79,3 +79,15 @@ Once EGFX rides the lossy UDP flow, a dropped mixed frame is not retransmitted, 
 
 ### M3. `negotiator::video::caps_from_egfx` ORs flags across every advertised capset
 `src/negotiator/video.rs:50-82`. The server confirms one capset (the highest), so a client advertising `V8_1{AVC420_ENABLED}` plus `V10_x{AVC_DISABLED}` is planned as AVC420 while the confirmed capset disables AVC; sending AVC420 then is a protocol violation. Latent (the ladder is not wired yet; `h264.rs::caps_indicate_avc` has the same shape). Fix: derive `VideoCaps` from the negotiated capset passed to `on_ready`, not from the advertise list.
+
+## Resolution (2026-09-30)
+- C1 fixed: `refine_tick` prepares tiles under `ctx`, releases it, then locks `server_handle`.
+- C2 fixed: refinement tracker is marked at ship time from the regions actually painted (keyframe / full / empty → whole surface); submit-time marking removed.
+- C3 fixed on `phase-2-avc444-math` (merged).
+- I1 fixed: `RegionDebt` accumulates every capture's regions before any drop decision; the next encoded frame ships the union.
+- I2 fixed: in-flight gate removed (tiles are refined with the newest pixels; a later repaint re-marks them), so VT drops / counter resets can't stall refinement; log is `trace!`.
+- I3 fixed: region queue, last regions and debt reset wherever the encoder is dropped or rebuilt.
+- I4 fixed: refinement also piggybacks on submits (rate-limited to 100 ms), not only on idle timeouts.
+- I5 fixed: stride/size checked before `take_ready`; on encode/send failure tiles are re-marked due and the ClearCodec encoder restarts.
+- Minor M1–M3 deferred to Phase 2b.
+- Verification gap: loopback on this Mac mirrors the virtual display onto the screen that shows the FreeRDP window (feedback loop → full-screen change every frame), so idle refinement can't be observed locally; covered by the real-mstsc checklist.
