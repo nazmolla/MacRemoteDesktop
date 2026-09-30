@@ -42,6 +42,7 @@ mod logging;
 mod lossless;
 mod multitransport;
 mod negotiator;
+mod private_dir;
 mod rdpdr;
 mod reaper;
 mod refine;
@@ -800,7 +801,7 @@ struct Args {
 #[cfg(target_os = "macos")]
 fn prevent_sleep() {
     let pid = std::process::id().to_string();
-    let res = std::process::Command::new("caffeinate")
+    let res = std::process::Command::new("/usr/bin/caffeinate")
         .args(["-dimsu", "-w", &pid])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -4234,5 +4235,46 @@ mod tls_tests {
         assert!(cert_dir.join("cert.pem").exists());
         assert!(cert_dir.join("key.pem").exists());
         fs::remove_dir_all(&cert_dir).ok();
+    }
+}
+
+/// Every external program is started by absolute path, so nothing earlier on
+/// `PATH` can stand in for it (review finding S6). Test-only files, which run
+/// developer tools such as ffmpeg, are exempt.
+#[cfg(test)]
+mod command_path_tests {
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn external_commands_use_absolute_paths() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        let needle = concat!("Command::new", "(\"");
+        let mut bare = Vec::new();
+        for file in files {
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            if name.ends_with("_test.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                if let Some(at) = line.find(needle) {
+                    if !line[at + needle.len()..].starts_with('/') {
+                        bare.push(format!("{}:{}", file.display(), i + 1));
+                    }
+                }
+            }
+        }
+        assert!(bare.is_empty(), "commands started by bare name: {bare:?}");
     }
 }

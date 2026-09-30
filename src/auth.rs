@@ -156,7 +156,9 @@ mod pam_impl {
                 let bytes = pw_cstr.as_bytes_with_nul();
                 let buf = unsafe { libc::malloc(bytes.len()) } as *mut c_char;
                 if buf.is_null() {
-                    unsafe { libc::free(arr as *mut c_void) };
+                    // SAFETY: `arr` holds `num_msg` zero-initialised entries
+                    // (calloc) and only entries before `i` can have been filled.
+                    unsafe { free_responses(arr, i) };
                     return 1;
                 }
                 unsafe {
@@ -172,6 +174,34 @@ mod pam_impl {
         }
         unsafe { *out_resp = arr };
         PAM_SUCCESS
+    }
+
+    /// Wipe and free the password copies in the first `filled` responses, then
+    /// the array itself. Used when the conversation fails part-way, so libpam
+    /// never sees (or frees) the array.
+    ///
+    /// # Safety
+    /// `arr` must come from `calloc` with at least `filled` entries, each
+    /// `resp` either null or a NUL-terminated buffer from `malloc`.
+    unsafe fn free_responses(arr: *mut PamResponse, filled: isize) {
+        for j in 0..filled {
+            // SAFETY: j < filled, within the allocation (see above).
+            let resp = unsafe { (*arr.offset(j)).resp };
+            if resp.is_null() {
+                continue;
+            }
+            // SAFETY: `resp` is a NUL-terminated malloc'd buffer we wrote.
+            let len = unsafe { libc::strlen(resp) };
+            for k in 0..len {
+                // Volatile so the wipe is not optimised away before free.
+                // SAFETY: k < len, inside the buffer.
+                unsafe { std::ptr::write_volatile(resp.add(k), 0) };
+            }
+            // SAFETY: allocated with malloc in `conv`, freed exactly once.
+            unsafe { libc::free(resp as *mut c_void) };
+        }
+        // SAFETY: allocated with calloc in `conv`, freed exactly once.
+        unsafe { libc::free(arr as *mut c_void) };
     }
 
     pub fn check(service: &str, username: &str, password: &str) -> Verdict {

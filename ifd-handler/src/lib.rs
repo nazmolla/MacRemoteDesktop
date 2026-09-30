@@ -24,11 +24,19 @@
 //! connects fail and we report "no card".
 
 #![allow(non_snake_case)]
+// The IFDH* functions are C entry points called by slotd with pointers it
+// owns; each checks its pointers for null before use. Marking them `unsafe fn`
+// would change nothing for the C caller.
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "C ABI entry points; pointer validity is the caller's contract"
+)]
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::os::raw::c_char;
-use std::sync::{Mutex, OnceLock};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 // ---- IFDHandler v3.0 C types ----
@@ -64,6 +72,8 @@ const TAG_IFD_SLOTS_NUMBER: Dword = 0x0FAE;
 const TAG_IFD_SIMULTANEOUS_ACCESS: Dword = 0x0FAF;
 
 const MAX_ATR: usize = 33;
+/// Largest response APDU: 65536 data bytes plus SW1 SW2 (extended length).
+const MAX_RESPONSE: usize = 65538;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const IO_TIMEOUT: Duration = Duration::from_millis(5000);
 
@@ -91,6 +101,22 @@ struct State {
 fn state() -> &'static Mutex<State> {
     static S: OnceLock<Mutex<State>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(State::default()))
+}
+
+/// Lock the state, recovering from a poisoned lock: a panic in an earlier call
+/// (already caught by [`ffi_guard`]) must not wedge every later one. The state
+/// is a connection and a cached ATR, both safe to reuse or reset.
+fn locked() -> MutexGuard<'static, State> {
+    state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Run an entry point's body, turning a panic into `on_panic`. This code runs
+/// inside `slotd`, the system smart-card daemon; a panic must never unwind
+/// into it (or abort it, which is what unwinding out of `extern "C"` does).
+fn ffi_guard(on_panic: ResponseCode, f: impl FnOnce() -> ResponseCode) -> ResponseCode {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(on_panic)
 }
 
 impl State {
@@ -148,7 +174,17 @@ fn read_u32(s: &mut TcpStream) -> std::io::Result<u32> {
     Ok(u32::from_be_bytes(b))
 }
 
-fn read_vec(s: &mut TcpStream, len: usize) -> std::io::Result<Vec<u8>> {
+/// Read `len` bytes, refusing a length above `max` before allocating. The
+/// length comes from whatever holds the loopback port, which any local process
+/// can bind while macrdp is not listening; an unchecked `0xFFFFFFFF` would make
+/// `slotd` try to allocate 4 GiB and abort.
+fn read_vec(s: &mut impl Read, len: usize, max: usize) -> std::io::Result<Vec<u8>> {
+    if len > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("length {len} exceeds {max}"),
+        ));
+    }
     let mut v = vec![0u8; len];
     s.read_exact(&mut v)?;
     Ok(v)
@@ -160,25 +196,31 @@ fn read_vec(s: &mut TcpStream, len: usize) -> std::io::Result<Vec<u8>> {
 /// lazily per op, so just clear stale state.
 #[no_mangle]
 pub extern "C" fn IFDHCreateChannelByName(_Lun: Dword, _DeviceName: Lpstr) -> ResponseCode {
-    state().lock().unwrap().reset();
-    IFD_SUCCESS
+    ffi_guard(IFD_COMMUNICATION_ERROR, || {
+        locked().reset();
+        IFD_SUCCESS
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn IFDHCreateChannel(_Lun: Dword, _Channel: Dword) -> ResponseCode {
-    state().lock().unwrap().reset();
-    IFD_SUCCESS
+    ffi_guard(IFD_COMMUNICATION_ERROR, || {
+        locked().reset();
+        IFD_SUCCESS
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn IFDHCloseChannel(_Lun: Dword) -> ResponseCode {
-    let mut s = state().lock().unwrap();
-    // Best-effort power-off, then drop the connection.
-    let _ = with_conn(&mut s, |c| {
-        c.write_all(&[CMD_POWER_OFF]).and_then(|_| read_u8(c))
-    });
-    s.reset();
-    IFD_SUCCESS
+    ffi_guard(IFD_COMMUNICATION_ERROR, || {
+        let mut s = locked();
+        // Best-effort power-off, then drop the connection.
+        let _ = with_conn(&mut s, |c| {
+            c.write_all(&[CMD_POWER_OFF]).and_then(|_| read_u8(c))
+        });
+        s.reset();
+        IFD_SUCCESS
+    })
 }
 
 /// Report fixed capabilities. The buffer at `Value` has capacity `*Length` on
@@ -190,45 +232,47 @@ pub extern "C" fn IFDHGetCapabilities(
     Length: PDword,
     Value: PUchar,
 ) -> ResponseCode {
-    if Length.is_null() {
-        return IFD_COMMUNICATION_ERROR;
-    }
-    let cap = unsafe { *Length } as usize;
-    let write_bytes = |bytes: &[u8]| -> bool {
-        if Value.is_null() || cap < bytes.len() {
-            return false;
+    ffi_guard(IFD_COMMUNICATION_ERROR, || {
+        if Length.is_null() {
+            return IFD_COMMUNICATION_ERROR;
         }
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), Value, bytes.len());
-            *Length = bytes.len() as u32;
-        }
-        true
-    };
-    match Tag {
-        TAG_IFD_SLOTS_NUMBER | TAG_IFD_SIMULTANEOUS_ACCESS => {
-            if write_bytes(&[1u8]) {
-                IFD_SUCCESS
-            } else {
-                IFD_ERROR_TAG
+        let cap = unsafe { *Length } as usize;
+        let write_bytes = |bytes: &[u8]| -> bool {
+            if Value.is_null() || cap < bytes.len() {
+                return false;
             }
-        }
-        TAG_IFD_THREAD_SAFE | TAG_IFD_SLOT_THREAD_SAFE => {
-            if write_bytes(&[0u8]) {
-                IFD_SUCCESS
-            } else {
-                IFD_ERROR_TAG
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), Value, bytes.len());
+                *Length = bytes.len() as u32;
             }
-        }
-        TAG_IFD_ATR => {
-            let atr = state().lock().unwrap().atr.clone();
-            if write_bytes(&atr) {
-                IFD_SUCCESS
-            } else {
-                IFD_ERROR_TAG
+            true
+        };
+        match Tag {
+            TAG_IFD_SLOTS_NUMBER | TAG_IFD_SIMULTANEOUS_ACCESS => {
+                if write_bytes(&[1u8]) {
+                    IFD_SUCCESS
+                } else {
+                    IFD_ERROR_TAG
+                }
             }
+            TAG_IFD_THREAD_SAFE | TAG_IFD_SLOT_THREAD_SAFE => {
+                if write_bytes(&[0u8]) {
+                    IFD_SUCCESS
+                } else {
+                    IFD_ERROR_TAG
+                }
+            }
+            TAG_IFD_ATR => {
+                let atr = locked().atr.clone();
+                if write_bytes(&atr) {
+                    IFD_SUCCESS
+                } else {
+                    IFD_ERROR_TAG
+                }
+            }
+            _ => IFD_ERROR_TAG,
         }
-        _ => IFD_ERROR_TAG,
-    }
+    })
 }
 
 #[no_mangle]
@@ -263,55 +307,57 @@ pub extern "C" fn IFDHPowerICC(
     Atr: PUchar,
     AtrLength: PDword,
 ) -> ResponseCode {
-    let mut s = state().lock().unwrap();
-    match Action {
-        IFD_POWER_UP | IFD_RESET => {
-            let result = with_conn(&mut s, |c| {
-                c.write_all(&[CMD_POWER_ON])?;
-                let status = read_u8(c)?;
-                if status != 0 {
-                    return Ok(None); // no card
-                }
-                let len = read_u8(c)? as usize;
-                Ok(Some(read_vec(c, len)?))
-            });
-            match result {
-                Ok(Some(atr)) if !atr.is_empty() && atr.len() <= MAX_ATR => {
-                    s.atr = atr.clone();
-                    if Atr.is_null() || AtrLength.is_null() {
-                        return IFD_COMMUNICATION_ERROR;
+    ffi_guard(IFD_ERROR_POWER_ACTION, || {
+        let mut s = locked();
+        match Action {
+            IFD_POWER_UP | IFD_RESET => {
+                let result = with_conn(&mut s, |c| {
+                    c.write_all(&[CMD_POWER_ON])?;
+                    let status = read_u8(c)?;
+                    if status != 0 {
+                        return Ok(None); // no card
                     }
-                    // Per the IFDHandler v3.0 contract the `Atr` buffer is always
-                    // MAX_ATR_SIZE (33) and `*AtrLength` is OUTPUT-only — macOS
-                    // slotd passes it in as 0, so we must NOT treat it as an input
-                    // capacity bound. We already guard atr.len() <= MAX_ATR above.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(atr.as_ptr(), Atr, atr.len());
-                        *AtrLength = atr.len() as u32;
+                    let len = read_u8(c)? as usize;
+                    Ok(Some(read_vec(c, len, MAX_ATR)?))
+                });
+                match result {
+                    Ok(Some(atr)) if !atr.is_empty() && atr.len() <= MAX_ATR => {
+                        s.atr = atr.clone();
+                        if Atr.is_null() || AtrLength.is_null() {
+                            return IFD_COMMUNICATION_ERROR;
+                        }
+                        // Per the IFDHandler v3.0 contract the `Atr` buffer is always
+                        // MAX_ATR_SIZE (33) and `*AtrLength` is OUTPUT-only — macOS
+                        // slotd passes it in as 0, so we must NOT treat it as an input
+                        // capacity bound. We already guard atr.len() <= MAX_ATR above.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(atr.as_ptr(), Atr, atr.len());
+                            *AtrLength = atr.len() as u32;
+                        }
+                        IFD_SUCCESS
                     }
-                    IFD_SUCCESS
-                }
-                _ => {
-                    s.atr.clear();
-                    if !AtrLength.is_null() {
-                        unsafe { *AtrLength = 0 };
+                    _ => {
+                        s.atr.clear();
+                        if !AtrLength.is_null() {
+                            unsafe { *AtrLength = 0 };
+                        }
+                        IFD_ERROR_POWER_ACTION
                     }
-                    IFD_ERROR_POWER_ACTION
                 }
             }
-        }
-        IFD_POWER_DOWN => {
-            let _ = with_conn(&mut s, |c| {
-                c.write_all(&[CMD_POWER_OFF]).and_then(|_| read_u8(c))
-            });
-            s.atr.clear();
-            if !AtrLength.is_null() {
-                unsafe { *AtrLength = 0 };
+            IFD_POWER_DOWN => {
+                let _ = with_conn(&mut s, |c| {
+                    c.write_all(&[CMD_POWER_OFF]).and_then(|_| read_u8(c))
+                });
+                s.atr.clear();
+                if !AtrLength.is_null() {
+                    unsafe { *AtrLength = 0 };
+                }
+                IFD_SUCCESS
             }
-            IFD_SUCCESS
+            _ => IFD_NOT_SUPPORTED,
         }
-        _ => IFD_NOT_SUPPORTED,
-    }
+    })
 }
 
 /// Forward one command APDU to the client's card and return its response.
@@ -325,51 +371,53 @@ pub extern "C" fn IFDHTransmitToICC(
     RxLength: PDword,
     RecvPci: *mut ScardIoHeader,
 ) -> ResponseCode {
-    if RxLength.is_null() {
-        return IFD_COMMUNICATION_ERROR;
-    }
-    // Caller's recv-buffer capacity; forwarded so the server requests exactly
-    // this much from the card (extended responses need more than a fixed cap).
-    let recv_cap: u32 = unsafe { *RxLength };
-    let cap = recv_cap as usize;
-    let apdu: Vec<u8> = if TxLength == 0 || TxBuffer.is_null() {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(TxBuffer, TxLength as usize).to_vec() }
-    };
-
-    let mut s = state().lock().unwrap();
-    let result = with_conn(&mut s, |c| {
-        let mut req = Vec::with_capacity(9 + apdu.len());
-        req.push(CMD_TRANSMIT);
-        req.extend_from_slice(&(apdu.len() as u32).to_be_bytes()); // send_len
-        req.extend_from_slice(&apdu);
-        req.extend_from_slice(&recv_cap.to_be_bytes()); // recv_len
-        c.write_all(&req)?;
-        let status = read_u8(c)?;
-        if status != 0 {
-            return Ok(None);
+    ffi_guard(IFD_COMMUNICATION_ERROR, || {
+        if RxLength.is_null() {
+            return IFD_COMMUNICATION_ERROR;
         }
-        let len = read_u32(c)? as usize;
-        Ok(Some(read_vec(c, len)?))
-    });
+        // Caller's recv-buffer capacity; forwarded so the server requests exactly
+        // this much from the card (extended responses need more than a fixed cap).
+        let recv_cap: u32 = unsafe { *RxLength };
+        let cap = recv_cap as usize;
+        let apdu: Vec<u8> = if TxLength == 0 || TxBuffer.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(TxBuffer, TxLength as usize).to_vec() }
+        };
 
-    match result {
-        Ok(Some(resp)) => {
-            if RxBuffer.is_null() || cap < resp.len() {
-                return IFD_COMMUNICATION_ERROR;
+        let mut s = locked();
+        let result = with_conn(&mut s, |c| {
+            let mut req = Vec::with_capacity(9 + apdu.len());
+            req.push(CMD_TRANSMIT);
+            req.extend_from_slice(&(apdu.len() as u32).to_be_bytes()); // send_len
+            req.extend_from_slice(&apdu);
+            req.extend_from_slice(&recv_cap.to_be_bytes()); // recv_len
+            c.write_all(&req)?;
+            let status = read_u8(c)?;
+            if status != 0 {
+                return Ok(None);
             }
-            unsafe {
-                std::ptr::copy_nonoverlapping(resp.as_ptr(), RxBuffer, resp.len());
-                *RxLength = resp.len() as u32;
-                if !RecvPci.is_null() {
-                    (*RecvPci).protocol = _SendPci.protocol;
+            let len = read_u32(c)? as usize;
+            Ok(Some(read_vec(c, len, cap.min(MAX_RESPONSE))?))
+        });
+
+        match result {
+            Ok(Some(resp)) => {
+                if RxBuffer.is_null() || cap < resp.len() {
+                    return IFD_COMMUNICATION_ERROR;
                 }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(resp.as_ptr(), RxBuffer, resp.len());
+                    *RxLength = resp.len() as u32;
+                    if !RecvPci.is_null() {
+                        (*RecvPci).protocol = _SendPci.protocol;
+                    }
+                }
+                IFD_SUCCESS
             }
-            IFD_SUCCESS
+            _ => IFD_COMMUNICATION_ERROR,
         }
-        _ => IFD_COMMUNICATION_ERROR,
-    }
+    })
 }
 
 #[no_mangle]
@@ -391,14 +439,43 @@ pub extern "C" fn IFDHControl(
 /// Is a card present? Polled frequently by slotd.
 #[no_mangle]
 pub extern "C" fn IFDHICCPresence(_Lun: Dword) -> ResponseCode {
-    let mut s = state().lock().unwrap();
-    let present = with_conn(&mut s, |c| {
-        c.write_all(&[CMD_PRESENCE])?;
-        read_u8(c)
-    });
-    match present {
-        Ok(1) => IFD_ICC_PRESENT,
-        Ok(_) => IFD_ICC_NOT_PRESENT,
-        Err(()) => IFD_ICC_NOT_PRESENT, // macrdp not listening → no card
+    ffi_guard(IFD_ICC_NOT_PRESENT, || {
+        let mut s = locked();
+        let present = with_conn(&mut s, |c| {
+            c.write_all(&[CMD_PRESENCE])?;
+            read_u8(c)
+        });
+        match present {
+            Ok(1) => IFD_ICC_PRESENT,
+            Ok(_) => IFD_ICC_NOT_PRESENT,
+            Err(()) => IFD_ICC_NOT_PRESENT, // macrdp not listening → no card
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_vec_refuses_lengths_above_the_cap_before_allocating() {
+        let mut empty: &[u8] = &[];
+        let err = read_vec(&mut empty, u32::MAX as usize, MAX_RESPONSE).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut data: &[u8] = &[1, 2, 3];
+        assert_eq!(read_vec(&mut data, 3, 3).unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_panicking_entry_point_returns_the_fallback_code() {
+        let code = ffi_guard(IFD_COMMUNICATION_ERROR, || panic!("boom"));
+        assert_eq!(code, IFD_COMMUNICATION_ERROR);
+        // A panic while holding the lock must not wedge later calls.
+        let _ = ffi_guard(IFD_COMMUNICATION_ERROR, || {
+            let _s = locked();
+            panic!("poison")
+        });
+        locked().reset();
     }
 }

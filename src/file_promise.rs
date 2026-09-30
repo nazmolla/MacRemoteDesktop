@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::pdu::{FileContentsFlags, FileContentsRequest, FileContentsResponse};
@@ -306,7 +305,7 @@ fn ready_signal() {
 }
 
 fn play_glass() {
-    if let Err(e) = std::process::Command::new("afplay")
+    if let Err(e) = std::process::Command::new("/usr/bin/afplay")
         .arg("/System/Library/Sounds/Glass.aiff")
         .spawn()
     {
@@ -326,7 +325,7 @@ fn auto_paste_if_finder_front() {
             end if
         end tell
     "#;
-    let output = match std::process::Command::new("osascript")
+    let output = match std::process::Command::new("/usr/bin/osascript")
         .arg("-e")
         .arg(script)
         .output()
@@ -351,15 +350,12 @@ fn auto_paste_if_finder_front() {
 }
 
 fn make_temp_dir() -> std::io::Result<PathBuf> {
-    // Pid + nanos is unique enough for a single-process tool; we don't
-    // need /dev/urandom for collision avoidance.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("macrdp-paste-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    // `macrdp-paste-<pid>-<random>`: the pid lets `reap_stale` find leftovers
+    // of a dead process; the directory is always freshly created (0700).
+    crate::private_dir::create_unique(
+        &std::env::temp_dir(),
+        &format!("macrdp-paste-{}-", std::process::id()),
+    )
 }
 
 /// Reap eager-paste temp dirs (`$TMPDIR/macrdp-paste-<pid>-<nanos>`) left by a

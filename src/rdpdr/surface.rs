@@ -801,16 +801,31 @@ fn prepare_mountpoint(label: &str) -> std::io::Result<PathBuf> {
     match std::fs::create_dir(&candidate) {
         Ok(()) => Ok(candidate),
         Err(_) => {
-            let tmp = std::env::temp_dir()
-                .join(format!("macrdp-rdpdr-{}", std::process::id()))
-                .join(label);
-            std::fs::create_dir_all(&tmp)?;
-            Ok(tmp)
+            // Fallback: a fresh directory inside a private per-process one.
+            // `create_child` refuses a name that would leave the parent and
+            // anything that already exists, so the client-chosen label can
+            // never place the mount somewhere else.
+            let parent = std::env::temp_dir().join(format!("macrdp-rdpdr-{}", std::process::id()));
+            crate::private_dir::ensure(&parent)?;
+            let mut name = label.to_owned();
+            let mut n = 1;
+            loop {
+                match crate::private_dir::create_child(&parent, &name) {
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 50 => {
+                        name = format!("{label}-{n}");
+                        n += 1;
+                    }
+                    other => return other,
+                }
+            }
         }
     }
 }
 
-/// Make a drive label safe for a single path component (no `/`, `:` etc.).
+/// Make a drive label safe for a single path component. The label is the
+/// client's own device name, so it is untrusted: separators, `:` and control
+/// characters become `_`, and leading dots are replaced so the result can never
+/// be `.`, `..` or a hidden name.
 fn sanitize_label(label: &str) -> String {
     let trimmed = label.trim().trim_end_matches(':');
     let cleaned: String = trimmed
@@ -823,9 +838,32 @@ fn sanitize_label(label: &str) -> String {
             }
         })
         .collect();
-    if cleaned.is_empty() {
+    let dots = cleaned.len() - cleaned.trim_start_matches('.').len();
+    let cleaned = format!("{}{}", "_".repeat(dots), &cleaned[dots..]);
+    if cleaned.trim_matches('_').is_empty() {
         "drive".to_owned()
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::sanitize_label;
+
+    #[test]
+    fn labels_cannot_name_a_parent_or_hidden_directory() {
+        for (raw, want) in [
+            ("C:", "C"),
+            ("..", "drive"),
+            (".", "drive"),
+            ("", "drive"),
+            ("../x", "___x"),
+            (".hidden", "_hidden"),
+            ("a/b\\c", "a_b_c"),
+            ("My Drive", "My Drive"),
+        ] {
+            assert_eq!(sanitize_label(raw), want, "{raw:?}");
+        }
     }
 }
