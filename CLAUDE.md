@@ -4,6 +4,7 @@
 - Record every deliberate difference from upstream code in `FORK.md` → Divergence log.
 - Guiding rule: sessions are configured by negotiation with the client, not flags. New code must not add user-facing flags.
 - Performance and color accuracy are hard requirements (spec §8, §9).
+- Fork architecture: `docs/architecture.md` (Negotiated sessions); security model: `docs/security.md`.
 - Upstream's own guidance follows unchanged.
 
 ---

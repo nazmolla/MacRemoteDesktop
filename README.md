@@ -1,5 +1,4 @@
-> **Fork notice.** This is a private fork of [macrdp](https://github.com/clintcan/macrdp) being restructured into a negotiated, headless-first RDP server for macOS. See [FORK.md](FORK.md) and the [design spec](docs/superpowers/specs/2026-09-29-negotiated-mac-rdp-design.md). Upstream README follows unchanged.
-
+> **MacRemoteDesktop fork.** A fork of [macrdp](https://github.com/clintcan/macrdp) that configures each session from the RDP handshake instead of flags: Retina-aware virtual displays, sRGB color, AVC444, dirty-region H.264 and lossless refinement. Docs: [architecture](docs/architecture.md#negotiated-sessions-macremotedesktop-fork), [features](docs/features.md), [security model](docs/security.md), [fork divergences](FORK.md), [design spec](docs/superpowers/specs/2026-09-29-negotiated-mac-rdp-design.md). Upstream README follows.
 ---
 
 # macrdp

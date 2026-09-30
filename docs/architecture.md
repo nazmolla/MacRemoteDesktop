@@ -370,3 +370,34 @@ Cross-cutting:
 - **Single capture loop** — `MacRdpsnd` (the audio factory) holds an `Arc<AtomicU64>` generation counter shared with every backend it builds. Each `start()` claims a fresh generation; older capture loops observe the bump on their next iteration and exit. Without this, an mstsc cert-prompt reconnect leaves the first capture loop running while the second starts, both feeding the shared event channel → ~2× audio reaching the client.
 
 When adding a feature, locate it in one of those modules first; if it spans them (e.g., a new virtual channel), it belongs in a dedicated module alongside `clipboard.rs`, driven by `ironrdp_server`'s factory traits.
+
+
+## Negotiated sessions (MacRemoteDesktop fork)
+
+Sessions are configured from the client handshake and host state instead of flags
+(design: `docs/superpowers/specs/2026-09-29-negotiated-mac-rdp-design.md`; every
+deliberate difference from upstream is logged in `FORK.md`).
+
+### Modules
+| Area | Files | What it does |
+|---|---|---|
+| Session Negotiator | `src/negotiator/{display,session,host,handler,video}.rs` | Pure decisions: display scale plan, Ctrl→Cmd, privacy shield, codec ladder; `handler.rs` is a `ConnectionHandler` decorator recording client scale/platform |
+| Zero-flag startup | `src/main.rs` (`apply_negotiated_defaults`) | Turns features on from host caps; `MACRDP_NEGOTIATE=0` restores flag-only |
+| Handshake plumbing | `vendor/ironrdp-acceptor` div (5), `vendor/ironrdp-server` `on_client_display` | Carries GCC Core Data scale/physical size to the app |
+| Retina virtual display | `src/virtual_display/{mod,private_api}.rs` | Private `CGVirtualDisplay` API, hiDPI modes, raw CoreGraphics mode FFI (`cg_modes`), sRGB primaries |
+| Dirty-region H.264 | `src/h264.rs` (`FrameRegions`, `RegionDebt`, `avc_regions`, region queue by PTS), `src/capture.rs` | AVC frames repaint only changed rects |
+| Lossless refinement | `src/refine.rs`, `src/lossless.rs`, `src/h264.rs` (`refine_tick`) | Idle tiles re-sent as ClearCodec via `send_mixed_frame` |
+| AVC444 | `src/avc444.rs`, `src/h264.rs` (`Avc444Buffers`, aux encoder, PTS pairing in `ship_loop`), `src/videotoolbox.rs` (`encode_yuv420`, odd-height padding) | 4:4:4 as main + auxiliary H.264 streams |
+| Test/perf tooling | `src/color_*`, `scripts/perf/*`, `tools/workload`, `scripts/verify/*` | Harnesses (not shipped) |
+
+### Data flow
+1. Startup: `apply_negotiated_defaults` (main.rs) turns on H.264, adaptive bitrate, UDP offer, a virtual display, and the privacy shield when a physical display is attached and the `macrdpshield` helper exists. `MACRDP_NEGOTIATE=0` restores upstream's flag-only behaviour; flags can only switch features on.
+2. Handshake: the vendored acceptor captures `ClientDisplayInfo` (GCC Core Data); `NegotiationHandler` records scale + platform (Ctrl→Cmd decided here).
+3. Display: `CaptureDisplay::sync_virtual_display` builds a `DisplayPlan` (1×, Retina, Retina-downscaled) and applies it to the virtual display; live `request_layout` updates carry the scale.
+4. Video: the EGFX capability set decides the codec ladder (AVC444 → AVC420 → bitmaps). Frames ship with dirty-rect regions; idle tiles are refined losslessly with ClearCodec.
+
+### Concurrency invariants
+- Lock order in `src/h264.rs`: **`server_handle` → `ctx`**, never the reverse (`GfxDvcBridge::process` holds the server mutex while calling handler callbacks that lock `ctx`). `refine_tick` prepares under `ctx`, releases it, then locks `server_handle`.
+- Region queue is keyed by encoder PTS and reset on every encoder rebuild; `RegionDebt` carries dropped frames' regions.
+- AVC444: main and aux encoders get the same keyframe decision; the ship thread pairs by PTS (250 ms timeout; unpaired main ships as AVC420).
+- One active RDP session per process (newer authenticated connection preempts).

@@ -6,3 +6,4 @@ pub mod display;
 pub mod handler;
 pub mod host;
 pub mod session;
+pub mod video;

@@ -1525,7 +1525,12 @@ mod macos {
                 // last frame, and a settled resize gets picked up promptly
                 // instead of stalling until the next real desktop change).
                 // (Neither pending — the common idle case — blocks normally.)
-                let sample = if self.flush_remaining > 0 || self.pending_resize.has_pending() {
+                let refine_pending = self.flush_remaining == 0
+                    && self.gfx.as_ref().is_some_and(|g| g.refine_pending());
+                let sample = if self.flush_remaining > 0
+                    || self.pending_resize.has_pending()
+                    || refine_pending
+                {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(Some(sample)) => sample,
                         Ok(None) => return Ok(None),
@@ -1534,13 +1539,26 @@ mod macos {
                                 self.flush_remaining -= 1;
                                 if let Some(gfx) = self.gfx.as_ref() {
                                     if !self.last_frame.is_empty() {
-                                        if let Err(e) = gfx.submit_bgra(
+                                        if let Err(e) = gfx.submit_bgra_regions(
                                             &self.last_frame,
                                             self.last_stride,
                                             false,
+                                            crate::h264::FrameRegions::SameAsLast,
                                         ) {
                                             tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                                         }
+                                    }
+                                }
+                            }
+                            if self.flush_remaining == 0
+                                && refine_pending
+                                && !self.last_frame.is_empty()
+                            {
+                                if let Some(gfx) = self.gfx.as_ref() {
+                                    if let Err(e) =
+                                        gfx.refine_tick(&self.last_frame, self.last_stride, false)
+                                    {
+                                        tracing::warn!(error = ?e, "lossless refinement failed");
                                     }
                                 }
                             }
@@ -1674,7 +1692,45 @@ mod macos {
                     } else {
                         false
                     };
-                    match gfx.submit_bgra(src, stride_bytes, big_change || resume_keyframe) {
+                    // Only the changed rects repaint the client surface, so
+                    // lossless refinement elsewhere survives (spec §8.3).
+                    let regions = if !self.seeded || self.force_full_frame {
+                        crate::h264::FrameRegions::Full
+                    } else {
+                        match sample.dirty_rects() {
+                            Some(list) => crate::h264::FrameRegions::Rects(
+                                list.iter()
+                                    .filter_map(|r| {
+                                        let (o, s) = (r.origin(), r.size());
+                                        let x = o.x.max(0.0).floor() as u32;
+                                        let y = o.y.max(0.0).floor() as u32;
+                                        let w = (o.x + s.width).max(0.0).ceil() as u32;
+                                        let h = (o.y + s.height).max(0.0).ceil() as u32;
+                                        (w > x && h > y).then(|| crate::refine::Rect {
+                                            x,
+                                            y,
+                                            w: w - x,
+                                            h: h - y,
+                                        })
+                                    })
+                                    .collect(),
+                            ),
+                            None => crate::h264::FrameRegions::Full,
+                        }
+                    };
+                    let submitted = gfx.submit_bgra_regions(
+                        src,
+                        stride_bytes,
+                        big_change || resume_keyframe,
+                        regions,
+                    );
+                    // Refine static tiles even while something animates (review I4).
+                    if matches!(submitted, Ok(true)) && gfx.refine_pending() {
+                        if let Err(e) = gfx.refine_tick(src, stride_bytes, true) {
+                            tracing::warn!(error = ?e, "lossless refinement failed");
+                        }
+                    }
+                    match submitted {
                         Ok(true) => {
                             self.seeded = true;
                             // First-EGFX-frame milestone: arms the suppress
