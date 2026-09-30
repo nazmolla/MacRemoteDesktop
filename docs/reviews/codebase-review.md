@@ -18,6 +18,7 @@
 7. [Dependencies and supply chain](#7-dependencies-and-supply-chain)
 8. [Remediation plan](#8-remediation-plan)
 9. [Appendix: commands and raw numbers](#9-appendix-commands-and-raw-numbers)
+10. [Resolution](#10-resolution)
 
 ## 1. How the review was done
 
@@ -514,3 +515,72 @@ cargo deny check licenses                # ok
 | `capture.rs:569` `request_layout` | 38 |
 
 **DAST probe source:** the four probes were appended temporarily to `src/conn_test.rs` as `mod dast_probe` and run with `cargo test --locked dast_probe -- --nocapture --test-threads=1`. They reuse `build_test_server_full`, `connect_with_retry` and `connect_client` from that file, and `UdpMultitransportListener::bind` from the vendored server. They were removed after the run. Section 6.3 recommends making them permanent once the fixes land.
+
+## 10. Resolution
+
+Fixed on branch `fix/review-remediation` (2026-09-30), following
+`docs/superpowers/plans/2026-09-30-review-remediation.md`. The owner decided
+that the fork is the product and will not be merged upstream, so the vendored
+crates were changed freely (this also settles A5).
+
+Verified on Linux: `cargo test --locked` (239 tests), `cargo clippy
+--all-targets -- -D warnings`, `cargo fmt --check`, and the macOS type check
+and clippy (`tools/macos-typecheck/check.sh`, `-D warnings`). Nothing that
+only runs on macOS has been executed yet.
+
+| Finding | Status | Change | Commit |
+|---|---|---|---|
+| S1 | Fixed | `HandshakePool`: 5 s to X.224, 30 s total, 32 in flight, 4 per source; concurrent handshakes, accepts never pause; channels attached after auth | `38aa6dc` |
+| S2 | Fixed | UDP SYN must be at least 1132 bytes and come from an IP holding a live offer; 64 peers, 4 per IP | `38aa6dc` |
+| S3 | Fixed | Failures counted from explicit signals (`on_authenticated`, `on_handshake_failed`) on every path | `38aa6dc`, `a0ca594` |
+| S4 | Fixed | Drive labels sanitised; mountpoints created fresh inside a 0700 per-process directory | `8a3ae58` |
+| S5 | Fixed | IFD handler caps lengths before allocating; `catch_unwind` on every export; poison-tolerant lock | `8a3ae58` |
+| S6 | Fixed | Absolute paths for every external command, with a test | `8a3ae58` |
+| S7 | Fixed | Every handler call carries the peer; audit schema v2 | `38aa6dc`, `a0ca594` |
+| S8 | Fixed | IPv6 keyed by /64; stale sweep at most once a second; oldest evicted at the cap | `a0ca594` |
+| S9 | Fixed | Credential monitor: PAM re-check every 5 min, Keychain follow, revoke on rejection | `0db1db0` |
+| S10 | Fixed | PAM conversation zeroes and frees earlier responses on failure | `8a3ae58` |
+| S11 | Fixed | `src/private_dir.rs`: fresh 0700 directories, owner checked | `8a3ae58` |
+| A1 | Partly | `main.rs` is the module list; startup is `src/app/` phases; `run` 976 to 633 lines. Channel and capture wiring still inline (see the plan's as-built notes) | `c5357a3`, `c064d01` |
+| A2 | Fixed | `src/tunables.rs` registry of all 77 `MACRDP_*` variables, logged at startup; the vendored server reads no environment | `75b6b92` |
+| A3 | Fixed for signalling | `ResyncSignal` replaces the `RESYNC_*` statics. Remaining statics are module-private caches of OS-global state | `bbce56c` |
+| A4 | Fixed | `src/h264/`, `src/input/`, `src/app/` | `d36f396`, `c5357a3` |
+| A5 | Closed by decision | Vendored crates are owned code; divergences recorded in `FORK.md` | |
+| A6 | Fixed | `lock_server` / `lock_ctx` with a debug-build order check; one real ABBA risk in `setup_locked` fixed | `b2609bf` |
+| Q1 | Fixed | `lock_or_recover` everywhere in `src/` (the one `lock().unwrap()` left is in a test that poisons a lock on purpose) | `f38afb3` |
+| Q2 | Fixed | `undocumented_unsafe_blocks` enforced; a `SAFETY:` comment on every block and impl | `43acaa6` |
+| Q3 | Fixed | Clippy clean with `-D warnings` on Linux and macOS; TIS calls serialised (the intermittent SIGABRT) | `b97c871` |
+| Q4 | Fixed | Casts of external input use `try_from` | `b97c871` |
+| Q5 | Fixed | The misleading `drop` calls replaced | `b97c871` |
+| Q6 | Partly | Garbage-input tests on every `cargo test`; 7 cargo-fuzz targets written, no campaign run | `5104350` |
+
+Also fixed along the way: two tests that captured tracing events failed about
+one run in 40 (`0596568`).
+
+### Still to check on a Mac
+
+1. `cargo test --locked`, which adds the macOS-only tests (among them the
+   three lock-order tests in `src/h264`).
+2. mstsc first connection with the certificate prompt left open more than
+   30 s: expect one extra reconnect, not a failure.
+3. UDP multitransport from a client whose UDP leaves from a different IP than
+   its TCP: expect the session to stay on TCP.
+4. Credential monitor: change the account password while connected. RDP
+   logins should stop within 5 minutes; with `--keychain`, updating the
+   Keychain entry should restore them within a minute.
+5. `--auto-unlock` after a password change (it should stop typing the old
+   password once the monitor revokes it).
+6. The audit stream (`MACRDP_AUDIT_JSON=1`) against a SIEM parser: schema v2
+   adds `handshake_failed` and changes disconnect outcomes to `clean` /
+   `error`.
+7. Drive redirection, paste and lazy paste, which now use the new private
+   temporary directories.
+8. Smart-card redirection end to end (the IFD handler changed).
+9. A short `cargo fuzz run` of each target (see `fuzz/README.md`).
+
+### Not covered by this pass
+
+- No runtime testing on macOS (above).
+- No fuzzing campaign.
+- The Swift helpers under `gui/` and the Objective-C USB shim were reviewed
+  for their IPC surface only, not line by line.

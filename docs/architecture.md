@@ -1,7 +1,8 @@
 # Architecture
 
 ```
-src/main.rs       CLI, TCC preflight, TLS cert mgmt, RdpServer assembly
+src/main.rs       Module list and main(); the startup code is in src/app/
+src/app/          CLI, TCC preflight, TLS cert mgmt, RdpServer assembly
 src/auth.rs       Startup PAM auth against the macOS account (libpam FFI)
 src/auth_guard.rs Connection-level auth hardening (Tier 1.2): per-source-IP
                   rate-limiting + escalating auto-expiring lockout + a greppable
@@ -16,7 +17,7 @@ src/auth_guard.rs Connection-level auth hardening (Tier 1.2): per-source-IP
                   session resets) so a benign disconnect never locks anyone out.
 src/capture.rs    ScreenCaptureKit → BgrA32 BitmapUpdate, dirty-rect driven
 src/cursor.rs     NSCursor → RGBAPointer, hashed for change detection
-src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI by
+src/input/        RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI by
                   default; non-US via src/keyboard_layout.rs),
                   per-side modifier state with NX_DEVICE bits, Caps Lock
                   toggle, AX-driven symbolic-hotkey workarounds
@@ -44,7 +45,7 @@ src/switcher_hud.rs  App-switcher HUD IPC client (--app-switcher-hud). A bg
                   the smart-card bridge) over loopback to the macrdphud helper,
                   best-effort/non-blocking (try_send) so the input path never
                   stalls. input.rs calls it from cycle_apps/commit_cycle_session;
-                  main.rs auto-spawns the helper + sets the captured display id.
+                  app/ auto-spawns the helper + sets the captured display id.
                   The helper itself is gui/Sources/macrdphud/main.swift (a 2nd
                   SwiftPM target alongside the menu-bar controller): a borderless
                   non-activating NSPanel drawing an app-icon row that
@@ -157,7 +158,7 @@ src/virtual_display/    Opt-in headless display via undocumented
                         private_api.rs (the maintenance boundary —
                         when Apple changes the API in a future macOS,
                         update only that file).
-src/h264.rs       EGFX/H.264 video pipeline (opt-in via --enable-h264).
+src/h264/         EGFX/H.264 video pipeline (opt-in via --enable-h264).
                   Bridges the VideoToolbox encoder (src/videotoolbox.rs) to
                   upstream's GraphicsPipelineServer: per SCK frame, encode →
                   non-blocking drain → AVC420 (Annex-B framing) → DRDYNVC →
@@ -179,7 +180,7 @@ src/multitransport.rs  macrdp-side RDP UDP multitransport provider
                   sans-I/O vendor/ironrdp-rdpeudp crate; the UDP listener + rustls
                   TLS + MS-RDPEMT tunnel + DYNVC Soft-Sync EGFX migration live in
                   vendored ironrdp-server (src/multitransport/, divergence (12))
-                  + vendored ironrdp-dvc (Soft-Sync codec). main.rs binds the
+                  + vendored ironrdp-dvc (Soft-Sync codec). app/transport.rs binds the
                   listener on the TCP address/port and wires the cookie registry +
                   the server↔listener tunnel handoff. EGFX-over-UDP rendering is
                   additionally env-gated by MACRDP_UDP_MIGRATE_EGFX until soaked.
@@ -365,7 +366,7 @@ Cross-cutting:
 - **Auth** at startup: `--username` (defaults to `$USER`) + interactive password prompt → PAM `checkpw` service → set as the static credential ironrdp_server checks per-connection. `--skip-auth` bypasses for dev.
 - **Session model** — by default macrdp attaches to the console session of the logged-in user (single session, mirrors the primary panel). With `--virtual-display --width W --height H`, the server instead allocates a headless `CGVirtualDisplay` and serves *that*; the local Mac screen is untouched and the remote sees its own desktop at the requested resolution. The CG-side display is owned by `main()`'s scope, registered via `[CGVirtualDisplay initWithDescriptor:]` + `applySettings:`, and torn down on normal exit (signal-driven `std::process::exit(0)` skips Drop, but macOS reaps the registration when the owning process dies). Capture / input / cursor all parameterize on `(displayID, origin_pts, size_pts)` so they target the right surface regardless of which path is in effect.
 - **Process model — single-process.** One `macrdp` process does everything (accept → capture/encode/serve) for the lifetime of the server. Under launchd it IS the job (KeepAlive watches it). It owns all persistent state directly: the virtual display, headless blanking (`--capture-primary`/`--detach-primary`, engaged on first connect, process-scoped so it auto-restores on process death), `caffeinate`, and the app-switcher HUD helper. (An earlier `--fork-workers` model that fork+exec'd a fresh worker process per connection — xrdp's model, to dodge mstsc's EGFX reconnect-blank — was removed once the server learned to self-heal that blank in place via a bare core Deactivation–Reactivation; see the H.264 reconnect-blank quirk.)
-- **Signal handling** — `main.rs` spawns a task that awaits SIGINT/SIGTERM and `std::process::exit(0)`s. Without it, ScreenCaptureKit's framework threads can leave the process unkillable by Ctrl-C once an SCStream is active.
+- **Signal handling** — `app/mod.rs::run` spawns a task that awaits SIGINT/SIGTERM and `std::process::exit(0)`s. Without it, ScreenCaptureKit's framework threads can leave the process unkillable by Ctrl-C once an SCStream is active.
 - **Audio rate** — SCK only supports 8/16/24/48 kHz, so capture is at 48 kHz, but `src/audio.rs` resamples to 44.1 kHz via `rubato` before sending. The 44.1 kHz output is **empirically load-bearing** — the earlier 48 kHz feed produced a ~20% sustained over-feed and multi-second audio backlogs on mstsc, and switching to 44.1 fixed it — but the originally-documented mechanism ("the client plays directly without internal resampling") was checked against Microsoft's Core Audio docs (2026-07-18) and doesn't hold in general: modern Windows resamples *every* shared-mode stream to the endpoint's configured mix format (frequently 48 kHz) regardless, so the honest explanation for the historical backlog is a rate-accounting/pacing mismatch in the old 48 kHz path, not avoided resampling. Don't revert to 48 kHz without re-testing the mstsc backlog; don't cite "no client resampling" as the reason. The advertised RDPSND `AudioFormat` is 44.1 kHz / 2 ch / 16-bit.
 - **Single capture loop** — `MacRdpsnd` (the audio factory) holds an `Arc<AtomicU64>` generation counter shared with every backend it builds. Each `start()` claims a fresh generation; older capture loops observe the bump on their next iteration and exit. Without this, an mstsc cert-prompt reconnect leaves the first capture loop running while the second starts, both feeding the shared event channel → ~2× audio reaching the client.
 
@@ -382,22 +383,112 @@ deliberate difference from upstream is logged in `FORK.md`).
 | Area | Files | What it does |
 |---|---|---|
 | Session Negotiator | `src/negotiator/{display,session,host,handler,video}.rs` | Pure decisions: display scale plan, Ctrl→Cmd, privacy shield, codec ladder; `handler.rs` is a `ConnectionHandler` decorator recording client scale/platform |
-| Zero-flag startup | `src/main.rs` (`apply_negotiated_defaults`) | Turns features on from host caps; `MACRDP_NEGOTIATE=0` restores flag-only |
+| Zero-flag startup | `src/app/args.rs` (`apply_negotiated_defaults`) | Turns features on from host caps; `MACRDP_NEGOTIATE=0` restores flag-only |
 | Handshake plumbing | `vendor/ironrdp-acceptor` div (5), `vendor/ironrdp-server` `on_client_display` | Carries GCC Core Data scale/physical size to the app |
 | Retina virtual display | `src/virtual_display/{mod,private_api}.rs` | Private `CGVirtualDisplay` API, hiDPI modes, raw CoreGraphics mode FFI (`cg_modes`), sRGB primaries |
-| Dirty-region H.264 | `src/h264.rs` (`FrameRegions`, `RegionDebt`, `avc_regions`, region queue by PTS), `src/capture.rs` | AVC frames repaint only changed rects |
-| Lossless refinement | `src/refine.rs`, `src/lossless.rs`, `src/h264.rs` (`refine_tick`) | Idle tiles re-sent as ClearCodec via `send_mixed_frame` |
-| AVC444 | `src/avc444.rs`, `src/h264.rs` (`Avc444Buffers`, aux encoder, PTS pairing in `ship_loop`), `src/videotoolbox.rs` (`encode_yuv420`, odd-height padding) | 4:4:4 as main + auxiliary H.264 streams |
+| Dirty-region H.264 | `src/h264/regions.rs` (`FrameRegions`), `src/h264/mod.rs` (`RegionDebt`, `avc_regions`, region queue by PTS), `src/capture.rs` | AVC frames repaint only changed rects |
+| Lossless refinement | `src/refine.rs`, `src/lossless.rs`, `src/h264/mod.rs` (`refine_tick`) | Idle tiles re-sent as ClearCodec via `send_mixed_frame` |
+| AVC444 | `src/avc444.rs`, `src/h264/mod.rs` (`Avc444Buffers`, aux encoder, PTS pairing in `ship_loop`), `src/videotoolbox.rs` (`encode_yuv420`, odd-height padding) | 4:4:4 as main + auxiliary H.264 streams |
 | Test/perf tooling | `src/color_*`, `scripts/perf/*`, `tools/workload`, `scripts/verify/*` | Harnesses (not shipped) |
 
 ### Data flow
-1. Startup: `apply_negotiated_defaults` (main.rs) turns on H.264, adaptive bitrate, UDP offer, a virtual display, and the privacy shield when a physical display is attached and the `macrdpshield` helper exists. `MACRDP_NEGOTIATE=0` restores upstream's flag-only behaviour; flags can only switch features on.
+1. Startup: `apply_negotiated_defaults` (`src/app/args.rs`) turns on H.264, adaptive bitrate, UDP offer, a virtual display, and the privacy shield when a physical display is attached and the `macrdpshield` helper exists. `MACRDP_NEGOTIATE=0` restores upstream's flag-only behaviour; flags can only switch features on.
 2. Handshake: the vendored acceptor captures `ClientDisplayInfo` (GCC Core Data); `NegotiationHandler` records scale + platform (Ctrl→Cmd decided here).
 3. Display: `CaptureDisplay::sync_virtual_display` builds a `DisplayPlan` (1×, Retina, Retina-downscaled) and applies it to the virtual display; live `request_layout` updates carry the scale.
 4. Video: the EGFX capability set decides the codec ladder (AVC444 → AVC420 → bitmaps). Frames ship with dirty-rect regions; idle tiles are refined losslessly with ClearCodec.
 
 ### Concurrency invariants
-- Lock order in `src/h264.rs`: **`server_handle` → `ctx`**, never the reverse (`GfxDvcBridge::process` holds the server mutex while calling handler callbacks that lock `ctx`). `refine_tick` prepares under `ctx`, releases it, then locks `server_handle`.
+- Lock order in `src/h264/mod.rs`: **`server_handle` then `ctx`**, never the reverse (`GfxDvcBridge::process` holds the server mutex while calling handler callbacks that lock `ctx`). `refine_tick` prepares under `ctx`, releases it, then locks `server_handle`. Every lock goes through `lock_server` / `lock_ctx`; in debug builds `lock_server` panics if the thread already holds `ctx`, so a reversal fails the first test or debug run that reaches it.
 - Region queue is keyed by encoder PTS and reset on every encoder rebuild; `RegionDebt` carries dropped frames' regions.
 - AVC444: main and aux encoders get the same keyframe decision; the ship thread pairs by PTS (250 ms timeout; unpaired main ships as AVC420).
 - One active RDP session per process (newer authenticated connection preempts).
+- Shared locks are taken with `lock_or_recover` / `read_or_recover` / `write_or_recover` (`src/sync_ext.rs`): a panic while a lock is held logs and carries on with the data instead of poisoning every later caller.
+
+## Startup, connection admission and configuration (review remediation, 2026-09-30)
+
+Changes from `docs/reviews/codebase-review.md`; the plan is in
+`docs/superpowers/plans/2026-09-30-review-remediation.md`.
+
+### Startup (`src/app/`)
+`src/main.rs` is only the module list and `main`. The composition root is
+`src/app/mod.rs::run`, a sequence of phases:
+
+| Phase | Where |
+|---|---|
+| Flags, `--config` file, negotiated defaults | `app/args.rs::resolve` |
+| Logging, audit stream, tunables snapshot | `app/mod.rs::init_logging` |
+| Flag combinations that cannot work | `app/args.rs::validate` (unit-tested) |
+| Headless-mode guard slots, released in order on a signal | `app/overlay.rs::HeadlessSlots` |
+| Virtual display, desktop size and geometry | `app/display.rs` |
+| Username, password, PAM check | `app/credentials.rs::obtain` |
+| Session watcher or `--make-primary` | `app/overlay.rs::engage_headless_mode` |
+| TLS material | `app/tls.rs::load_material` |
+| Channel factories, capture, input | `app/mod.rs::run` (still inline: they share most of the state) |
+| Auto-reconnect cookie, UDP listener | `app/transport.rs` |
+| Server credentials and the credential monitor | `app/credentials.rs::install` |
+
+Helper processes and sleep prevention are in `app/helpers.rs`; lock on
+disconnect and auto-unlock in `app/session_lock.rs`.
+
+### Connection admission (`vendor/ironrdp-server`, divergence 25-fork)
+Every TCP connection goes through the same path:
+
+1. `ConnectionHandler::on_accept` (auth guard: rate limit and lockout).
+2. `HandshakePool` capacity: at most 32 handshakes in flight and 4 per source
+   (IPv4 address or IPv6 /64). Over capacity the socket is closed.
+3. One `negotiate` (X.224, TLS, CredSSP) under two deadlines: 5 s to the
+   X.224 request, 30 s in total. Handshakes run concurrently; accepting
+   never pauses.
+4. Only an authenticated connection reaches `serve_negotiated`, which
+   attaches the channels and makes the multitransport offer. With a live
+   session it preempts it (unchanged).
+
+Outcomes reach the application through `on_authenticated(peer, ..)` and
+`on_handshake_failed(peer, HandshakeFailure)`, which the auth guard counts
+(`src/auth_guard.rs`) and the audit log records (schema v2,
+`docs/audit-log.md`).
+
+The UDP listener starts an RDPEUDP flow only for a SYN of at least 1132
+bytes from an IP that holds a live multitransport offer, with at most 64
+peers and 4 per IP.
+
+### Credentials
+The server reads its credentials from a shared `CredentialsHandle` at the
+start of each handshake. `src/credential_monitor.rs` keeps it in step with
+the account: it re-checks the password with PAM every 5 minutes, and with
+`--keychain` it polls the Keychain every 60 s and installs a changed
+password once PAM accepts it. A password PAM rejects is revoked at once (the
+handle gets a random 64-hex-digit password) and never retried, so it cannot
+push the account towards the OS lockout. A PAM error (service unavailable)
+changes nothing. Auto-unlock reads the same cell (`SecretCell`).
+
+### Configuration
+Flags are the user-facing surface (`docs/cli.md`). Every `MACRDP_*`
+environment variable is registered in `src/tunables.rs` with its type,
+default and meaning, snapshotted once after `config.env` is bridged into the
+environment, and logged at startup when set. Two tests keep it that way: a
+`MACRDP_*` name quoted anywhere in `src/` or `vendor/` must be registered,
+and none may be read with `std::env` directly. The vendored server reads no
+environment; its knobs arrive as `ListenerConfig` fields and `RdpServer`
+setters.
+
+### Cross-module signals
+The A/V resync request (`Ctrl+Alt+Shift+R`) is a `ResyncSignal`
+(`src/resync.rs`) created in `run` and handed to input, capture and audio.
+The process-wide statics that remain are module-private caches of state the
+OS itself holds globally (focus, cursor, the pasteboard change count).
+
+### Module layout
+`src/h264/` is split into `annexb.rs`, `blank.rs` (reconnect-blank detector),
+`congestion.rs`, `regions.rs` and `udp_watchdog.rs` around `mod.rs`.
+`src/input/` keeps the cross-platform handler in `mod.rs` and the macOS
+pieces in `input/macos/{ax,focus,switcher,windows,hotkeys}.rs`.
+
+### Testing without a Mac
+- `tools/macos-typecheck/check.sh` runs `cargo check` or `cargo clippy` for
+  `aarch64-apple-darwin` on Linux with a stub SDK, so every
+  `cfg(target_os = "macos")` path is type-checked and linted. Nothing is
+  linked or run; macOS-only tests (for example `src/h264`) still need a Mac.
+- `src/garbage_input_test.rs` feeds random and truncated input to the wire
+  decoders on every `cargo test`.
+- `fuzz/` holds cargo-fuzz targets for the same decoders (see its README).

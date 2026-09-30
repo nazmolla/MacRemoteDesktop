@@ -158,3 +158,14 @@ Commit after each item. Each commit passes the three checks above.
 - **mstsc certificate prompt.** A first connection whose certificate prompt stays open more than 30 s is dropped. mstsc already reconnects after the user accepts, so this should only add one reconnect.
 - **UDP multitransport from a different IP.** If the client reaches UDP from a different public IP than TCP (unusual carrier NAT), the tunnel is refused and the session stays on TCP.
 - **Credential monitor.** Every 5 minutes it performs one PAM check of the stored password. After a password change, RDP logins stop working until the Keychain entry is updated (with `--keychain`) or macrdp is restarted with the new password.
+
+## As built (2026-09-30)
+
+Every step above was done, in order, on branch `fix/review-remediation`. Where the result differs from the plan:
+
+- **A4.** `src/input/` came out as `mod.rs` (the cross-platform handler) plus `input/macos/{ax,focus,switcher,windows,hotkeys}.rs`, because the macOS code was the bulk of the file. `src/h264/` also got `udp_watchdog.rs`.
+- **A1.** There is no `app/server.rs`. The channel factories, capture and input wiring share about fifteen handles with each other and with the server setters, and moving them out without a context struct would only have passed those handles through a long argument list. They stay inline in `run`, which went from 976 lines to 633. The other phases are functions as planned, plus `app/display.rs` (virtual display and geometry) and `app/transport.rs` (auto-reconnect cookie and the UDP listener). `args::validate` is new and unit-tested.
+- **Tests that capture tracing events** were flaky (about one run in 40): callsite interest is cached process-wide, and a callsite first hit on a thread with no subscriber is cached as "never". `logging::catch_all_for_tests` installs a global subscriber once so that cannot happen. 200 consecutive runs passed after the fix.
+- **Q6.** The fuzz targets are written and build, but no fuzzing campaign has been run. The garbage-input tests run on every `cargo test`.
+
+What still needs the Mac is listed in the resolution section of `docs/reviews/codebase-review.md`.
