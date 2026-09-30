@@ -114,6 +114,11 @@ impl Encoder {
     /// thread (the push pipeline). After this, `drain`/`flush` on this encoder
     /// return nothing; the encoder is submit-only. Returns `None` if already
     /// taken.
+    /// PTS the next submitted frame will carry (matches `EncodedFrame::pts`).
+    pub fn next_pts(&self) -> i64 {
+        self.next_pts
+    }
+
     pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<EncodedFrame>> {
         self.rx.take()
     }
