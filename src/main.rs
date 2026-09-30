@@ -25,6 +25,7 @@ mod color_pattern;
 mod color_roundtrip_test;
 #[cfg(test)]
 mod conn_test;
+mod credential_monitor;
 mod cursor;
 #[cfg(target_os = "macos")]
 mod file_promise;
@@ -940,9 +941,12 @@ fn spawn_hud_helper() -> Option<std::process::Child> {
 
 /// Shell out to `security find-generic-password -s macrdp -a <user> -w`,
 /// which prints the password on stdout. The Keychain entry has to be
-/// created out-of-band; this never prompts the user interactively.
+/// created out-of-band; this never prompts the user interactively. The tool
+/// is named by absolute path so a `security` earlier on `PATH` cannot stand in
+/// for it (and the Keychain ACL is tied to `/usr/bin/security` anyway, see
+/// docs/macos-gotchas.md).
 fn read_password_from_keychain(username: &str) -> Result<Zeroizing<String>> {
-    let out = std::process::Command::new("security")
+    let out = std::process::Command::new("/usr/bin/security")
         .args([
             "find-generic-password",
             "-s",
@@ -1765,8 +1769,9 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
     lock_on_disconnect: Option<Arc<lock_activity::ConnectionActivity>>,
     // (--auto-unlock) When true, try to unlock the local session on
     // reconnect using the exact same validated credential used for RDP
-    // auth. A no-op if the screen isn't locked.
-    password: Arc<Zeroizing<String>>,
+    // auth. A no-op if the screen isn't locked, or if the credential monitor
+    // has revoked the password (the cell is then empty).
+    password: credential_monitor::SecretCell,
     auto_unlock: bool,
 ) {
     tokio::spawn(async move {
@@ -1858,6 +1863,17 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                 let password = Arc::clone(&password);
                                 std::thread::spawn(move || {
                                     use std::sync::atomic::Ordering as AtomicOrdering;
+                                    let Some(password) = password
+                                        .read()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .clone()
+                                    else {
+                                        warn!(
+                                            label,
+                                            "auto-unlock: skipped, the password was revoked"
+                                        );
+                                        return;
+                                    };
                                     match attempt_auto_unlock(password.as_str()) {
                                         AutoUnlockOutcome::NotLocked
                                         | AutoUnlockOutcome::SkippedUnsafe => {}
@@ -2939,10 +2955,6 @@ async fn async_main() -> Result<()> {
                 .context("read password from terminal")?,
         )
     };
-    // Arc'd so the reconnect-time auto-unlock watcher (below) can reuse this
-    // exact validated credential without a second Keychain read — works
-    // identically regardless of which branch above produced it.
-    let password: Arc<Zeroizing<String>> = Arc::new(password);
     if !args.skip_auth {
         auth::authenticate(&username, password.as_str())
             .with_context(|| format!("PAM auth failed for {username}"))?;
@@ -2960,6 +2972,12 @@ async fn async_main() -> Result<()> {
         }
         warn!("--skip-auth set; using --password verbatim without PAM check (loopback only)");
     }
+    // Shared with the reconnect-time auto-unlock watcher (below), which reuses
+    // this exact validated credential without a second Keychain read, and kept
+    // current by the credential monitor (a changed or revoked password reaches
+    // auto-unlock too).
+    let secret: credential_monitor::SecretCell =
+        Arc::new(std::sync::RwLock::new(Some(password.clone())));
 
     let session_tracker = capture::SessionTracker::default();
     // (--lock-on-disconnect) Connection activity the pending lock consults so
@@ -2991,7 +3009,7 @@ async fn async_main() -> Result<()> {
             args.restore_windows_on_disconnect,
             physical_main_id,
             lock_activity.clone(),
-            Arc::clone(&password),
+            Arc::clone(&secret),
             auto_unlock,
         );
     } else if args.capture_primary {
@@ -3010,7 +3028,7 @@ async fn async_main() -> Result<()> {
             args.restore_windows_on_disconnect,
             physical_main_id,
             lock_activity.clone(),
-            Arc::clone(&password),
+            Arc::clone(&secret),
             auto_unlock,
         );
     } else if args.shield_primary {
@@ -3029,7 +3047,7 @@ async fn async_main() -> Result<()> {
             args.restore_windows_on_disconnect,
             physical_main_id,
             lock_activity.clone(),
-            Arc::clone(&password),
+            Arc::clone(&secret),
             auto_unlock,
         );
     } else if args.make_primary {
@@ -3703,9 +3721,30 @@ async fn async_main() -> Result<()> {
     // Our Zeroizing<String> still wipes its own allocation at scope exit.
     server.set_credentials(Some(Credentials {
         username: username.clone(),
-        password: (**password).clone(),
+        password: (*password).clone(),
         domain: None,
     }));
+    // Keep those credentials in step with the account (see
+    // credential_monitor.rs). Not under --skip-auth: that password was never
+    // checked with PAM, so there is nothing to keep in step with.
+    if !args.skip_auth {
+        credential_monitor::spawn(
+            credential_monitor::Monitor::new(
+                std::time::Instant::now(),
+                password.clone(),
+                args.keychain,
+            ),
+            credential_monitor::Wiring {
+                username: username.clone(),
+                credentials: server.credentials_handle(),
+                secret: Arc::clone(&secret),
+                check: auth::check,
+                read_keychain: args
+                    .keychain
+                    .then_some(read_password_from_keychain as credential_monitor::KeychainReader),
+            },
+        );
+    }
 
     info!(
         addr = %args.bind,
