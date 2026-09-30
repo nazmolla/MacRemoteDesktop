@@ -191,10 +191,9 @@ impl Encoder {
         self.next_pts = self.next_pts.wrapping_add(1);
         let r = ffi::encode_frame(
             &self.inner,
-            bgra,
+            ffi::Source::Bgra { bgra, stride },
             self.width,
             self.height,
-            stride,
             pts,
             self.fps,
             force_keyframe,
@@ -204,6 +203,36 @@ impl Encoder {
             self.pad_buf = buf;
         }
         r
+    }
+
+    /// Encode pre-split full-range I420 planes (the AVC444 main or auxiliary
+    /// view), tightly packed at the encoder's (even) size.
+    pub fn encode_yuv420(
+        &mut self,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        force_keyframe: bool,
+    ) -> Result<()> {
+        if !self.full_range {
+            bail!("I420 input needs the full-range encoder path");
+        }
+        let (w, h) = (usize::from(self.width), usize::from(self.height));
+        if y.len() < w * h || u.len() < (w / 2) * (h / 2) || v.len() < (w / 2) * (h / 2) {
+            bail!("I420 planes too small for {w}x{h}");
+        }
+        let pts = self.next_pts;
+        self.next_pts = self.next_pts.wrapping_add(1);
+        ffi::encode_frame(
+            &self.inner,
+            ffi::Source::Yuv420 { y, u, v },
+            self.width,
+            self.height,
+            pts,
+            self.fps,
+            force_keyframe,
+            self.full_range,
+        )
     }
 
     /// Pull every encoded frame the callback has produced so far.
@@ -1023,12 +1052,23 @@ mod ffi {
     }
 
     #[allow(clippy::too_many_arguments)] // internal FFI helper; grouping into a struct adds no clarity
+    /// Pixels for one encoded frame.
+    pub(super) enum Source<'a> {
+        /// Packed BGRA, `stride` bytes per row.
+        Bgra { bgra: &'a [u8], stride: usize },
+        /// Full-range I420 planes, tightly packed (`width`, `width/2` bytes per row).
+        Yuv420 {
+            y: &'a [u8],
+            u: &'a [u8],
+            v: &'a [u8],
+        },
+    }
+
     pub(super) fn encode_frame(
         guard: &SessionGuard,
-        bgra: &[u8],
+        source: Source<'_>,
         width: u16,
         height: u16,
-        stride: usize,
         pts: i64,
         fps: u32,
         force_keyframe: bool,
@@ -1079,30 +1119,50 @@ mod ffi {
                 // conversion if vImage can't handle this frame (descriptor
                 // generation failed, or odd dimensions). Both produce full-range
                 // BT.709 NV12, so the fallback is transparent.
-                if bgra_to_nv12_full_range_vimage(
-                    bgra,
-                    stride,
-                    width.into(),
-                    height.into(),
-                    y_plane,
-                    y_stride,
-                    cbcr_plane,
-                    cbcr_stride,
-                )
-                .is_err()
-                {
-                    bgra_to_nv12_full_range(
-                        bgra,
-                        stride,
-                        width.into(),
-                        height.into(),
-                        y_plane,
-                        y_stride,
-                        cbcr_plane,
-                        cbcr_stride,
-                    );
+                match source {
+                    Source::Bgra { bgra, stride } => {
+                        if bgra_to_nv12_full_range_vimage(
+                            bgra,
+                            stride,
+                            width.into(),
+                            height.into(),
+                            y_plane,
+                            y_stride,
+                            cbcr_plane,
+                            cbcr_stride,
+                        )
+                        .is_err()
+                        {
+                            bgra_to_nv12_full_range(
+                                bgra,
+                                stride,
+                                width.into(),
+                                height.into(),
+                                y_plane,
+                                y_stride,
+                                cbcr_plane,
+                                cbcr_stride,
+                            );
+                        }
+                    }
+                    Source::Yuv420 { y, u, v } => {
+                        let (w, h) = (usize::from(width), usize::from(height));
+                        let (cw, ch) = (w / 2, h / 2);
+                        for row in 0..h {
+                            y_plane[row * y_stride..row * y_stride + w]
+                                .copy_from_slice(&y[row * w..row * w + w]);
+                        }
+                        for row in 0..ch {
+                            let dst =
+                                &mut cbcr_plane[row * cbcr_stride..row * cbcr_stride + 2 * cw];
+                            for (i, px) in dst.chunks_exact_mut(2).enumerate() {
+                                px[0] = u[row * cw + i];
+                                px[1] = v[row * cw + i];
+                            }
+                        }
+                    }
                 }
-            } else {
+            } else if let Source::Bgra { bgra, stride } = source {
                 let dst = CVPixelBufferGetBaseAddress(pbuf) as *mut u8;
                 let dst_stride = CVPixelBufferGetBytesPerRow(pbuf);
                 let row_bytes = usize::from(width) * 4;
