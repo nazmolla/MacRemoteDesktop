@@ -13,6 +13,7 @@
 //! Mac-side clipboard changes via `NSPasteboard.changeCount` and signals
 //! the protocol layer.
 
+use crate::sync_ext::LockExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -220,16 +221,24 @@ fn png_or_tiff_to_dib(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     let (w, h) = (img.width(), img.height());
     let row_bytes = (w as usize) * 4;
     let pixel_bytes = row_bytes * (h as usize);
+    // The DIB header stores the size as i32 width/height and a u32 byte count.
+    let (Ok(w_i32), Ok(h_i32), Ok(size_u32)) = (
+        i32::try_from(w),
+        i32::try_from(h),
+        u32::try_from(pixel_bytes),
+    ) else {
+        anyhow::bail!("image {w}x{h} is too large for a DIB");
+    };
 
     let mut out = Vec::with_capacity(40 + pixel_bytes);
     // BITMAPINFOHEADER
     out.extend_from_slice(&40u32.to_le_bytes()); // biSize
-    out.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
-    out.extend_from_slice(&(-(h as i32)).to_le_bytes()); // biHeight (negative = top-down)
+    out.extend_from_slice(&w_i32.to_le_bytes()); // biWidth
+    out.extend_from_slice(&(-h_i32).to_le_bytes()); // biHeight (negative = top-down)
     out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
     out.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
     out.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
-    out.extend_from_slice(&(pixel_bytes as u32).to_le_bytes()); // biSizeImage
+    out.extend_from_slice(&size_u32.to_le_bytes()); // biSizeImage
     out.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
     out.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
     out.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
@@ -463,7 +472,7 @@ impl MacCliprdr {
 
 impl ServerEventSender for MacCliprdr {
     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
-        *self.sender.lock().unwrap() = Some(sender);
+        *self.sender.lock_or_recover() = Some(sender);
 
         // Spawn a poller that notices Mac-side copies and tells the RDP
         // server to advertise the new content to the remote.
@@ -685,7 +694,7 @@ impl ironrdp_core::AsAny for MacCliprdrBackend {
 
 impl MacCliprdrBackend {
     fn push(&self, msg: ClipboardMessage) {
-        if let Some(s) = self.sender.lock().unwrap().as_ref() {
+        if let Some(s) = self.sender.lock_or_recover().as_ref() {
             let _ = s.send(ServerEvent::Clipboard(msg));
         }
     }
@@ -756,7 +765,7 @@ impl MacCliprdrBackend {
     ) -> Option<FileContentsResponse<'static>> {
         let idx = usize::try_from(request.index).ok()?;
         let path = {
-            let guard = self.file_paths.lock().unwrap();
+            let guard = self.file_paths.lock_or_recover();
             guard.get(idx).cloned()?
         };
         let meta = std::fs::metadata(&path)
@@ -838,7 +847,7 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
                 files.push(fd);
                 snapshot.push(e.path);
             }
-            *paths.lock().unwrap() = snapshot;
+            *paths.lock_or_recover() = snapshot;
             debug!(
                 file_count = files.len(),
                 "advertising file copy to client (recursive)"
@@ -879,7 +888,7 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
     }
     // Clear any stale file-paths snapshot so a leftover index can't be
     // exploited by a slow follow-up FileContentsRequest.
-    paths.lock().unwrap().clear();
+    paths.lock_or_recover().clear();
     send(
         sender,
         ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)),
@@ -887,7 +896,7 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
 }
 
 fn send(sender: &Sender, event: ServerEvent) -> bool {
-    let guard = sender.lock().unwrap();
+    let guard = sender.lock_or_recover();
     match guard.as_ref() {
         Some(s) => s.send(event).is_ok(),
         None => false,
@@ -1201,7 +1210,7 @@ impl CliprdrBackend for MacCliprdrBackend {
             // Default to text if we don't know what we asked for — matches
             // the original text-only behaviour.
             Some(Want::Text(_)) | None => {
-                if data.len() % 2 != 0 {
+                if !data.len().is_multiple_of(2) {
                     warn!(len = data.len(), "odd-length UTF-16 payload");
                 } else {
                     let mut units: Vec<u16> = data
@@ -1313,6 +1322,9 @@ mod pb {
 
     pub fn change_count() -> i64 {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block.
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.changeCount() as i64
@@ -1320,28 +1332,41 @@ mod pb {
     }
 
     pub fn has_string() -> bool {
+        // SAFETY: the AppKit pasteboard-type constants are immutable NSString statics exported by
+        // AppKit; reading one is only unsafe because it is an extern static.
         unsafe { has_type(NSPasteboardTypeString) }
     }
 
     pub fn has_image() -> bool {
+        // SAFETY: the AppKit pasteboard-type constants are immutable NSString statics exported by
+        // AppKit; reading one is only unsafe because it is an extern static.
         unsafe { has_type(NSPasteboardTypePNG) || has_type(NSPasteboardTypeTIFF) }
     }
 
     pub fn has_files() -> bool {
+        // SAFETY: the AppKit pasteboard-type constants are immutable NSString statics exported by
+        // AppKit; reading one is only unsafe because it is an extern static.
         unsafe { has_type(NSPasteboardTypeFileURL) }
     }
 
     pub fn has_html() -> bool {
+        // SAFETY: the AppKit pasteboard-type constants are immutable NSString statics exported by
+        // AppKit; reading one is only unsafe because it is an extern static.
         unsafe { has_type(NSPasteboardTypeHTML) }
     }
 
     pub fn has_rtf() -> bool {
+        // SAFETY: the AppKit pasteboard-type constants are immutable NSString statics exported by
+        // AppKit; reading one is only unsafe because it is an extern static.
         unsafe { has_type(NSPasteboardTypeRTF) }
     }
 
     /// The pasteboard's HTML representation (`public.html`), UTF-8 decoded.
     pub fn read_html() -> Option<String> {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. The type constant is an immutable AppKit static.
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.dataForType(NSPasteboardTypeHTML)
@@ -1352,6 +1377,9 @@ mod pb {
     /// The pasteboard's RTF representation (`public.rtf`), as raw bytes.
     pub fn read_rtf() -> Option<Vec<u8>> {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. The type constant is an immutable AppKit static.
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.dataForType(NSPasteboardTypeRTF)
@@ -1389,6 +1417,10 @@ mod pb {
     /// logged but don't abort the rest of the walk.
     pub fn read_files() -> Vec<FileEntry> {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. Every item, type and URL is a retained object owned by this autorelease
+        // pool.
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             let Some(items) = pb.pasteboardItems() else {
@@ -1506,6 +1538,7 @@ mod pb {
     /// the kernel's NSURL machinery), so we let NSURL convert it before
     /// handing the result back to Rust's std::fs.
     fn resolve_file_url(url_str: &NSString) -> Option<std::path::PathBuf> {
+        // SAFETY: `url_str` is a valid NSString; NSURL methods return retained objects or None.
         unsafe {
             let url = NSURL::URLWithString(url_str)?;
             // `URLByResolvingSymlinksInPath` is what turns the file-
@@ -1519,6 +1552,9 @@ mod pb {
 
     fn has_type(target: &objc2_app_kit::NSPasteboardType) -> bool {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block.
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             let Some(types) = pb.types() else {
@@ -1536,6 +1572,9 @@ mod pb {
 
     pub fn read_string() -> Option<String> {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. The type constant is an immutable AppKit static.
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.stringForType(NSPasteboardTypeString)
@@ -1547,6 +1586,9 @@ mod pb {
     #[cfg(test)]
     pub fn write_string(s: &str) {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block.
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.clearContents();
@@ -1560,6 +1602,9 @@ mod pb {
     /// via the `image` crate so this returns PNG either way).
     pub fn read_image_bytes() -> Option<(ImageEncoding, Vec<u8>)> {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. The type constants are immutable AppKit statics.
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             if let Some(d) = pb.dataForType(NSPasteboardTypePNG) {
@@ -1587,6 +1632,10 @@ mod pb {
         mark: &std::sync::atomic::AtomicI64,
     ) {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. Each NSData and NSString written is created from a Rust slice or string that
+        // outlives the call.
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.clearContents();
@@ -1614,6 +1663,8 @@ mod pb {
     }
 
     fn nsdata_to_vec(d: &NSData) -> Vec<u8> {
+        // SAFETY: `bytes()` points at `length()` readable bytes owned by `d`, which outlives this
+        // copy.
         unsafe {
             let len = d.length();
             let ptr = d.bytes().as_ptr();

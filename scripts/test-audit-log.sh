@@ -97,8 +97,8 @@ def check(name, ok):
     if not ok: fails.append(name)
 
 check("audit file is non-empty", bool(rows))
-check("every row has schema_version=1 + event + src_ip",
-      all(r.get("schema_version") == 1 and "event" in r and "src_ip" in r for r in rows))
+check("every row has schema_version=2 + event + src_ip",
+      all(r.get("schema_version") == 2 and "event" in r and "src_ip" in r for r in rows))
 check("target is macrdp::audit on every row", all(r.get("target") == "macrdp::audit" for r in rows))
 
 acc   = ev(event="accept")
@@ -116,11 +116,13 @@ check("auth events carry src_ip + src_port",
       all("src_ip" in r and "src_port" in r for r in au_ok + au_no))
 check("reject events (if any) carry src_ip but NOT src_port",
       all(("src_ip" in r and "src_port" not in r) for r in ev(event="reject")))
-check(">=2 disconnect events", len(dis) >= 2)
+check(">=1 disconnect event (the logged-in session)", len(dis) >= 1)
 
 def tup(r): return (r.get("src_ip"), r.get("src_port"))
 corr = any(tup(a) in {tup(x) for x in acc} and tup(a) in {tup(x) for x in dis} for a in au_ok)
 check("auth-success (src_ip,src_port) correlates to its accept AND disconnect", corr)
+check("a failed login has no disconnect (no session started)",
+      not ({tup(r) for r in au_no} & {tup(r) for r in dis}))
 
 check("auth-failure reason is a clean single-line token (no control chars)",
       all(not any(ord(c) < 0x20 or ord(c) == 0x7f for c in (r.get("reason") or "")) for r in au_no))

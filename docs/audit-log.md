@@ -30,25 +30,29 @@ The same event is written to both sinks, e.g. an accepted connection:
 
 ```text
 # logfmt (macrdp.log)
-2026-07-10T18:22:04.117Z  INFO macrdp::audit: schema_version=1 macrdp_version="0.8.32" host="mac-studio" event="accept" src_ip=203.0.113.5 src_port=54132
+2026-07-10T18:22:04.117Z  INFO macrdp::audit: schema_version=2 macrdp_version="0.8.32" host="mac-studio" event="accept" src_ip=203.0.113.5 src_port=54132
 ```
 ```json
 // JSON (--audit-file)
-{"timestamp":"2026-07-10T18:22:04.117Z","level":"INFO","target":"macrdp::audit","schema_version":1,"macrdp_version":"0.8.32","host":"mac-studio","event":"accept","src_ip":"203.0.113.5","src_port":54132}
+{"timestamp":"2026-07-10T18:22:04.117Z","level":"INFO","target":"macrdp::audit","schema_version":2,"macrdp_version":"0.8.32","host":"mac-studio","event":"accept","src_ip":"203.0.113.5","src_port":54132}
 ```
 
-## The five events
+## The six events
 
-macrdp maps one TCP connection to (usually) four events in order —
-**`accept` → `auth` → `fingerprint` → `disconnect`** — plus **`reject`** for
-connections the guard blocks *before* they ever handshake.
+A successful login produces four events in order —
+**`accept` → `auth` → `fingerprint` → `disconnect`**. A connection that does not
+log in ends earlier: at **`auth`** with `outcome="did_not_complete"` for rejected
+credentials, or at **`handshake_failed`** for anything else that stopped it before
+authentication. **`reject`** covers connections the guard blocks before they ever
+handshake.
 
 ### `accept` — the guard let the connection through *(INFO)*
 Emitted the moment a connection passes the pre-handshake auth guard (per-IP
 rate-limit + lockout checks) and is handed to the TLS/CredSSP stack. **It does
 not mean the client authenticated** — only that it was allowed to try. Every
-accepted connection should be followed by an `auth` and a `disconnect` with the
-same `(src_ip, src_port)`.
+accepted connection is followed, with the same `(src_ip, src_port)`, by exactly
+one of: an `auth` success (then `fingerprint` and `disconnect`), an `auth`
+failure, or a `handshake_failed`.
 
 ### `reject` — the guard blocked it before any handshake *(WARN)*
 Emitted when the per-IP guard refuses the connection outright; it is dropped with
@@ -57,7 +61,7 @@ no TLS, no CredSSP, no `accept`. `reason` says why:
 - **`reason="rate_limit"`** — too many connection attempts from this IP inside the
   sliding window (default 10 / 60 s). `window_attempts` is how many were counted.
 - **`reason="lockout"`** — this IP is in an escalating cooldown after repeated
-  fast failures (default: after 5 consecutive, 30 s doubling to a 15 min cap).
+  failed logins or failed handshakes (default: after 5 consecutive, 30 s doubling to a 15 min cap).
   `retry_after_secs` is how long until the cooldown expires.
 
 A `reject` carries **`src_ip` but not `src_port`** (the decision is per-IP, made
@@ -78,8 +82,8 @@ exchange resolves. This is the authoritative login result:
 
 Because it fires *after* the TLS upgrade, a benign pre-TLS blip (e.g. mstsc's
 first-connect certificate-trust prompt reopening the socket) happens **before**
-this point and can never produce a false `auth` failure — such a connection simply
-has an `accept` and a `disconnect` with **no `auth` event in between**, which is
+this point and can never produce a false `auth` failure — such a connection has
+an `accept` followed by a `handshake_failed`, with **no `auth` event**, which is
 itself the tell that it never reached authentication.
 
 > **Scope:** the `auth` event is emitted on the single-process server path. See
@@ -115,22 +119,30 @@ client is this?" triage — never as a trust signal.
 > **Scope:** the `fingerprint` event is emitted on the single-process server
 > path (same as `auth`).
 
-### `disconnect` — the connection ended *(INFO)*
-Emitted when the connection closes, with `duration_ms` (wall-clock lifetime) and a
-heuristic `outcome`:
+### `handshake_failed` — the connection ended before authenticating *(WARN)*
+Emitted when an accepted connection is dropped before the login verdict, for a
+reason other than rejected credentials. `reason` says why:
 
-- **`outcome="success"`** — a clean session, **or** any connection that got past
-  the handshake (treated as legitimate; it resets the IP's failure counter).
-- **`outcome="failure"`** — the connection errored **and** failed fast (within the
-  ~3 s fail-fast window) — the brute-force/scan signature. Only this classified
-  failure accrues toward a lockout.
+- **`reason="timeout"`** — the client did not finish the handshake in time (5 s
+  to send its first RDP request, 30 s for the whole handshake including TLS and
+  CredSSP). A port scanner that connects and says nothing ends here.
+- **`reason="tls"`** — the TLS handshake failed. mstsc's first-connect certificate
+  prompt produces one of these.
+- **`reason="protocol"`** — the client did not speak RDP.
+- **`reason="capacity"`** — the server had no free handshake slot (too many
+  handshakes in flight overall or from this source). Not counted against the IP.
 
-> **`disconnect.outcome` is a heuristic for the lockout logic, not the login
-> verdict.** For "did this login succeed?", read the **`auth`** event.
-> `disconnect.outcome="failure"` means "errored + fast" (looked like a scan);
-> `auth.outcome="did_not_complete"` means "authentication actually failed." They
-> usually agree, but a long benign session that errors late (e.g. a flaky link)
-> is `disconnect.outcome="success"` with no `auth` failure.
+The first three count toward the lockout, the same as a failed login.
+
+### `disconnect` — a logged-in session ended *(INFO)*
+Emitted when a session that authenticated ends, with `duration_ms` (wall-clock
+lifetime) and `outcome`:
+
+- **`outcome="clean"`** — the session ended normally.
+- **`outcome="error"`** — the session ended with an error (for example a network
+  drop).
+
+This event does not affect the lockout: only the login step does.
 
 ## Field reference
 
@@ -139,16 +151,16 @@ heuristic `outcome`:
 | `timestamp` | string | all | RFC3339 UTC when the event was recorded (JSON only; logfmt shows it as the line prefix) |
 | `level` | string | all | `INFO`, or `WARN` for `reject` and `auth` failure |
 | `target` | string | all | always `macrdp::audit` (the grep key) |
-| `schema_version` | int | all | audit contract version (`1`); bumps only on a breaking field change |
+| `schema_version` | int | all | audit contract version (`2`); bumps only on a breaking field change |
 | `macrdp_version` | string | all | server build, e.g. `0.8.32` |
 | `host` | string | all | server hostname (a collector usually adds its own too) |
-| `event` | string | all | `accept` \| `reject` \| `auth` \| `fingerprint` \| `disconnect` |
+| `event` | string | all | `accept` \| `reject` \| `auth` \| `handshake_failed` \| `fingerprint` \| `disconnect` |
 | `src_ip` | string | all | client source IP — the primary correlation key |
-| `src_port` | int | accept, auth, fingerprint, disconnect | client source port — completes the per-connection tuple. **Absent on `reject`.** |
-| `reason` | string | reject, auth (failure only) | reject: `rate_limit` \| `lockout`. auth: sanitized sspi error text |
+| `src_port` | int | accept, auth, handshake_failed, fingerprint, disconnect | client source port — completes the per-connection tuple. **Absent on `reject`.** |
+| `reason` | string | reject, auth (failure only), handshake_failed | reject: `rate_limit` \| `lockout`. auth: sanitized sspi error text. handshake_failed: `timeout` \| `tls` \| `protocol` \| `capacity` |
 | `window_attempts` | int | reject (`rate_limit`) | attempts counted in the current window |
 | `retry_after_secs` | int | reject (`lockout`) | seconds until the cooldown expires |
-| `outcome` | string | auth, disconnect | auth: `success` \| `did_not_complete`. disconnect: `success` \| `failure` |
+| `outcome` | string | auth, disconnect | auth: `success` \| `did_not_complete`. disconnect: `clean` \| `error` |
 | `client_name` | string | fingerprint | client's announced hostname (client-controlled; sanitized) |
 | `rdp_version` | string | fingerprint | announced RDP protocol version, hex |
 | `client_build` | int | fingerprint | client's announced build number |
@@ -167,7 +179,7 @@ time window; a monotonic per-connection id is a possible future additive field.
 event="accept"      src_ip=203.0.113.5 src_port=54132
 event="auth"        src_ip=203.0.113.5 src_port=54132 outcome="success"
 event="fingerprint" src_ip=203.0.113.5 src_port=54132 client_name="GENMACWIN" client_build=26100 platform="WINDOWS/WINDOWS_NT"
-event="disconnect"  src_ip=203.0.113.5 src_port=54132 duration_ms=216913 outcome="success"
+event="disconnect"  src_ip=203.0.113.5 src_port=54132 duration_ms=216913 outcome="clean"
 ```
 Allowed → authenticated → identified as real mstsc → clean multi-minute session.
 The baseline.
@@ -176,14 +188,13 @@ The baseline.
 ```text
 event="accept"     src_ip=203.0.113.9 src_port=51020
 event="auth"       src_ip=203.0.113.9 src_port=51020 outcome="did_not_complete" reason="logon denied"  (WARN)
-event="disconnect" src_ip=203.0.113.9 src_port=51020 duration_ms=850 outcome="failure"
 ```
-One bad login: the `auth` WARN is the authoritative signal; the fast `failure`
-disconnect is what the lockout counter watches.
+One bad login: the `auth` WARN is both the authoritative signal and what the
+lockout counter records. There is no `disconnect`, since no session started.
 
 **Brute force / password spray → lockout**
 ```text
-… five (or more) accept → auth did_not_complete → disconnect failure cycles from 203.0.113.9 …
+… five (or more) accept → auth did_not_complete cycles from 203.0.113.9 …
 event="reject" reason="lockout" src_ip=203.0.113.9 retry_after_secs=30   (WARN)
 event="reject" reason="lockout" src_ip=203.0.113.9 retry_after_secs=60   (WARN)   ← escalating
 ```
@@ -193,16 +204,15 @@ window instead shows `reason="rate_limit"` with `window_attempts`.
 
 **Benign client blip (e.g. mstsc cert prompt)**
 ```text
-event="accept"     src_ip=203.0.113.5 src_port=54120
-event="disconnect" src_ip=203.0.113.5 src_port=54120 duration_ms=140 outcome="failure"
-event="accept"     src_ip=203.0.113.5 src_port=54121
-event="auth"       src_ip=203.0.113.5 src_port=54121 outcome="success"
-event="disconnect" src_ip=203.0.113.5 src_port=54121 outcome="success"
+event="accept"           src_ip=203.0.113.5 src_port=54120
+event="handshake_failed" src_ip=203.0.113.5 src_port=54120 reason="tls"   (WARN)
+event="accept"           src_ip=203.0.113.5 src_port=54121
+event="auth"             src_ip=203.0.113.5 src_port=54121 outcome="success"
+event="disconnect"       src_ip=203.0.113.5 src_port=54121 outcome="clean"
 ```
-The first connection ended **before** `auth` (no `auth` event) — it never reached
-authentication, so it is not a failed login. A single such fast failure never
-locks anyone out (the threshold is consecutive failures, and the next clean
-session resets the counter).
+The first connection ended **before** `auth` — it never reached authentication,
+so it is not a failed login. It counts as one failure toward the lockout, far
+below the threshold, and the successful login right after resets the counter.
 
 **Loopback** — `127.0.0.1` / `::1` is exempt from the guard's enforcement but is
 **still audited**, so you will see `accept`/`auth`/`disconnect` for local
@@ -222,6 +232,12 @@ out or treat them as low signal in a SOC.
 - **Volume is bounded.** Rejected connections never reach the stack, so a
   brute-forcer's accepted attempts are capped by the lockout, and the audit file
   self-rotates — the stream can't run away under attack.
+- **Schema 2 (2026-09-30).** Version 1 emitted a `disconnect` for every accepted
+  connection, with a heuristic `outcome` of `success` or `failure` that fed the
+  lockout. Version 2 adds `handshake_failed`, emits `disconnect` only for
+  sessions that logged in, and changes its `outcome` to `clean` or `error`.
+  Rules keyed on `disconnect.outcome="failure"` should move to `auth`
+  `did_not_complete` plus `handshake_failed`.
 - **`macrdp_version` / `schema_version`** let you pin detection rules across
   upgrades; key alerts off `schema_version` so an additive field never breaks a
   parser.

@@ -14,7 +14,7 @@ cargo fmt                      # format
 RUST_LOG=debug cargo run       # crank logging for troubleshooting
 ```
 
-Useful CLI flags (see `src/main.rs::Args` for the full set):
+Useful CLI flags (see `src/app/args.rs::Args` for the full set):
 ```
 --bind 0.0.0.0:3390       # listen address
 --username NAME           # default: $USER
@@ -455,7 +455,6 @@ MACRDP_AUDIT_LOG=1                # connection audit log (independent of the gua
 MACRDP_GUARD_RL_MAX=10            # max attempts per window per IP (0 = no rate-limit)
 MACRDP_GUARD_RL_WINDOW_SECS=60    # rate-limit sliding window
 MACRDP_GUARD_FAIL_THRESHOLD=5     # consecutive failures before lockout (0 = no lockout)
-MACRDP_GUARD_FAILFAST_SECS=3      # only errored connections that fail within this window (pre-handshake) count toward lockout
 MACRDP_GUARD_COOLDOWN_BASE_SECS=30  # first lockout length (doubles per extra failure)
 MACRDP_GUARD_COOLDOWN_MAX_SECS=900  # lockout escalation cap (15 min)
 ```
@@ -475,16 +474,16 @@ consecutive failure and doubles from 30 s as the IP keeps failing past each cool
 There is **no manual unlock** — each cooldown auto-expires, then the next attempt is
 allowed through. Escalation requires *actually failing again after* each cooldown
 clears (while locked out, attempts are rejected pre-handshake and don't count as new
-failures), and **a clean session — or any connection that got past the handshake —
-resets the IP to 0**. The lockout is **heuristic**: only a connection that errored
-*and* failed within the fail-fast window (`MACRDP_GUARD_FAILFAST_SECS`, ~3s — i.e.
-never authenticated, the brute-force signature) counts as a failure. A client that
-connected for several seconds and *then* errored (e.g. mstsc's reconnect-blank or a
-flaky link) is treated as legitimate and does **not** accrue toward a lockout — so a
-reconnecting real client is never locked out, and a single benign disconnect (mstsc's
-first-connect cert-prompt "Broken pipe") never does either. Audit lines are tagged
+failures), and **a successful login resets the IP to 0**. A failure is a rejected
+password, or a connection that timed out, failed TLS or did not speak RDP before
+authenticating (the server reports each case explicitly). What happens after a
+successful login, such as a session that later errors or a reconnect, never counts, so
+a reconnecting real client is not locked out, and a single benign disconnect (mstsc's
+first-connect cert-prompt "Broken pipe") is one failure, well below the threshold.
+IPv6 sources are grouped by /64, so rotating addresses within one subscriber prefix
+does not reset the count. Audit lines are tagged
 `macrdp::audit`: `grep 'macrdp::audit' ~/Library/Logs/macrdp.log` shows
-`event="accept|reject|disconnect"` with the source IP and (for rejects) the reason
+`event="accept|reject|auth|handshake_failed|disconnect"` with the source IP and (for rejects) the reason
 and retry-after.
 
 Health-check watchdog (env-only; **on by default when headless**). Detects a

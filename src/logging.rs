@@ -248,7 +248,7 @@ fn install_panic_hook() {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
+    crate::tunables::var(key)
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&v| v > 0)
@@ -257,7 +257,7 @@ fn env_u64(key: &str, default: u64) -> u64 {
 
 fn env_usize(key: &str, default: usize) -> usize {
     // 0 is a legal value here (no archives kept), so don't filter it out.
-    std::env::var(key)
+    crate::tunables::var(key)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(default)
@@ -392,9 +392,26 @@ impl<'a> MakeWriter<'a> for RotatingWriter {
     }
 }
 
+/// Installs a global subscriber that enables every event, once per test
+/// process, for tests that capture events with a scoped subscriber.
+///
+/// Callsite interest is cached process-wide. When a callsite is first hit on
+/// a thread with no subscriber, tracing caches "never" for it and a scoped
+/// subscriber on another thread can miss the event. That dropped captured
+/// audit events in about one run in 40. With a global subscriber that always
+/// says yes, no callsite is ever cached as "never", so each dispatch is asked.
+#[cfg(test)]
+pub(crate) fn catch_all_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_ext::LockExt;
 
     fn unique_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -523,7 +540,7 @@ mod tests {
         }
         impl Write for BufW {
             fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
+                self.0.lock_or_recover().extend_from_slice(b);
                 Ok(b.len())
             }
             fn flush(&mut self) -> io::Result<()> {
@@ -547,13 +564,14 @@ mod tests {
         let subscriber = tracing_subscriber::registry()
             .with(main_layer)
             .with(audit_layer);
+        crate::logging::catch_all_for_tests();
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: "macrdp::audit", event = "accept", src_ip = "203.0.113.5");
             tracing::info!("an operational info line");
         });
 
-        let audit = String::from_utf8(audit_buf.0.lock().unwrap().clone()).unwrap();
-        let main = String::from_utf8(main_buf.0.lock().unwrap().clone()).unwrap();
+        let audit = String::from_utf8(audit_buf.0.lock_or_recover().clone()).unwrap();
+        let main = String::from_utf8(main_buf.0.lock_or_recover().clone()).unwrap();
         // Reached the audit sink as JSON despite the `warn` operational filter.
         assert!(
             audit.contains("\"event\":\"accept\"") && audit.contains("203.0.113.5"),

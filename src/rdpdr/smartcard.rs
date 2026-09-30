@@ -53,7 +53,7 @@ const CMD_PRESENCE: u8 = 4;
 const MAX_APDU_LEN: usize = 65_544;
 
 fn port() -> u16 {
-    std::env::var("MACRDP_SCARD_PORT")
+    crate::tunables::var("MACRDP_SCARD_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PORT)

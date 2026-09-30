@@ -194,6 +194,9 @@ fn color_roundtrip_avc420_baseline() {
     }
 }
 
+/// Tightly packed (y, u, v) planes.
+type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
+
 /// Encode full-range I420 planes (`w×h`) 30× with a fresh encoder, decode the
 /// last frame with ffmpeg; returns tightly packed (y, u, v) at `w×h`.
 fn encode_decode_i420(
@@ -203,7 +206,7 @@ fn encode_decode_i420(
     v: &[u8],
     w: usize,
     h: usize,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+) -> Result<Planes, String> {
     let mut enc = crate::videotoolbox::Encoder::new(w as u16, h as u16, 60, 50_000_000, 2.0)
         .map_err(|e| e.to_string())?;
     for i in 0..30 {

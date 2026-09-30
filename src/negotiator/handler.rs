@@ -21,6 +21,10 @@ pub struct ClientAdvert {
 }
 
 impl ClientAdvert {
+    #[allow(
+        dead_code,
+        reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
+    )]
     pub fn platform(&self) -> ClientPlatform {
         match self.platform.load(Ordering::Relaxed) {
             1 => ClientPlatform::Windows,
@@ -89,15 +93,22 @@ impl ConnectionHandler for NegotiationHandler {
         }
     }
 
-    fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
+    fn on_handshake_failed(&mut self, peer: SocketAddr, failure: ironrdp_server::HandshakeFailure) {
+        if let Some(h) = self.inner.as_mut() {
+            h.on_handshake_failed(peer, failure);
+        }
+    }
+
+    fn on_authenticated(&mut self, peer: SocketAddr, success: bool, reason: Option<&str>) {
         // Forward as lock_activity.rs does
         if let Some(h) = self.inner.as_mut() {
-            h.on_authenticated(success, reason);
+            h.on_authenticated(peer, success, reason);
         }
     }
 
     fn on_client_fingerprint(
         &mut self,
+        peer: SocketAddr,
         client_name: &str,
         rdp_version: u32,
         client_build: u32,
@@ -105,7 +116,7 @@ impl ConnectionHandler for NegotiationHandler {
     ) {
         // Forward to inner
         if let Some(h) = self.inner.as_mut() {
-            h.on_client_fingerprint(client_name, rdp_version, client_build, platform);
+            h.on_client_fingerprint(peer, client_name, rdp_version, client_build, platform);
         }
 
         // Record platform
@@ -124,10 +135,10 @@ impl ConnectionHandler for NegotiationHandler {
         tracing::info!(target: "macrdp::negotiator", platform = ?p, ctrl_to_cmd = on, override = self.ctrl_to_cmd_override.is_some(), "input: Ctrl→Cmd decided from client platform");
     }
 
-    fn on_client_display(&mut self, info: &ironrdp_acceptor::ClientDisplayInfo) {
+    fn on_client_display(&mut self, peer: SocketAddr, info: &ironrdp_acceptor::ClientDisplayInfo) {
         // Forward to inner
         if let Some(h) = self.inner.as_mut() {
-            h.on_client_display(info);
+            h.on_client_display(peer, info);
         }
 
         // Record scale factor
@@ -146,6 +157,9 @@ mod tests {
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Arc;
 
+    const PEER: SocketAddr =
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 3389);
+
     // Test 1: apple_client_turns_ctrl_to_cmd_off
     #[test]
     fn apple_client_turns_ctrl_to_cmd_off() {
@@ -157,7 +171,7 @@ mod tests {
 
         let advert = Arc::new(ClientAdvert::default());
         let mut handler = NegotiationHandler::wrap(None, advert.clone(), None, rec);
-        handler.on_client_fingerprint("x", 0, 0, "OsX/Unspecified");
+        handler.on_client_fingerprint(PEER, "x", 0, 0, "OsX/Unspecified");
 
         assert_eq!(LAST.load(Ordering::SeqCst), 0);
         assert_eq!(advert.platform(), ClientPlatform::Apple);
@@ -175,14 +189,14 @@ mod tests {
         // Windows client with no override → 1
         let advert = Arc::new(ClientAdvert::default());
         let mut handler = NegotiationHandler::wrap(None, advert.clone(), None, rec);
-        handler.on_client_fingerprint("y", 0, 0, "Windows/WindowsNt");
+        handler.on_client_fingerprint(PEER, "y", 0, 0, "Windows/WindowsNt");
 
         assert_eq!(LAST.load(Ordering::SeqCst), 1);
 
         // Now create a new handler with override Some(false)
         let mut handler2 =
             NegotiationHandler::wrap(None, Arc::new(ClientAdvert::default()), Some(false), rec);
-        handler2.on_client_fingerprint("y", 0, 0, "Windows/WindowsNt");
+        handler2.on_client_fingerprint(PEER, "y", 0, 0, "Windows/WindowsNt");
 
         assert_eq!(LAST.load(Ordering::SeqCst), 0);
     }
@@ -201,7 +215,7 @@ mod tests {
         };
 
         let mut handler = NegotiationHandler::wrap(None, advert.clone(), None, |_| {});
-        handler.on_client_display(&info_with_scale);
+        handler.on_client_display(PEER, &info_with_scale);
 
         assert_eq!(advert.scale_pct.load(Ordering::Relaxed), 150);
 
@@ -212,7 +226,7 @@ mod tests {
             desktop_scale_factor: None,
             ..Default::default()
         };
-        handler.on_client_display(&info_no_scale);
+        handler.on_client_display(PEER, &info_no_scale);
 
         assert_eq!(advert.scale_pct.load(Ordering::Relaxed), 0);
     }

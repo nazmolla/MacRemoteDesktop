@@ -20,6 +20,10 @@ pub fn classify_platform(platform: &str) -> ClientPlatform {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientCaps {
     pub monitor: ClientMonitor,
@@ -33,11 +37,19 @@ pub struct HostCaps {
 }
 
 /// Developer overrides from hidden CLI flags / config; `None` = negotiate.
+#[allow(
+    dead_code,
+    reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
+)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Overrides {
     pub map_ctrl_to_cmd: Option<bool>,
 }
 
+#[allow(
+    dead_code,
+    reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPlan {
     /// `None` when virtual displays are unavailable (physical capture fallback).
@@ -47,6 +59,10 @@ pub struct SessionPlan {
     pub reasons: Vec<String>,
 }
 
+#[allow(
+    dead_code,
+    reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
+)]
 pub fn negotiate(client: &ClientCaps, host: &HostCaps, overrides: &Overrides) -> SessionPlan {
     let mut reasons = Vec::new();
     let display = if host.virtual_display_available {

@@ -93,7 +93,7 @@ impl Encoder {
         // image while keeping FreeRDP correct. Opt back out to video-range (let
         // VT convert from BGRA) with MACRDP_H264_FULL_RANGE=0 for debugging.
         let full_range = !matches!(
-            std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
+            crate::tunables::var("MACRDP_H264_FULL_RANGE").as_deref(),
             Ok("0") | Ok("false") | Ok("FALSE")
         );
         // Keyframe interval is a frame count; derive it from the requested
@@ -165,7 +165,7 @@ impl Encoder {
     pub fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<()> {
         // Odd source height: the session is one row taller (see `new`) than
         // the caller's buffer, so replicate its last row into a reused buffer.
-        let src_rows = if stride == 0 { 0 } else { bgra.len() / stride };
+        let src_rows = bgra.len().checked_div(stride).unwrap_or(0);
         let mut padded: Option<Vec<u8>> = None;
         if src_rows > 0 && src_rows + 1 == usize::from(self.height) {
             let mut buf = std::mem::take(&mut self.pad_buf);
@@ -262,6 +262,8 @@ impl Encoder {
 // VT's compression session is thread-safe according to Apple's docs
 // (frames can be submitted from any thread). The Receiver is !Sync but
 // that's fine — we only call `drain()` from the owning thread.
+// SAFETY: the compression session accepts frames from any thread, and the receiver is only drained
+// by its owner (see the note above).
 unsafe impl Send for Encoder {}
 
 mod ffi {
@@ -500,6 +502,8 @@ mod ffi {
 
     impl Drop for SessionGuard {
         fn drop(&mut self) {
+            // SAFETY: the session is released once, only if non-null, after being invalidated so no
+            // output callback runs afterwards.
             unsafe {
                 if !self.session.is_null() {
                     VTCompressionSessionInvalidate(self.session);
@@ -509,6 +513,7 @@ mod ffi {
         }
     }
     // The session itself is documented as thread-safe.
+    // SAFETY: the compression session is documented as thread-safe.
     unsafe impl Send for SessionGuard {}
 
     pub(super) fn create_session(
@@ -519,6 +524,9 @@ mod ffi {
         tx_ctx: *mut c_void,
     ) -> Result<SessionGuard> {
         let mut session: VTCompressionSessionRef = ptr::null();
+        // SAFETY: null allocators and specs ask VT for defaults; `output_callback` is an `extern
+        // "C"` function and `tx_ctx` is the leaked channel context it expects, which outlives the
+        // session; `session` is a valid out-pointer.
         let status = unsafe {
             VTCompressionSessionCreate(
                 ptr::null(),
@@ -541,6 +549,8 @@ mod ffi {
         // Real-time low-latency profile. Disable frame reordering so
         // every emitted frame is immediately decodable in order — RDP
         // does not tolerate B-frames or reorder delay.
+        // SAFETY: `session` is non-null (checked above) and owned by `guard`; the keys and CF
+        // values are system constants or live locals.
         unsafe {
             set_bool(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)?;
             set_bool(
@@ -605,6 +615,7 @@ mod ffi {
             )?;
         }
 
+        // SAFETY: `session` is non-null and owned by `guard`.
         let prepared = unsafe { VTCompressionSessionPrepareToEncodeFrames(session) };
         if prepared != 0 {
             bail!("VTCompressionSessionPrepareToEncodeFrames failed: OSStatus {prepared}");
@@ -838,6 +849,8 @@ mod ffi {
                 cbcr_min: 0,
             };
             let mut info = VImageArgbToYpCbCr { opaque: [0u8; 128] };
+            // SAFETY: `range` and `info` are locals that outlive the call, and `info` is the opaque
+            // 128-byte buffer vImage fills.
             let err = unsafe {
                 vImageConvert_ARGBToYpCbCr_GenerateConversion(
                     kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2,
@@ -851,6 +864,31 @@ mod ffi {
             (err == 0).then_some(info)
         })
         .as_ref()
+    }
+
+    /// Check that a buffer of `len` bytes holds `rows` rows of `row_bytes`
+    /// bytes at `stride`, which is what vImage reads or writes through the raw
+    /// pointer. The last row only needs `row_bytes`, not a full stride.
+    fn ensure_plane(
+        len: usize,
+        stride: usize,
+        row_bytes: usize,
+        rows: usize,
+        what: &str,
+    ) -> Result<()> {
+        let needed = match rows {
+            0 => 0,
+            n => stride
+                .checked_mul(n - 1)
+                .and_then(|v| v.checked_add(row_bytes))
+                .ok_or_else(|| anyhow!("{what} plane size overflows"))?,
+        };
+        if stride < row_bytes || len < needed {
+            bail!(
+                "{what} plane too small for vImage: {len} bytes, need {needed} (stride {stride})"
+            );
+        }
+        Ok(())
     }
 
     /// vImage equivalent of `bgra_to_nv12_full_range`. `Err` if vImage isn't
@@ -867,6 +905,9 @@ mod ffi {
         cbcr_plane: &mut [u8],
         cbcr_stride: usize,
     ) -> Result<()> {
+        ensure_plane(bgra.len(), src_stride, width * 4, height, "source")?;
+        ensure_plane(y_plane.len(), y_stride, width, height, "Y")?;
+        ensure_plane(cbcr_plane.len(), cbcr_stride, width, height / 2, "CbCr")?;
         let info = vimage_conv_info().ok_or_else(|| anyhow!("vImage conv-info unavailable"))?;
         let src = VImageBuffer {
             data: bgra.as_ptr() as *mut c_void,
@@ -889,6 +930,9 @@ mod ffi {
         // Source is BGRA (byte order B,G,R,A); vImage's ARGB8888 is A,R,G,B.
         // permuteMap[dest] = source index: A<-3, R<-2, G<-1, B<-0.
         let permute: [u8; 4] = [3, 2, 1, 0];
+        // SAFETY: `ensure_plane` above checked that every buffer holds the rows and strides
+        // described in `src`, `dest_yp` and `dest_cbcr`; `info` was generated by vImage, and
+        // `permute` is a four-entry map as required.
         let err = unsafe {
             vImageConvert_ARGB8888To420Yp8_CbCr8(
                 &src,
@@ -1016,6 +1060,10 @@ mod ffi {
         cr_plane: &mut [u8],
         cr_stride: usize,
     ) -> Result<()> {
+        ensure_plane(bgra.len(), src_stride, width * 4, height, "source")?;
+        ensure_plane(y_plane.len(), y_stride, width, height, "Y")?;
+        ensure_plane(cb_plane.len(), cb_stride, width, height, "Cb")?;
+        ensure_plane(cr_plane.len(), cr_stride, width, height, "Cr")?;
         let src = VImageBuffer {
             data: bgra.as_ptr() as *mut c_void,
             height,
@@ -1033,6 +1081,8 @@ mod ffi {
                 width,
                 row_bytes: stride,
             };
+            // SAFETY: `ensure_plane` above checked that the source and each destination plane hold
+            // `height` rows at their strides; `matrix` is a four-entry coefficient array.
             let err = unsafe {
                 vImageMatrixMultiply_ARGB8888ToPlanar8(
                     &src,
@@ -1064,6 +1114,10 @@ mod ffi {
         },
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one call site per source kind; the arguments are the frame's parameters"
+    )]
     pub(super) fn encode_frame(
         guard: &SessionGuard,
         source: Source<'_>,
@@ -1082,6 +1136,8 @@ mod ffi {
             K_CV_PIXEL_FORMAT_TYPE_32_BGRA
         };
         let mut pbuf: CVPixelBufferRef = ptr::null();
+        // SAFETY: null allocator and attributes ask CoreVideo for a default buffer of the given
+        // size and format; `pbuf` is a valid out-pointer.
         let status = unsafe {
             CVPixelBufferCreate(
                 ptr::null(),
@@ -1101,6 +1157,9 @@ mod ffi {
         // we release our reference right after submit. The actual
         // CFRelease lives in the cleanup path below regardless of
         // success/failure so we don't leak on errors.
+        // SAFETY: `pbuf` is non-null (checked above) and locked before any base address is read;
+        // each plane slice spans exactly bytes-per-row times the plane's row count as reported by
+        // CoreVideo for this buffer, and the buffer is unlocked before the result is returned.
         let result = unsafe {
             CVPixelBufferLockBaseAddress(pbuf, 0);
             if full_range {
@@ -1228,6 +1287,8 @@ mod ffi {
                 Ok(())
             }
         };
+        // SAFETY: `pbuf` is non-null and this is the one reference we created; VT retains its own
+        // for the encode.
         unsafe { CFRelease(pbuf) };
         result
     }
@@ -1242,6 +1303,7 @@ mod ffi {
             flags: 0,
             epoch: 0,
         };
+        // SAFETY: `guard.session` is a live compression session.
         let status = unsafe { VTCompressionSessionCompleteFrames(guard.session, invalid) };
         if status != 0 {
             bail!("VTCompressionSessionCompleteFrames failed: OSStatus {status}");

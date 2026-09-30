@@ -375,6 +375,8 @@ impl H264Decoder {
         let ptrs = [sps.as_ptr(), pps.as_ptr()];
         let sizes = [sps.len(), pps.len()];
         let mut fmt: CmFormatDescriptionRef = ptr::null();
+        // SAFETY: `ptrs` and `sizes` are two-element arrays pointing at the SPS and PPS byte
+        // vectors, which outlive the call; `fmt` is a valid out-pointer.
         let st = unsafe {
             CMVideoFormatDescriptionCreateFromH264ParameterSets(
                 ptr::null(),
@@ -395,6 +397,9 @@ impl H264Decoder {
             ref_con: self.cb_state as *mut c_void,
         };
         let mut session: VtDecompressionSessionRef = ptr::null();
+        // SAFETY: `fmt` was checked non-null above; `record` lives on the stack for the call (VT
+        // copies it) and its `ref_con` is `cb_state`, which this decoder owns until Drop, after the
+        // session is invalidated; `session` is a valid out-pointer.
         let st = unsafe {
             VTDecompressionSessionCreate(
                 ptr::null(),
@@ -406,6 +411,8 @@ impl H264Decoder {
             )
         };
         if st != 0 || session.is_null() {
+            // SAFETY: `fmt` is a non-null format description created above and not yet stored
+            // anywhere, so it is released exactly once.
             unsafe { CFRelease(fmt) };
             return Err(anyhow!("VTDecompressionSessionCreate OSStatus {st}"));
         }
@@ -423,6 +430,8 @@ impl H264Decoder {
         // Wrap the AVCC data in a CMBlockBuffer (VT-owned copy), then a
         // CMSampleBuffer with our format description, then decode.
         let mut block: CmBlockBufferRef = ptr::null();
+        // SAFETY: null allocators and memory block ask CoreMedia to allocate `avcc.len()` bytes
+        // itself; `block` is a valid out-pointer.
         let st = unsafe {
             CMBlockBufferCreateWithMemoryBlock(
                 ptr::null(),
@@ -439,15 +448,20 @@ impl H264Decoder {
         if st != 0 || block.is_null() {
             return;
         }
+        // SAFETY: `block` is non-null and was created with exactly `avcc.len()` bytes, which is the
+        // length copied from the `avcc` slice.
         let st = unsafe {
             CMBlockBufferReplaceDataBytes(avcc.as_ptr() as *const c_void, block, 0, avcc.len())
         };
         if st != 0 {
+            // SAFETY: `block` is non-null and owned here; released once before returning.
             unsafe { CFRelease(block) };
             return;
         }
         let sizes = [avcc.len()];
         let mut sample: CmSampleBufferRef = ptr::null();
+        // SAFETY: `block` and `format_desc` are live, `sizes` holds one entry matching the one
+        // sample, and `sample` is a valid out-pointer.
         let st = unsafe {
             CMSampleBufferCreateReady(
                 ptr::null(),
@@ -462,10 +476,13 @@ impl H264Decoder {
             )
         };
         if st != 0 || sample.is_null() {
+            // SAFETY: `block` is non-null and owned here; released once before returning.
             unsafe { CFRelease(block) };
             return;
         }
         let mut info_flags: u32 = 0;
+        // SAFETY: `session` and `sample` are live; decoding is synchronous with respect to these
+        // references, and both CF objects are released once after it.
         unsafe {
             VTDecompressionSessionDecodeFrame(
                 self.session,
@@ -482,6 +499,8 @@ impl H264Decoder {
 
 impl Drop for H264Decoder {
     fn drop(&mut self) {
+        // SAFETY: each handle is released once, only if non-null; the session is invalidated before
+        // `cb_state` is freed, so the output callback can no longer run when the box is reclaimed.
         unsafe {
             if !self.session.is_null() {
                 VTDecompressionSessionInvalidate(self.session);

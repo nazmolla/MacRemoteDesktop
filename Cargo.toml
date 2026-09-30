@@ -74,6 +74,9 @@ ironrdp-connector = "0.10"
 ironrdp-tokio = "0.10"
 # For the UDP multitransport loopback test: decode the listener's SYN+ACK reply.
 ironrdp-rdpeudp = { path = "vendor/ironrdp-rdpeudp" }
+# For the garbage-input tests of the URBDRC decoders (src/garbage_input_test.rs);
+# resolved through the git [patch.crates-io] entry below.
+ironrdp-rdpeusb = "0.1"
 
 [build-dependencies]
 # Compile the USB-redirection Obj-C shim (src/usb_redirect/usb_spike.m) on macOS.
@@ -156,6 +159,12 @@ ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git",
 # consumer resolves to the single vendored copy.
 [patch."https://github.com/Devolutions/IronRDP.git"]
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
+
+[lints.clippy]
+# New in rustc 1.98: suggests rewriting fixed-size `chunks_exact` loops as `as_chunks`.
+# Those loops are the per-pixel hot paths (encode, cursor, clipboard, audio) and are
+# measured as they are; keep them rather than churn them for a style lint.
+chunks_exact_to_as_chunks = "allow"
 
 [profile.release]
 lto = "thin"

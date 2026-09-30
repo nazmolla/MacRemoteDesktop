@@ -48,6 +48,7 @@
 
 #![cfg(target_os = "macos")]
 
+use crate::sync_ext::LockExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -71,158 +72,24 @@ use tracing::{debug, info, trace, warn};
 
 use crate::videotoolbox::{EncodedFrame, Encoder};
 
-/// Minimum spacing between "trickle" frames let through the EGFX-on-UDP
-/// backpressure gate while the client's frame-ack lag is over the threshold.
-/// ~10 fps: enough trailing frames for mstsc to keep presenting + acking (so
-/// the window reopens and lag recovers) while still throttling well below the
-/// full 60 fps so the client's decode queue drains net. See the gate in
-/// `submit_bgra` and `ConnectionContext::last_throttle_ship`.
-const UDP_THROTTLE_FLOOR: Duration = Duration::from_millis(100);
+mod annexb;
+mod blank;
+mod congestion;
+mod regions;
+mod udp_watchdog;
 
-/// P3 cold-start guard: how long after the first frame-ack the adaptive controller
-/// ignores the ack-lag congestion signal. At connect the encoder ships an initial
-/// burst (keyframe + first frames) before the client starts acking, so `shipped −
-/// acked` spikes (~25) for ~1.5 s — that's startup backlog, not congestion, and
-/// honoring it dips the bitrate right as the session opens. The retransmit signal
-/// stays active during warmup (it's acks-independent).
-const ADAPTIVE_WARMUP: Duration = Duration::from_secs(2);
-
-/// Slots in the per-connection ship-time ring used to sample each frame's
-/// ship→ack round trip (indexed `frame_id % RTT_RING`). 128 comfortably covers
-/// any realistic frames-in-flight window (even 500 ms RTT at 60 fps is ~30).
-const RTT_RING: usize = 128;
-
-/// Bucket width of the two-bucket windowed-minimum RTT filter. The min over
-/// the current + previous bucket is the base-RTT estimate the queue-delay
-/// signal subtracts; a route change (VPN reconnect) re-baselines within ~2
-/// buckets. Long on purpose: a SHORT window lets a slowly-growing standing
-/// queue launder itself into the baseline (the min "chases" the queued
-/// samples and the measured delay reads as growth-per-window instead of the
-/// absolute queue). 30 s buckets keep the base honest for 30–60 s while
-/// still re-baselining after a genuine route change within a minute.
-const RTT_MIN_WINDOW: Duration = Duration::from_secs(30);
-
-/// Fold one ack-RTT sample into the current windowed-min bucket and return
-/// `(new_bucket_min, standing_queue_delay_ms)` — the delay is the sample's
-/// excess over the two-bucket minimum (never negative). Pure, unit-tested;
-/// bucket rotation happens at the call site (it needs the clock).
-fn queue_delay_fold(sample_ms: f64, bucket_min_ms: f64, prev_bucket_min_ms: f64) -> (f64, f64) {
-    let cur = bucket_min_ms.min(sample_ms);
-    let base = cur.min(prev_bucket_min_ms);
-    (cur, (sample_ms - base).max(0.0))
-}
-
-/// The controller's effective congestion sample for one interval: the latest
-/// ack-derived queue delay, floored by the **no-ack fallback** — when frames
-/// are outstanding and we're actively shipping but acks have gone quiet, the
-/// time since the last ack is itself a lower bound on the standing delay.
-/// Without this, TOTAL saturation goes dark: a fully choked pipe delivers so
-/// few frames that acks stop entirely → no RTT samples → `queue_delay_ms`
-/// freezes at its last (healthy) value and the controller reads a drowning
-/// link as clean (observed live on a shaped 500 Kbit pipe 2026-07-04: ack lag
-/// grew 275→4746 while the sampled delay stayed 0.0). On a healthy link acks
-/// arrive continuously, so `since_ack_ms` is just the tiny inter-ack gap and
-/// the max() is a no-op; with nothing outstanding (static screen) or shipping
-/// stopped (suppressed), the fallback is skipped so idle never reads as
-/// congestion. Pure, unit-tested.
-fn effective_queue_delay(
-    queue_delay_ms: f64,
-    since_ack_ms: f64,
-    outstanding: bool,
-    actively_shipping: bool,
-) -> f64 {
-    if outstanding && actively_shipping {
-        queue_delay_ms.max(since_ack_ms)
-    } else {
-        queue_delay_ms
-    }
-}
-
-/// How the H.264 NAL units are framed inside the AVC420 wire payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WireFormat {
-    /// 4-byte big-endian length prefix per NAL (VideoToolbox's native AVCC).
-    /// ironrdp's decoder documents this as the expected format.
-    LengthPrefixed,
-    /// `00 00 00 01` start codes (historical Windows/FreeRDP convention).
-    AnnexB,
-}
-
-impl WireFormat {
-    /// Annex-B is the verified-correct framing for Microsoft's decoder
-    /// (mstsc renders the desktop with it; length-prefixed AVCC gets ZERO
-    /// frame-acks and a blank surface — confirmed empirically 2026-05-20).
-    /// Default to Annex-B; keep length-prefixed one env var away
-    /// (`MACRDP_H264_LENGTH_PREFIXED=1`) for ironrdp-decoder interop testing.
-    /// The legacy `MACRDP_H264_ANNEXB=1` is still accepted (now a no-op since
-    /// Annex-B is the default).
-    fn from_env() -> Self {
-        match std::env::var("MACRDP_H264_LENGTH_PREFIXED") {
-            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Self::LengthPrefixed,
-            _ => Self::AnnexB,
-        }
-    }
-}
-
-/// Per-connection state, shared between the `Gfx` factory/handle (capture
-/// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
-/// Which part of the client surface a submitted frame updates (MS-RDPEGFX
-/// AVC420 region rects). Areas outside the regions keep what the client has —
-/// which is what lets lossless refinement survive later frames (spec §8.3).
-#[derive(Debug, Clone)]
-pub(crate) enum FrameRegions {
-    /// Whole surface.
-    Full,
-    /// Only these rectangles changed.
-    Rects(Vec<crate::refine::Rect>),
-    /// Same pixels as the previous submit (flush frames): reuse its regions.
-    SameAsLast,
-}
+pub(crate) use annexb::avcc_to_annex_b;
+use annexb::*;
+use blank::*;
+use congestion::*;
+pub(crate) use regions::FrameRegions;
+use regions::*;
+use udp_watchdog::*;
 
 /// A tile unchanged this long is re-sent losslessly (spec §8.3: ~150–300 ms).
 const REFINE_IDLE: std::time::Duration = std::time::Duration::from_millis(200);
 /// Tiles per refinement tick (64×64 each) — bounds one tick's burst.
 const REFINE_BUDGET_TILES: usize = 48;
-
-/// Regions submitted but not yet carried by an encoded frame. A dropped
-/// capture's change must ride on the next encoded frame (review I1).
-#[derive(Debug, Clone, Default)]
-enum RegionDebt {
-    #[default]
-    None,
-    Full,
-    Rects(Vec<crate::refine::Rect>),
-}
-
-impl RegionDebt {
-    /// Add a frame's regions; `None` = whole surface.
-    fn add(&mut self, rects: Option<&[crate::refine::Rect]>) {
-        *self = match (std::mem::take(self), rects) {
-            (Self::Full, _) | (_, None) => Self::Full,
-            (Self::None, Some(r)) => Self::Rects(r.to_vec()),
-            (Self::Rects(mut v), Some(r)) => {
-                v.extend_from_slice(r);
-                if v.len() > 4 * MAX_AVC_REGIONS {
-                    Self::Full
-                } else {
-                    Self::Rects(v)
-                }
-            }
-        };
-    }
-
-    /// Regions for the frame being encoded now (`None` = whole surface).
-    fn take(&mut self) -> Option<Vec<crate::refine::Rect>> {
-        match std::mem::take(self) {
-            Self::Full => None,
-            Self::None => Some(Vec::new()),
-            Self::Rects(v) => Some(v),
-        }
-    }
-}
-
-/// Cap before collapsing a frame's regions into their bounding box.
-const MAX_AVC_REGIONS: usize = 16;
 
 /// Reused planes for AVC444: full YUV444, then the main and auxiliary I420
 /// views (MS-RDPEGFX §3.3.8.3.2 v1 layout, see `crate::avc444`).
@@ -277,6 +144,65 @@ impl Avc444Buffers {
     }
 }
 
+// ---- Lock order ----------------------------------------------------------
+//
+// `server_handle` (the connection's `GraphicsPipelineServer`) may be locked and
+// then `ctx`, never the other way round: the vendored dispatcher holds the
+// server lock while it calls into `GfxHandler`, which locks `ctx`. Every ctx
+// lock goes through `lock_ctx` and every server lock through `lock_server`; in
+// debug builds the ctx locks held by the current thread are counted and
+// `lock_server` panics if any is alive, so a reversed order fails in tests
+// instead of deadlocking a session in the field.
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static CTX_LOCKS_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A held `ctx` lock. Derefs to the context slot.
+struct CtxGuard<'a>(std::sync::MutexGuard<'a, Option<ConnectionContext>>);
+
+impl std::ops::Deref for CtxGuard<'_> {
+    type Target = Option<ConnectionContext>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for CtxGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for CtxGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        CTX_LOCKS_HELD.with(|n| n.set(n.get() - 1));
+    }
+}
+
+fn lock_ctx(ctx: &Mutex<Option<ConnectionContext>>) -> CtxGuard<'_> {
+    let guard = ctx.lock_or_recover();
+    #[cfg(debug_assertions)]
+    CTX_LOCKS_HELD.with(|n| n.set(n.get() + 1));
+    CtxGuard(guard)
+}
+
+fn lock_server(server: &GfxServerHandle) -> std::sync::MutexGuard<'_, GraphicsPipelineServer> {
+    #[cfg(debug_assertions)]
+    CTX_LOCKS_HELD.with(|n| {
+        assert_eq!(
+            n.get(),
+            0,
+            "lock order: the EGFX server lock must not be taken while holding ctx"
+        )
+    });
+    server.lock_or_recover()
+}
+
+/// Per-connection state, shared between the `Gfx` factory/handle (capture
+/// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
 struct ConnectionContext {
     /// Client negotiated AVC444 (spec §8.2 codec ladder): frames are encoded as
     /// a main + auxiliary H.264 pair and shipped with `send_avc444_frame`.
@@ -337,7 +263,7 @@ struct ConnectionContext {
     submitted: Arc<AtomicU64>,
     shipped: Arc<AtomicU64>,
     /// Dimensions the surface + encoder were created with (in
-    /// `setup_locked`, from the live `SharedDesktopSize`). `ship_frames`
+    /// `ensure_surface`, from the live `SharedDesktopSize`). `ship_frames`
     /// builds its AVC420 regions from these — not from a fresh
     /// `SharedDesktopSize` read — so a size adoption between setup and ship
     /// can't tear the region away from the surface.
@@ -477,804 +403,6 @@ struct ConnectionContext {
     min_render_reports: u64,
 }
 
-/// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
-/// [`should_force_recovery_idr`] and `docs/rdp-udp-multitransport-feasibility.md`
-/// ("Ack-driven IDR recovery").
-#[derive(Clone, Copy, Debug)]
-struct RecoveryParams {
-    /// We only treat silent acks as loss while we're *actively* shipping — if the
-    /// last ship is older than this, the screen is static and the periodic IDR
-    /// backstops. Sized to cover the flush-burst window so a loss just before the
-    /// screen goes static still heals.
-    active_window: Duration,
-    /// How long acks must stay silent (while shipping) before we infer a lost
-    /// frame. Above normal ack jitter + RTT, below the periodic keyframe interval.
-    ack_stall: Duration,
-    /// Minimum spacing between forced recovery IDRs — the IDR is large and itself
-    /// loss-vulnerable, so don't storm them if it keeps getting lost.
-    min_recovery_interval: Duration,
-}
-
-/// Decide whether to force a recovery IDR from ack-staleness. Pure (takes
-/// `Duration`s, not a clock) so it's unit-testable without timing. See the spec
-/// in `docs/rdp-udp-multitransport-feasibility.md` — each clause guards a distinct
-/// failure mode:
-/// - `egfx_on_lossy`: only on the lossy tunnel; on TCP/reliable a missing ack is
-///   congestion and an IDR would *worsen* it.
-/// - `!acks_suspended`: with acks off (`queueDepth==0xFFFFFFFF`) loss is uninferable.
-/// - `since_ship <= active_window`: only while actively shipping (else: static screen).
-/// - `since_ack >= ack_stall`: the loss signal — acks went silent.
-/// - `since_recovery >= min_recovery_interval`: rate-limit IDR storms.
-fn should_force_recovery_idr(
-    since_ship: Duration,
-    since_ack: Duration,
-    since_recovery: Duration,
-    acks_suspended: bool,
-    egfx_on_lossy: bool,
-    p: &RecoveryParams,
-) -> bool {
-    egfx_on_lossy
-        && !acks_suspended
-        && since_ship <= p.active_window
-        && since_ack >= p.ack_stall
-        && since_recovery >= p.min_recovery_interval
-}
-
-/// Decide whether to de-migrate EGFX from the RELIABLE UDP tunnel back onto TCP.
-/// Pure (Durations, not a clock) so it's unit-testable without timing.
-///
-/// The reliable (UdpFecR) tunnel is ordered, so it head-of-line-blocks under loss
-/// exactly like TCP (feasibility finding #4): once the client stops acking while
-/// we're *actively* shipping (the #89 trickle floor guarantees we keep shipping
-/// even when the ack-lag is high), the tunnel is wedged and queued frames will
-/// never arrive — the video freezes with no recovery until reconnect. The fix is
-/// to route EGFX back over TCP, which mstsc accepts post-Soft-Sync (Spike A,
-/// verified live 2026-06-29) — the caller pairs this with a forced IDR, since the
-/// last UDP frames never arrived so the client's decode reference is stale.
-///
-/// Each clause guards a distinct failure mode:
-/// - `egfx_on_udp && !egfx_on_lossy`: only on the RELIABLE UDP tunnel. The lossy
-///   tunnel uses ack-driven IDR recovery instead ([`should_force_recovery_idr`]);
-///   TCP needs nothing (socket backpressure paces it).
-/// - `!already_demigrated`: fire once per connection (one-way latch, no flapping).
-/// - `!acks_suspended`: with acks off (`queueDepth==0xFFFFFFFF`) a wedge can't be
-///   inferred from ack-staleness.
-/// - `since_ship <= active_window`: only while actively shipping (else: static
-///   screen, where silent acks are normal and the periodic IDR backstops).
-/// - `since_ack >= wedge_timeout`: the wedge signal — acks have gone fully silent
-///   long enough to rule out a transient congestion blip.
-#[allow(clippy::too_many_arguments)]
-fn should_demigrate_to_tcp(
-    since_ship: Duration,
-    since_ack: Duration,
-    acks_suspended: bool,
-    egfx_on_udp: bool,
-    egfx_on_lossy: bool,
-    already_demigrated: bool,
-    active_window: Duration,
-    wedge_timeout: Duration,
-) -> bool {
-    egfx_on_udp
-        && !egfx_on_lossy
-        && !already_demigrated
-        && !acks_suspended
-        && since_ship <= active_window
-        && since_ack >= wedge_timeout
-}
-
-/// Tunables for the blank-presentation detector + recovery (the mstsc
-/// reconnect-blank). See [`should_blank_recover`] and the H.264 reconnect
-/// quirk note in `docs/known-quirks.md`.
-#[derive(Clone, Copy, Debug)]
-struct BlankRecoveryParams {
-    /// QoE reports that must accumulate (all with `time_diff_dr == 0`) before
-    /// the session is declared blank. Upstream delivers ~8 `on_qoe_metrics`
-    /// callbacks/s during active decoding (~1 per DVC batch, NOT per wire PDU —
-    /// measured live 2026-07-02: ~850 wire QoE PDUs produced exactly 120
-    /// callbacks), so the default 24 ≈ 3 s of active decoding. Also a floor on
-    /// real decode activity — a static screen accrues slowly and simply defers
-    /// detection. A *rendering* session is disarmed by its very first
-    /// callbacks: the initial full-screen IDR present always costs >1 ms
-    /// (observed 7–14 ms within ~230 ms of connect on every healthy session),
-    /// so a whole all-zero window is unambiguous well before 24. (The original
-    /// default was 40 ≈ 5 s; tightened once the drop became self-healing via
-    /// the auto-reconnect cookie — a hypothetical false positive now costs one
-    /// client-driven reconnect, not a dead session.)
-    min_qoe_reports: u64,
-    /// Consecutive nonzero-EDR reports that count as "the client is presenting"
-    /// and disarm the detector. **Sustained, not a single report** — see
-    /// [`QoeEvidence`] for the live case that forced this: a client can resume
-    /// reporting nonzero decode+render times after a recovery reactivation
-    /// while its picture stays black, and a one-report disarm then suppressed
-    /// the fallback drop forever. `MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS`,
-    /// default 3 — at the ~8 callbacks/s upstream delivers during active
-    /// decoding that is ~0.4 s, so a genuinely healthy session still disarms
-    /// long before the 3 s `arm_delay` lets the detector evaluate anything.
-    /// Deliberately NOT scaled by the RTT gate ([`blank_params_scaled`]):
-    /// raising it on a slow link would make the disarm *harder*, and slow links
-    /// are exactly where a false positive is most costly.
-    min_render_reports: u64,
-    /// Consecutive nonzero-EDR reports that mark a session as ESTABLISHED
-    /// (presented for a meaningful stretch, presumed healthy). At the ~8
-    /// callbacks/s active cadence the default 40 is ~5 s of continuous
-    /// presentation. Above this bar a relapse to zero EDR is treated as
-    /// probably-transient and held to `established_min_qoe` instead of the
-    /// aggressive `min_qoe_reports`; below it (a never/barely-presented
-    /// connection, incl. a post-reactivation few-frame flicker) the aggressive
-    /// connect-blank path applies. Deliberately HIGHER than `min_render_reports`
-    /// (the few-frame disarm) — the two gate opposite things. NOT RTT-scaled.
-    /// `MACRDP_BLANK_RECOVERY_ESTABLISHED_REPORTS`.
-    established_render_reports: u64,
-    /// All-zero QoE window required to recover an ESTABLISHED session (see
-    /// `established_render_reports`). Much larger than `min_qoe_reports`: this
-    /// client has ~3 s windows where it stops reporting nonzero EDR while
-    /// displaying fine, and the aggressive count dropped a healthy 12-minute
-    /// session live (2026-07-22). At ~8/s the default 160 is ~20 s of sustained
-    /// zeros — long enough that a transient clears first, while a genuine (rare)
-    /// mid-session blackout still eventually recovers. RTT-scaled like
-    /// `min_qoe_reports`. `MACRDP_BLANK_RECOVERY_ESTABLISHED_MIN_QOE`.
-    established_min_qoe: u64,
-    /// Wall-clock companion to `established_min_qoe`: an established session is
-    /// also declared blank once no nonzero-EDR report has arrived for this long
-    /// AND `established_wall_reports` consecutive zeros are in evidence. Exists
-    /// because the count path assumes the active ~8/s QoE cadence — on a STATIC
-    /// blank the cadence collapses to ~0.3/s and 160 reports is ~9 minutes, so
-    /// without this bound a genuine mid-session blackout on an idle screen
-    /// would practically never recover. Default 30 s; RTT-scaled like
-    /// `blank_max_wait`. `MACRDP_BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS`.
-    established_max_wait: Duration,
-    /// Consecutive-zero floor for the established wall-clock branch (above).
-    /// Proves the client is still decoding/acking while nothing presents;
-    /// without it an IDLE healthy session (frames stop ⇒ QoE stops ⇒ the
-    /// since-nonzero clock grows unboundedly) would trip the branch after any
-    /// quiet half-minute. Default 16 (~2 s of active decode). Not RTT-scaled —
-    /// it is paired with the wall clock, which is.
-    /// `MACRDP_BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS`.
-    established_wall_reports: u64,
-    /// Don't evaluate before this much of the connection has elapsed — the
-    /// connect-time surface/caps churn shouldn't race the detector.
-    arm_delay: Duration,
-    /// Minimum spacing between recovery attempts (the QoE-report counter also
-    /// resets per attempt, so a re-fire needs a full fresh all-zero window).
-    retry_interval: Duration,
-    /// Post-attempt heal-confirmation deadline (2026-07-23, Windows App for
-    /// macOS build 68576): once a recovery attempt has run, the session must
-    /// PROVE it healed — a sustained nonzero-EDR run (`min_render_reports`) at
-    /// some point since the attempt — within this much wall-clock, or the next
-    /// attempt (normally the fallback drop) fires. Exists because this client
-    /// starved the consecutive-zero escalation paths after a reactivation two
-    /// distinct ways — interleaved phantom nonzero reports (runs of 2–18 while
-    /// visibly black) that kept resetting `zero_streak`, or total QoE silence —
-    /// and the user stared at black for 12 s then reconnected by hand while
-    /// the drop that recovers this client sat unreachable. Guarded so an
-    /// idle-but-healed session can't trip it: it requires the client to have
-    /// ACKED frames since the attempt (the post-attempt IDR + flush frames
-    /// give a live client something to ack; no acks ⇒ nothing shipped ⇒
-    /// nothing to conclude) and either total QoE silence while acking (the
-    /// blank tell — this client emitted QoE fine before the attempt) or
-    /// `blank_min_reports` CUMULATIVE zeros since the attempt (immune to the
-    /// interleaved blips, which reset the streak but not the tally). A healed
-    /// static-desktop mstsc emits a few honest nonzero reports and no zeros
-    /// post-heal, so it matches neither arm. RTT-scaled like `blank_max_wait`.
-    /// `MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS`, default 8000; 0 disables.
-    heal_confirm_deadline: Duration,
-    /// Total attempts per connection. All attempts but the last REMAP the
-    /// output to a fresh surface (non-destructive); the LAST attempt drops the
-    /// connection so the client auto-reconnects (a fresh attempt renders with
-    /// high probability, and the detector re-checks the new session). The
-    /// default is 1 — i.e. go STRAIGHT to the drop: the remap was live-verified
-    /// (2026-07-02) to never heal mstsc (its layer-2 re-composite bug is
-    /// client-fatal for in-session surface swaps), so remap-first only added
-    /// ~10 s of black (a wasted attempt + a second full detection window)
-    /// before the drop that actually heals. Set ≥2 via
-    /// `MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS` to re-enable remap-first
-    /// experimentation (e.g. against a non-mstsc QoE-reporting client).
-    max_attempts: u32,
-    /// ON by default (`MACRDP_BLANK_RECOVERY_REACTIVATE=0` reverts to the
-    /// remap/drop path): make the FIRST recovery attempt a bare core
-    /// Deactivation–Reactivation ([`BlankAction::Reactivate`]); if it doesn't
-    /// heal, the second attempt drops. Forces `max_attempts` to ≥2 so the
-    /// fallback drop can fire.
-    reactivate: bool,
-    /// Wall-clock fast-path for detection on a STATIC blank. A blank desktop
-    /// changes little, so QoE reports trickle in slowly (~0.3/s vs ~8/s on an
-    /// active screen) and the `min_qoe_reports` count alone can take ~70 s to
-    /// accumulate. Once this much wall-clock has elapsed with acks flowing and a
-    /// small handful of all-zero reports (enough to rule out a client that sends
-    /// no QoE at all), the session is conclusively blank — fire without waiting
-    /// for the full count. Safe to be prompt because the reactivation heal is
-    /// non-destructive: an occasional early fire costs a brief re-handshake, not
-    /// a dropped session. `MACRDP_BLANK_RECOVERY_MAX_WAIT_MS`, default 4000.
-    blank_max_wait: Duration,
-    /// Minimum all-zero QoE reports for the wall-clock fast-path (above). Its
-    /// only job is to rule out a client that sends NO QoE (e.g. FreeRDP, which
-    /// would otherwise satisfy `!qoe_render_seen` forever) — so the default is a
-    /// low **1**: a single all-zero report after `arm_delay` (by which a
-    /// rendering session has already presented and disarmed via
-    /// `qoe_render_seen`, ~1-2 s on LAN) is conclusive on a trustworthy-RTT
-    /// link. Raise it (`MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS`) if a
-    /// slow-to-first-present client trips a spurious (cheap) reactivation.
-    blank_min_reports: u64,
-    /// Reconnect-storm guard: if this many CONSECUTIVE connections all ended in
-    /// a blank-recovery drop (no connection in between ever presented a frame),
-    /// stop dropping — the client is truly stuck (mstsc retains surfaces for
-    /// its whole process lifetime, and on rare clients every in-process
-    /// reconnect lands blank), and an endless drop → auto-reconnect → blank →
-    /// drop loop flashing "reconnecting…" every few seconds is worse than a
-    /// stable session plus clear log guidance (close + reopen the client — the
-    /// known-reliable recovery). The counter resets the moment any connection
-    /// reports a nonzero decode+render time (i.e. actually presents). 0 = no
-    /// cap.
-    max_consecutive_drops: u32,
-    /// RTT gate (link-aware detection, 2026-07-05): the kernel-measured TCP RTT
-    /// (ms) at or above which the DROP lever is withheld entirely for the
-    /// connection. The blank signature (`timeDiffEDR == 0` while acks flow) is
-    /// only trustworthy on fast links — live-verified over ZeroTier (~200 ms):
-    /// a session that IS visibly rendering reports zero EDR on every frame, so
-    /// the detector force-dropped a working session every ~5 s and the repeated
-    /// drops poisoned mstsc's surface into a REAL permanent black (the recovery
-    /// *caused* the blank). Below the gate the evidence window scales with RTT
-    /// (see [`blank_rtt_gate`]); at/above it the detector is disarmed for the
-    /// connection (log-only). 0 = no RTT gating (pre-2026-07-05 behavior).
-    max_rtt_ms: u32,
-}
-
-/// Which recovery lever to pull for a given (1-based) attempt number: every
-/// attempt before the last remaps to a fresh surface; the last one drops the
-/// connection. Pure, unit-tested.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum BlankAction {
-    /// Create a fresh surface, map it over the output, force an IDR — the
-    /// non-destructive in-session heal. Deliberately sends NO DeleteSurface and
-    /// NO RESET_GRAPHICS: the resize-dance variant (upstream `resize_with_
-    /// monitors`, whose first PDU deletes the mapped surface) was tried live
-    /// 2026-07-02 and KILLED mstsc's GFX channel outright (zero acks/QoE for
-    /// the rest of the session) — the third independent confirmation that any
-    /// DeleteSurface aimed at a blank mstsc is fatal. The old surface is left
-    /// alive; the client leaks at most (max_attempts − 1) surfaces.
-    Remap,
-    /// Drop the connection (`ServerEvent::Quit` → per-connection
-    /// `RunState::Disconnect`). mstsc treats the unexpected loss as an outage
-    /// and auto-reconnects with its reconnect cookie; a fresh connection
-    /// renders with high probability and the detector re-checks it.
-    Drop,
-    /// Gated by `MACRDP_BLANK_RECOVERY_REACTIVATE` (default on): trigger a bare
-    /// core RDP **Deactivation–Reactivation** (Server Deactivate All → new
-    /// Demand Active) WITHOUT touching the EGFX pipeline. Injected as a no-op
-    /// `DisplayUpdate::Resize(current_size)` (see `capture.rs`), which the
-    /// vendored server turns into `deactivate_all` +
-    /// `Acceptor::new_deactivation_reactivation` — and that call PRESERVES the
-    /// static channels, so the EGFX DVC (and our `ConnectionContext`/surface)
-    /// survive: `build_server_with_handle` is not re-run, `setup_locked` skips
-    /// (`surface_id` already `Some`), so NO `resize_with_monitors` / NO
-    /// DeleteSurface fires. A forced IDR follows. **LIVE-VERIFIED 2026-07-07 to
-    /// HEAL the mstsc reconnect-blank** — 5/5 blanks on real mstsc/WiFi went
-    /// EDR=0 → presenting in ~1-2 s with zero drops (frame ids mid-stream, so
-    /// the same connection healed in place, no reconnect). This is the DEFAULT
-    /// first recovery action and overturns the long-held "layer-2 is
-    /// client-fatal / not server-fixable" conclusion: prior attempts all
-    /// bundled a surface delete or DVC close (which ARE client-fatal); a bare
-    /// core reactivation, uniquely, is not. If it ever fails to heal, the
-    /// detector re-fires and attempt 2 falls through to [`BlankAction::Drop`].
-    Reactivate,
-}
-
-fn blank_action(attempt: u32, max_attempts: u32) -> BlankAction {
-    if attempt < max_attempts {
-        BlankAction::Remap
-    } else {
-        BlankAction::Drop
-    }
-}
-
-/// Reconnect-storm guard (see [`BlankRecoveryParams::max_consecutive_drops`]):
-/// true when the blank-recovery DROP lever must be withheld because the last
-/// `cap` consecutive connections all ended in a blank drop without any
-/// connection presenting in between. Pure, unit-tested.
-fn blank_drop_capped(consecutive_drops: u32, cap: u32) -> bool {
-    cap > 0 && consecutive_drops >= cap
-}
-
-/// Whether an in-flight connection should clear the reconnect-storm drop counter
-/// (see the call site + [`blank_drop_capped`]). Only a genuinely-ESTABLISHED
-/// connection resets it — a brief blip (a few post-reactivation frames that then
-/// relapse to black) does NOT, so a brief-present-then-drop still counts toward
-/// the cap. Reset only matters when the counter is non-zero. Pure, unit-tested.
-fn storm_guard_should_reset(
-    qoe: QoeEvidence,
-    established_render_reports: u64,
-    current_drops: u32,
-) -> bool {
-    current_drops != 0 && qoe.established(established_render_reports)
-}
-
-/// Raw QoE decode+render-time counters for the blank detector — pure tallies,
-/// no policy (the thresholds live in [`BlankRecoveryParams`]).
-///
-/// **Why streaks rather than a "has ever rendered" latch.** The original design
-/// latched `qoe_render_seen` on the *first* report with `time_diff_dr > 0` and
-/// never cleared it, on the reasoning that one nonzero EDR proves the client
-/// composited a frame. Live evidence (2026-07-22, Windows App for macOS)
-/// refuted that as a disarm condition: after a recovery *reactivation* the
-/// client resumed reporting nonzero decode+render times while the picture on
-/// screen stayed black. The latch made that permanent — the detector considered
-/// the session healed, so the fallback drop (the lever that actually recovers
-/// this client) could never fire, and the user had to reconnect by hand.
-///
-/// Two independent counters fix both halves of that:
-/// - `nonzero_streak` — consecutive nonzero-EDR reports. Requiring several
-///   ("sustained") means a brief post-reactivation blip no longer disarms.
-/// - `zero_streak` — consecutive all-zero reports, reset by ANY nonzero one.
-///   This is what makes the disarm revocable: a client that lapses back to
-///   zero rebuilds a full fresh evidence window and the detector re-fires.
-///
-/// `max_nonzero_streak` is the high-water mark of `nonzero_streak`, i.e. "did
-/// this connection ever genuinely present" — kept only to gate the wall-clock
-/// fast path (see [`should_blank_recover`]).
-///
-/// The three `*_since_reset` fields are CUMULATIVE tallies over the current
-/// evidence window (since connect, or since the last recovery attempt's
-/// [`reset_streaks`]) — unlike the streaks, a report of the opposite kind does
-/// NOT clear them. They exist for the post-attempt heal-confirmation deadline
-/// (2026-07-23, Windows App for macOS build 68576): after a reactivation this
-/// client can emit interleaved phantom nonzero reports (runs of 2–18 observed
-/// while visibly black) that reset `zero_streak` forever, or go QoE-silent
-/// entirely — either way the consecutive-zero paths starve and the fallback
-/// drop never fires. Cumulative counters are immune to the interleaving, and
-/// `reports_since_reset == 0` is the silence tell.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct QoeEvidence {
-    zero_streak: u64,
-    nonzero_streak: u64,
-    max_nonzero_streak: u64,
-    /// Total QoE reports folded in since the last [`reset_streaks`].
-    reports_since_reset: u64,
-    /// Cumulative ZERO reports since the last [`reset_streaks`] — NOT cleared
-    /// by a nonzero report (that is the whole point; see the type doc).
-    zeros_since_reset: u64,
-    /// High-water `nonzero_streak` since the last [`reset_streaks`] — "did the
-    /// client sustain presentation at any point in THIS window", as opposed to
-    /// `max_nonzero_streak` which spans the whole connection.
-    nonzero_max_since_reset: u64,
-    /// Durable "this connection genuinely presented at connect" latch (v0.9.2).
-    /// Set by the caller (`on_qoe_metrics`) the moment a sustained nonzero-EDR
-    /// run appears **while no recovery attempt has yet fired**, and never
-    /// cleared for the connection. When set, [`should_blank_recover`] returns
-    /// false unconditionally — the v0.9.0 one-shot-disarm behavior, restored.
-    ///
-    /// Why gate on "before any recovery attempt": QoE decode+render-time is
-    /// bidirectionally unreliable — one client class reports nonzero-while-black
-    /// (the #172 reconnect-blank client that flickers nonzero *after* a
-    /// reactivation), another reports zero-while-presenting (the client whose
-    /// working 50 s sessions #172 began false-dropping). The one signal that
-    /// separates them is *when* the nonzero run occurs: a sustained run seen
-    /// **before** any recovery proves the client painted the desktop on its own
-    /// (it is not the connect-time reconnect-blank, which is black from frame
-    /// one); a run seen **after** a reactivation may be the blank client's
-    /// post-reactivation flicker and must not disarm. So the latch requires the
-    /// former and the caller withholds it for the latter (`attempts == 0`).
-    presented_clean: bool,
-}
-
-impl QoeEvidence {
-    /// Fold in one QoE frame-acknowledge.
-    fn record(&mut self, time_diff_dr: u16) {
-        self.reports_since_reset = self.reports_since_reset.saturating_add(1);
-        if time_diff_dr > 0 {
-            self.zero_streak = 0;
-            self.nonzero_streak = self.nonzero_streak.saturating_add(1);
-            self.max_nonzero_streak = self.max_nonzero_streak.max(self.nonzero_streak);
-            self.nonzero_max_since_reset = self.nonzero_max_since_reset.max(self.nonzero_streak);
-        } else {
-            self.nonzero_streak = 0;
-            self.zero_streak = self.zero_streak.saturating_add(1);
-            self.zeros_since_reset = self.zeros_since_reset.saturating_add(1);
-        }
-    }
-
-    /// Clear the live streaks + the cumulative window tallies after a recovery
-    /// attempt so a re-fire needs a full fresh window. `max_nonzero_streak` and
-    /// `presented_clean` survive — they are facts about the connection, not
-    /// evidence for the current window. (`presented_clean` can never be set
-    /// once an attempt has fired, so in practice this only ever runs with it
-    /// already false.)
-    fn reset_streaks(&mut self) {
-        self.zero_streak = 0;
-        self.nonzero_streak = 0;
-        self.reports_since_reset = 0;
-        self.zeros_since_reset = 0;
-        self.nonzero_max_since_reset = 0;
-    }
-
-    /// Has this connection presented for a MEANINGFUL stretch — i.e. it is an
-    /// established, presumed-healthy session rather than one that merely
-    /// flickered a few frames? A few-frame blip must still be treated as a
-    /// suspicious (probably still-blank) connection and recovered aggressively
-    /// (and does NOT clear the reconnect-storm guard — see
-    /// [`storm_guard_should_reset`]), whereas a session that genuinely showed
-    /// the desktop for seconds must tolerate a transient zero-EDR window without
-    /// being dropped. See [`should_blank_recover`].
-    fn established(&self, established_render_reports: u64) -> bool {
-        self.max_nonzero_streak >= established_render_reports
-    }
-}
-
-/// Decide whether to run a blank-recovery attempt. Pure (counters + Durations,
-/// not a clock) so it's unit-testable without timing.
-///
-/// The signal (pcap-proven 2026-07-02, validated live the same day — see
-/// [[h264-reconnect-blank]]): a reconnect that lands on mstsc's stale retained
-/// surface DECODES every frame — FrameAcks and QoE acks flow normally — but
-/// never PRESENTS, and its QoE Frame Acknowledge PDUs report `timeDiffEDR == 0`
-/// on every single frame. A rendering session shows nonzero EDR on its first
-/// callbacks (~100–230 ms after connect). So: QoE flowing + zero render-time
-/// ever = the client is painting into a surface nobody composites (the
-/// reconnect-blank). The caller then pulls the [`blank_action`] lever for the
-/// attempt number: remap to a fresh surface, or drop the connection.
-///
-/// Each clause guards a distinct failure mode:
-/// - `zero_streak >= min_qoe_reports`: enough evidence, and implies the client
-///   actually sends QoE acks at all (FreeRDP-family clients that don't are
-///   simply never evaluated — no false recovery on non-QoE clients).
-/// - `!presenting_now`: a SUSTAINED run of nonzero EDR proves presentation and
-///   disarms the detector — see [`QoeEvidence`] for why a single report is not
-///   enough and why the disarm has to be revocable.
-/// - `egfx_acks_seen && !acks_suspended`: regular FrameAcks flowing too — the
-///   blank signature is "acking normally while EDR stays zero", not a stalled
-///   or suspended client (those are congestion, handled elsewhere).
-/// - `since_connect >= arm_delay`: skip the connect-time churn window.
-/// - `since_last_attempt >= retry_interval` + `attempts < max_attempts`:
-///   rate-limit; the final attempt is the connection drop, after which the
-///   fresh connection starts a fresh detector.
-/// - `acked_since_attempt`: whether the client has acknowledged frames since
-///   the last recovery attempt — only consulted by the post-attempt
-///   heal-confirmation deadline (see [`BlankRecoveryParams::heal_confirm_deadline`]).
-#[allow(clippy::too_many_arguments)]
-fn should_blank_recover(
-    qoe: QoeEvidence,
-    egfx_acks_seen: bool,
-    acks_suspended: bool,
-    since_connect: Duration,
-    since_last_nonzero: Duration,
-    since_last_attempt: Duration,
-    attempts: u32,
-    acked_since_attempt: bool,
-    p: &BlankRecoveryParams,
-) -> bool {
-    // Durable clean-presentation latch (v0.9.2): a connection that produced a
-    // sustained nonzero-EDR run BEFORE any recovery attempt genuinely presented
-    // the desktop at connect, so it is not the reconnect-blank (which is black
-    // from frame one) — never recover it. This is the v0.9.0 one-shot disarm,
-    // restored: it fixes a client that presents fine but reports zero EDR
-    // mid-session (its short nonzero runs never reach the `established` bar, so
-    // the revocable disarm was force-dropping working 50 s sessions), WITHOUT
-    // re-breaking #172's blank client — that one produces its nonzero run only
-    // AFTER a reactivation, and the caller withholds the latch there
-    // (`attempts == 0`). See [`QoeEvidence::presented_clean`].
-    if qoe.presented_clean {
-        return false;
-    }
-    // "Presenting" = the LAST `min_render_reports` reports were all nonzero.
-    // Streak, not a latch: a client that goes back to reporting zero (the
-    // post-reactivation relapse) re-arms the detector automatically, because a
-    // single zero report resets the streak.
-    let presenting_now = qoe.nonzero_streak >= p.min_render_reports;
-    // Established = the session presented for a MEANINGFUL stretch, so it is
-    // presumed healthy. This is the false-positive fix (2026-07-22): this
-    // client (Windows App for macOS) has brief windows — a few seconds — where
-    // it stops reporting nonzero EDR while still displaying fine. On a
-    // never/barely-presented connection those zeros are the reconnect-blank and
-    // we act in ~3 s; on an ESTABLISHED session they are almost always one of
-    // those transients, so requiring only `min_qoe_reports` (~3 s) dropped a
-    // healthy 12-minute session live. An established session therefore needs a
-    // much longer sustained zero window (`established_min_qoe`, ~20 s) — long
-    // enough that a hiccup clears first, while a genuine (rare) mid-session
-    // blackout still eventually recovers. `established_render_reports` (~5 s of
-    // presentation) is deliberately a HIGHER bar than `min_render_reports` (the
-    // few-frame disarm), so a post-reactivation few-frame flicker stays on the
-    // aggressive path and the reconnect-blank escalation is unaffected.
-    let established = qoe.established(p.established_render_reports);
-    let count_threshold = if established {
-        p.established_min_qoe
-    } else {
-        p.min_qoe_reports
-    };
-    // The established tier needs its own WALL-CLOCK branch, because the count
-    // path alone silently assumes the active QoE cadence (~8 reports/s): on a
-    // STATIC blank the cadence collapses to ~0.3/s, at which the 160-report
-    // window is ~9 minutes — the drop escalation would be theoretically
-    // reachable but practically never fire. So: an established session is also
-    // considered blank once NOTHING nonzero has arrived for
-    // `established_max_wait` wall-clock AND at least `established_wall_reports`
-    // consecutive zeros prove the client is still decoding/acking (without that
-    // floor, an IDLE healthy session — frames stop, QoE stops, the since-
-    // nonzero clock grows unboundedly — would trip this after any quiet
-    // half-minute). `since_last_nonzero` is wall time since the last nonzero
-    // EDR report, saturating at `since_connect` for a session that never had
-    // one (irrelevant here — this branch requires `established`).
-    let established_blackout = established
-        && since_last_nonzero >= p.established_max_wait
-        && qoe.zero_streak >= p.established_wall_reports;
-    // Post-attempt heal-confirmation deadline (2026-07-23, Windows App for
-    // macOS build 68576 — see the param doc): the consecutive-zero branches
-    // above all assume the client keeps emitting zeros in an unbroken run, and
-    // after a recovery attempt this client starved them for 12+ s live —
-    // either interleaved phantom nonzero reports (each one resetting
-    // `zero_streak`) or total QoE silence — so the fallback drop, the lever
-    // that actually recovers it, never fired and the user reconnected by hand.
-    // Once an attempt has run, the burden of proof flips: the session must
-    // show a sustained nonzero run within the deadline, or the escalation
-    // fires on cumulative-zero / silence evidence the blips can't reset.
-    // `acked_since_attempt` keeps an idle session out (no frames shipped ⇒
-    // nothing to conclude), and `nonzero_max_since_reset < min_render_reports`
-    // implies `!presenting_now` below, so the arms can't fight.
-    let post_attempt_unconfirmed = attempts >= 1
-        && !p.heal_confirm_deadline.is_zero()
-        && since_last_attempt >= p.heal_confirm_deadline
-        && acked_since_attempt
-        && qoe.nonzero_max_since_reset < p.min_render_reports
-        && (qoe.reports_since_reset == 0 || qoe.zeros_since_reset >= p.blank_min_reports);
-    // Blank evidence: EITHER the full all-zero report count (fast on an active
-    // screen), OR the established wall-clock blackout above, OR the
-    // post-attempt heal-confirmation deadline above, OR — for a STATIC
-    // connect-time blank whose QoE trickles in slowly — enough wall-clock
-    // elapsed with at least `blank_min_reports` all-zero reports (which rules
-    // out a client that sends no QoE, e.g. FreeRDP, from ever firing on the
-    // wall-clock branch). That last fast path is withheld once the session is
-    // established: with `blank_min_reports` as low as 1, a single stray zero
-    // from a healthy long-running session would otherwise satisfy it.
-    let blank_evidence = qoe.zero_streak >= count_threshold
-        || established_blackout
-        || post_attempt_unconfirmed
-        || (since_connect >= p.blank_max_wait
-            && qoe.zero_streak >= p.blank_min_reports
-            && !established);
-    blank_evidence
-        && !presenting_now
-        && egfx_acks_seen
-        && !acks_suspended
-        && since_connect >= p.arm_delay
-        && since_last_attempt >= p.retry_interval
-        && attempts < p.max_attempts
-}
-
-/// RTT gate for the blank detector (see [`BlankRecoveryParams::max_rtt_ms`]).
-/// Returns the evidence-window multiplier for this connection's link RTT, or
-/// `None` when the link is slow enough that the detector must not drop at all
-/// (the EDR==0 signal is unreliable there — ZeroTier live finding 2026-07-05).
-/// `link_rtt_ms == 0` means "unknown" (non-macOS / sample failed) and keeps
-/// today's LAN behavior; `max_rtt_ms == 0` disables gating entirely. The
-/// multiplier grows linearly from 1× at ≤25 ms, capped at 4×, so a moderately
-/// distant client just needs a proportionally longer all-zero window. Pure,
-/// unit-tested.
-fn blank_rtt_gate(link_rtt_ms: u32, max_rtt_ms: u32) -> Option<f64> {
-    if max_rtt_ms == 0 || link_rtt_ms == 0 {
-        return Some(1.0);
-    }
-    if link_rtt_ms >= max_rtt_ms {
-        return None;
-    }
-    Some((f64::from(link_rtt_ms) / 25.0).clamp(1.0, 4.0))
-}
-
-/// Scale a [`BlankRecoveryParams`] evidence window by the RTT multiplier from
-/// [`blank_rtt_gate`]: more all-zero QoE reports required and a longer arm
-/// delay before the first evaluation. Attempt spacing/caps are unchanged.
-fn blank_params_scaled(p: &BlankRecoveryParams, mult: f64) -> BlankRecoveryParams {
-    BlankRecoveryParams {
-        min_qoe_reports: ((p.min_qoe_reports as f64) * mult).ceil() as u64,
-        established_min_qoe: ((p.established_min_qoe as f64) * mult).ceil() as u64,
-        arm_delay: p.arm_delay.mul_f64(mult),
-        blank_max_wait: p.blank_max_wait.mul_f64(mult),
-        established_max_wait: p.established_max_wait.mul_f64(mult),
-        // mul_f64 of zero stays zero, so "0 = disabled" survives scaling.
-        heal_confirm_deadline: p.heal_confirm_deadline.mul_f64(mult),
-        ..*p
-    }
-}
-
-/// RTT-seeded initial bitrate (2026-07-05): the encoder's starting target for a
-/// new connection. On a slow link (`link_rtt_ms >= seed_rtt_ms`), start at
-/// **ceiling / 3** (clamped to `[floor, ceiling]`) instead of slamming the full
-/// ceiling into a pipe we already know is distant — the adaptive controller
-/// then climbs toward the ceiling if the link has headroom (long-but-fat links
-/// recover full quality within seconds) or backs off if it strains. Fast /
-/// unknown links start at the ceiling exactly as before. `seed_rtt_ms == 0`
-/// disables seeding. Pure, unit-tested.
-fn seeded_initial_bitrate(ceiling: u32, floor: u32, link_rtt_ms: u32, seed_rtt_ms: u32) -> u32 {
-    if seed_rtt_ms == 0 || link_rtt_ms == 0 || link_rtt_ms < seed_rtt_ms {
-        return ceiling;
-    }
-    (ceiling / 3).clamp(floor.min(ceiling), ceiling.max(1))
-}
-
-/// Pure AIMD step for congestion-responsive bitrate (P1). Given the current target,
-/// the reliable-tunnel loss delta observed this control interval, and the bounds/
-/// params, return the new target bitrate. **Multiplicative-decrease** on any loss
-/// (back off fast, clamp to `floor_bps`); **additive-increase** when clean (climb
-/// slowly, clamp to `ceiling_bps`). Pure (no clock/state) so it's unit-testable.
-/// See [`Gfx::adaptive_bitrate_step`].
-fn aimd_bitrate(
-    current: u32,
-    loss_delta: u64,
-    floor_bps: u32,
-    ceiling_bps: u32,
-    increase_bps: u32,
-    decrease: f32,
-) -> u32 {
-    if loss_delta > 0 {
-        (((current as f32) * decrease) as u32).max(floor_bps)
-    } else {
-        current.saturating_add(increase_bps).min(ceiling_bps)
-    }
-}
-
-/// What the IDR-backoff sub-controller (P2a) should do this interval. A periodic
-/// keyframe is a big intra frame — the worst thing to inject into a congested,
-/// backed-up tunnel — so under congestion we **stretch** the keyframe interval
-/// (effectively suppressing the periodic IDR) and **restore** it (plus force one
-/// clean recovery IDR) once the link has fully recovered. Safe on the RELIABLE
-/// tunnel: reliable delivery means there's no loss-corruption to heal, so the
-/// periodic IDR is only a decode-glitch safety net we can defer until clear.
-#[derive(Debug, PartialEq, Eq)]
-enum IdrBackoff {
-    /// Loss started and we're not yet backed off → suppress the periodic IDR.
-    Stretch,
-    /// Fully recovered (clean + back at the bitrate ceiling) while backed off →
-    /// restore the normal interval and force one recovery IDR.
-    Restore,
-    /// No change this interval.
-    Hold,
-}
-
-/// Pure IDR-backoff decision (P2a). `loss` = any reliable retransmit this interval;
-/// `new_target`/`ceiling` are the post-AIMD bitrate and its ceiling; `backed_off`
-/// is the current state. Unit-tested. See [`Gfx::adaptive_bitrate_step`].
-fn idr_backoff_decision(loss: bool, new_target: u32, ceiling: u32, backed_off: bool) -> IdrBackoff {
-    if loss && !backed_off {
-        IdrBackoff::Stretch
-    } else if !loss && new_target >= ceiling && backed_off {
-        IdrBackoff::Restore
-    } else {
-        IdrBackoff::Hold
-    }
-}
-
-/// Whether the reliable-tunnel retransmits observed this control interval count as
-/// loss, given the per-interval `tolerance`. The tunnel retransmits on *any* packet
-/// loss and a wireless link (WiFi) has near-continuous low-level loss, so a single
-/// retransmit must NOT read as congestion — only `retransmit_delta > tolerance` does.
-/// `tolerance == 0` restores the old "any retransmit = loss" behaviour. Pure +
-/// unit-tested. See [`Gfx::adaptive_bitrate_step`] and the `adaptive_retx_tolerance` field.
-fn retransmit_is_lossy(retransmit_delta: u64, tolerance: u64) -> bool {
-    retransmit_delta > tolerance
-}
-
-/// Pure congestion decision with EWMA smoothing + hysteresis. `ewma_lag` is the
-/// exponentially-smoothed frame-ack lag (shipped − acked); the caller smooths the raw
-/// per-interval lag so a single spike doesn't trip a back-off (raw TCP ack-lag bursts
-/// 0↔40 even at moderate loss, which a naive threshold turns into visible bitrate
-/// pumping). **Hysteresis:** enter congestion when `ewma_lag` crosses `high`, then stay
-/// congested until it falls below `low` (`low < high`) — so the bitrate doesn't
-/// flip-flop while the signal straddles one threshold. `retransmit_lossy` (UDP — the
-/// caller has already applied the per-interval retransmit *tolerance*, so this is
-/// "loss above the wireless background", not "any retransmit") forces congested
-/// immediately (a definite loss, no smoothing). With acks unusable (suspended / not yet
-/// seen / cold-start warmup), the lag is uninferable so only the retransmit signal
-/// counts. Unit-tested. See [`Gfx::adaptive_bitrate_step`].
-fn congested_hysteresis(
-    ewma_lag: f64,
-    high: f64,
-    low: f64,
-    retransmit_lossy: bool,
-    acks_usable: bool,
-    currently_congested: bool,
-) -> bool {
-    if retransmit_lossy {
-        return true;
-    }
-    if !acks_usable {
-        return false;
-    }
-    if currently_congested {
-        ewma_lag > low // stay congested until the smoothed lag drops below the low mark
-    } else {
-        ewma_lag > high // only enter once the smoothed lag clears the high mark
-    }
-}
-
-/// What the controller does to the bitrate this interval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RateAction {
-    /// Smoothed lag is above the high mark (or a retransmit) — multiplicative-decrease.
-    Decrease,
-    /// In the hysteresis band (congested, lag decaying between low and high) — hold the
-    /// current bitrate. Stops a single spike from cratering the bitrate as the EWMA
-    /// decays back through the band (it would otherwise decrease every interval → the
-    /// "video sometimes stops" deep dips).
-    Hold,
-    /// Cleared (below the low mark / not in an episode) — additive-increase toward ceiling.
-    Increase,
-}
-
-/// Pure 3-zone bitrate action on the smoothed signal (AIMD with a hold band).
-/// `congested` is the hysteresis state from [`congested_hysteresis`] this interval.
-/// Decrease while genuinely congested (lag above `high`, or retransmits above the
-/// tolerance); hold while
-/// the episode is still latched but the smoothed lag is decaying back through the band;
-/// increase once cleared. So a single spike = one step down then a plateau, while
-/// *sustained* congestion (lag stays above `high`) keeps decreasing toward the floor.
-/// Unit-tested. See [`Gfx::adaptive_bitrate_step`].
-fn rate_action(
-    ewma_lag: f64,
-    high: f64,
-    retransmit_lossy: bool,
-    acks_usable: bool,
-    congested: bool,
-) -> RateAction {
-    if retransmit_lossy || (acks_usable && ewma_lag > high) {
-        RateAction::Decrease
-    } else if !congested {
-        RateAction::Increase
-    } else {
-        RateAction::Hold
-    }
-}
-
-/// P2b — pure decision: should this capture be DROPPED to enforce a frame-rate floor?
-///
-/// Engages only once the bitrate controller has already cut the encoder to its floor
-/// (`at_floor`) AND the link is still `congested` — i.e. lowering quality can no longer
-/// help, so the next lever is shedding *frames* (fewer frames → fewer packets → less
-/// load). It caps the effective frame rate to a floor by dropping any capture that
-/// arrives within `min_interval` of the last one we let through (`since_last_pass`).
-///
-/// It never drops to zero: a capture is let through once `min_interval` has elapsed, so
-/// the client always keeps receiving trailing frames to present/ack (the same reason the
-/// EGFX-on-UDP trickle floor never zeroes — dropping to zero pins the lag and freezes the
-/// picture). Works on BOTH transports; on TCP it's the only fps lever (there's no UDP
-/// frame-ack backpressure gate). When the link recovers (`congested` clears or the
-/// controller climbs off the floor) it stops dropping and the full capture rate resumes.
-/// Unit-tested. See [`Gfx::submit_bgra`].
-fn frame_drop_at_floor(
-    at_floor: bool,
-    congested: bool,
-    since_last_pass: Duration,
-    min_interval: Duration,
-) -> bool {
-    at_floor && congested && since_last_pass < min_interval
-}
-
-/// Encoder adjustments the adaptive controller wants applied this frame: the P1
-/// bitrate and the P2a keyframe interval. `None` fields = no change. The controller
-/// also sets `ctx.need_keyframe` directly when forcing a recovery IDR.
-#[derive(Default)]
-struct AdaptiveActions {
-    bitrate_bps: Option<u32>,
-    keyframe_frames: Option<u32>,
-}
-
-/// Read the ack-recovery config from the environment once. Returns
-/// `(enabled, params)`; disabled (default) keeps the feature off and the path
-/// byte-identical. Tunables: `MACRDP_UDP_EGFX_ACK_STALL_MS` (200),
-/// `MACRDP_UDP_EGFX_ACK_ACTIVE_MS` (500), `MACRDP_UDP_EGFX_ACK_RECOVERY_MS` (1000).
-fn recovery_config_from_env() -> (bool, RecoveryParams) {
-    let ms = |name: &str, default: u64| -> Duration {
-        let v = std::env::var(name)
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(default);
-        Duration::from_millis(v)
-    };
-    let enabled = crate::multitransport::env_truthy("MACRDP_UDP_EGFX_ACK_RECOVERY");
-    let params = RecoveryParams {
-        active_window: ms("MACRDP_UDP_EGFX_ACK_ACTIVE_MS", 500),
-        ack_stall: ms("MACRDP_UDP_EGFX_ACK_STALL_MS", 200),
-        min_recovery_interval: ms("MACRDP_UDP_EGFX_ACK_RECOVERY_MS", 1000),
-    };
-    (enabled, params)
-}
-
 /// Cloneable factory + frame-submit handle. One clone is boxed into
 /// `RdpServer::builder().with_gfx_factory(...)`; another lives on the capture
 /// side as the `submit_bgra` entry point.
@@ -1283,7 +411,7 @@ pub struct Gfx {
     sender: Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>,
     ctx: Arc<Mutex<Option<ConnectionContext>>>,
     /// Live session desktop size, shared with `CaptureDisplay` /
-    /// `MacInputHandler`. Read in `setup_locked` when the per-connection
+    /// `MacInputHandler`. Read in `ensure_surface` when the per-connection
     /// surface + encoder are created, so the H.264 pipeline tracks the
     /// client-resolution auto-adopt without rebuilding the factory.
     desktop_size: crate::capture::SharedDesktopSize,
@@ -1453,18 +581,18 @@ impl Gfx {
     ) -> Self {
         let wire_format = WireFormat::from_env();
         let (recovery_enabled, recovery_params) = recovery_config_from_env();
-        let max_frame_lag = std::env::var("MACRDP_UDP_EGFX_MAX_FRAME_LAG")
+        let max_frame_lag = crate::tunables::var("MACRDP_UDP_EGFX_MAX_FRAME_LAG")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(16);
-        let watchdog_enabled = match std::env::var("MACRDP_UDP_EGFX_WATCHDOG") {
+        let watchdog_enabled = match crate::tunables::var("MACRDP_UDP_EGFX_WATCHDOG") {
             Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
             Err(_) => true, // default on (no-op unless EGFX is on the reliable UDP tunnel)
         };
         let watchdog_ms = |name: &str, default: u64| -> Duration {
             Duration::from_millis(
-                std::env::var(name)
+                crate::tunables::var(name)
                     .ok()
                     .and_then(|s| s.trim().parse::<u64>().ok())
                     .filter(|&n| n > 0)
@@ -1476,9 +604,9 @@ impl Gfx {
         // Adaptive bitrate (P1). Enabled by the --adaptive-bitrate flag OR the env
         // fallback; the controller still only acts while EGFX is on a UDP tunnel.
         let adaptive_enabled =
-            adaptive_bitrate || crate::multitransport::env_truthy("MACRDP_UDP_ADAPTIVE_BITRATE");
+            adaptive_bitrate || crate::tunables::truthy("MACRDP_UDP_ADAPTIVE_BITRATE");
         let env_u32 = |name: &str, default: u32| -> u32 {
-            std::env::var(name)
+            crate::tunables::var(name)
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .filter(|&n| n > 0)
@@ -1497,7 +625,7 @@ impl Gfx {
             "MACRDP_UDP_ADAPTIVE_INCREASE_BPS",
             (bitrate_bps / 16).max(250_000),
         );
-        let adaptive_decrease = std::env::var("MACRDP_UDP_ADAPTIVE_DECREASE")
+        let adaptive_decrease = crate::tunables::var("MACRDP_UDP_ADAPTIVE_DECREASE")
             .ok()
             .and_then(|s| s.trim().parse::<f32>().ok())
             .filter(|&f| f > 0.0 && f < 1.0)
@@ -1508,13 +636,13 @@ impl Gfx {
         // per-transport frame-count lag thresholds, which read a long-but-clean
         // pipe (high-RTT VPN/ZeroTier) as permanent congestion. 100 ms of queue
         // is unambiguous at any RTT; exit hysteresis at half.
-        let adaptive_queue_high_ms = std::env::var("MACRDP_ADAPTIVE_QUEUE_HIGH_MS")
+        let adaptive_queue_high_ms = crate::tunables::var("MACRDP_ADAPTIVE_QUEUE_HIGH_MS")
             .ok()
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|&n| n > 0.0)
             .unwrap_or(100.0);
         // EWMA smoothing weight for the queue-delay signal (clamped to (0,1]); default 0.3.
-        let adaptive_ewma_alpha = std::env::var("MACRDP_ADAPTIVE_EWMA_ALPHA")
+        let adaptive_ewma_alpha = crate::tunables::var("MACRDP_ADAPTIVE_EWMA_ALPHA")
             .ok()
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|&a| a > 0.0 && a <= 1.0)
@@ -1522,7 +650,7 @@ impl Gfx {
         // Retransmit tolerance per control interval for the UDP loss signal (0 = the
         // old "any retransmit = loss" behaviour). Default 2 so sporadic single
         // wireless retransmits don't ratchet the bitrate down on WiFi. See the field.
-        let adaptive_retx_tolerance = std::env::var("MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE")
+        let adaptive_retx_tolerance = crate::tunables::var("MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(2);
@@ -1549,14 +677,14 @@ impl Gfx {
         // remap was live-verified never to heal mstsc; ≥2 re-enables
         // remap-first). max_consecutive_drops caps the cross-connection
         // drop → reconnect → blank → drop loop on a truly-stuck client.
-        let blank_recovery_enabled = match std::env::var("MACRDP_BLANK_RECOVERY") {
+        let blank_recovery_enabled = match crate::tunables::var("MACRDP_BLANK_RECOVERY") {
             Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
             Err(_) => true,
         };
         // These two RTT knobs allow an explicit 0 (= "disable"), unlike env_u32
         // whose zero-filter falls back to the default.
         let env_u32_zero_ok = |name: &str, default: u32| -> u32 {
-            std::env::var(name)
+            crate::tunables::var(name)
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(default)
@@ -1569,7 +697,7 @@ impl Gfx {
         // remap-first (never healed) and the drop (kills the session): it
         // re-maps the client's retained surface with no disconnect. Set
         // `MACRDP_BLANK_RECOVERY_REACTIVATE=0` to fall back to the drop path.
-        let blank_reactivate = std::env::var("MACRDP_BLANK_RECOVERY_REACTIVATE")
+        let blank_reactivate = crate::tunables::var("MACRDP_BLANK_RECOVERY_REACTIVATE")
             .ok()
             .map(|s| !matches!(s.trim(), "0" | "false" | "off" | "no"))
             .unwrap_or(true);
@@ -1701,7 +829,7 @@ impl Gfx {
         if !on_reliable_udp {
             return; // not on the reliable UDP tunnel → nothing to switch
         }
-        let mut guard = self.ctx.lock().unwrap();
+        let mut guard = lock_ctx(&self.ctx);
         let Some(ctx) = guard.as_mut() else {
             return;
         };
@@ -1735,6 +863,10 @@ impl Gfx {
     /// particular frame was skipped for backpressure or isn't encoded yet).
     /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
+    #[allow(
+        dead_code,
+        reason = "whole-frame entry point; capture currently calls submit_bgra_regions"
+    )]
     pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
         self.submit_bgra_regions(bgra, stride, request_keyframe, FrameRegions::Full)
     }
@@ -1748,7 +880,7 @@ impl Gfx {
         regions: FrameRegions,
     ) -> Result<bool> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
-        // returns immediately; a dedicated ship thread (spawned in setup_locked)
+        // returns immediately; a dedicated ship thread (spawned in setup_encoder_locked)
         // pulls each encoded frame off VT's output channel and ships it the
         // instant it's ready. The capture thread never blocks on the encoder, so
         // it keeps pace with ScreenCaptureKit instead of falling behind under
@@ -1758,8 +890,9 @@ impl Gfx {
         // `server_handle`, which is never taken while holding ctx — the ship/ack
         // lock-order invariant). The decision extracts what the action needs here.
         let mut blank_recovery: Option<(BlankAction, GfxServerHandle, u16, u16, u32)> = None;
+        self.ensure_surface()?;
         let force_keyframe = {
-            let mut guard = self.ctx.lock().unwrap();
+            let mut guard = lock_ctx(&self.ctx);
             let Some(ctx) = guard.as_mut() else {
                 return Ok(false); // no active connection
             };
@@ -1846,10 +979,16 @@ impl Gfx {
                     );
                 }
             }
-            // Lazy one-time setup on the first ready frame (creates the encoder
-            // and spawns the ship thread).
-            if ctx.surface_id.is_none() || ctx.encoder.is_none() {
-                self.setup_locked(ctx)?;
+            // Lazy one-time setup on the first ready frame. The surface is
+            // created by `ensure_surface` before `ctx` is taken (it needs the
+            // server lock, which must come first); if the channel became ready
+            // only after that check, this frame is skipped and the next one
+            // creates it. The encoder and ship thread are set up here.
+            if ctx.surface_id.is_none() {
+                return Ok(true);
+            }
+            if ctx.encoder.is_none() {
+                self.setup_encoder_locked(ctx)?;
             }
             // Blank-presentation detector (the mstsc reconnect-blank): the client
             // is decoding + acking every frame (QoE reports flowing) but its
@@ -2143,7 +1282,7 @@ impl Gfx {
         // Submit to VideoToolbox (async). The ship thread delivers + ships the
         // output; we just count the submission for the drop-to-latest throttle.
         {
-            let mut guard = self.ctx.lock().unwrap();
+            let mut guard = lock_ctx(&self.ctx);
             let Some(ctx) = guard.as_mut() else {
                 return Ok(true);
             };
@@ -2489,14 +1628,33 @@ impl Gfx {
         debug!("EGFX ship loop exiting (output channel closed)");
     }
 
-    /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
-    fn setup_locked(&self, ctx: &mut ConnectionContext) -> Result<()> {
+    /// Create and map this connection's EGFX surface if it does not exist yet.
+    ///
+    /// Takes the server lock first and `ctx` second (see "Lock order" above).
+    /// `ctx` is only peeked at before that, to find the server handle, and
+    /// re-checked once both are held: a reconnect may have swapped the
+    /// context, or another frame may have created the surface meanwhile.
+    fn ensure_surface(&self) -> Result<()> {
+        let server_handle = {
+            let guard = lock_ctx(&self.ctx);
+            match guard.as_ref() {
+                Some(ctx) if ctx.is_ready && ctx.surface_id.is_none() => ctx.server_handle.clone(),
+                _ => return Ok(()),
+            }
+        };
+        let mut server = lock_server(&server_handle);
+        let mut guard = lock_ctx(&self.ctx);
+        let Some(ctx) = guard.as_mut() else {
+            return Ok(());
+        };
+        if !Arc::ptr_eq(&ctx.server_handle, &server_handle) || ctx.surface_id.is_some() {
+            return Ok(());
+        }
         // Read the live session size once and pin it for this connection's
         // surface + encoder + ship-side regions.
         let (width, height) = self.desktop_size.get();
         if ctx.surface_id.is_none() {
             ctx.dims = (width, height);
-            let mut server = ctx.server_handle.lock().unwrap();
             server.set_output_dimensions(width, height);
             // Emit RESET_GRAPHICS with an explicit single-monitor layout
             // covering the full desktop, BEFORE create_surface. The auto-reset
@@ -2539,6 +1697,12 @@ impl Gfx {
                 "EGFX surface created + mapped"
             );
         }
+        Ok(())
+    }
+
+    /// One-time per-connection encoder setup, once the surface exists (see
+    /// [`Self::ensure_surface`]). Caller holds `ctx`; never touches the server.
+    fn setup_encoder_locked(&self, ctx: &mut ConnectionContext) -> Result<()> {
         // Encoder dims always follow the surface's creation dims, so an
         // encoder (re)build can never disagree with an existing surface.
         let (width, height) = ctx.dims;
@@ -2635,7 +1799,7 @@ impl Gfx {
         height: u16,
     ) -> Result<()> {
         let (dvc_messages, egfx_channel_id, new_sid) = {
-            let mut server = server_handle.lock().unwrap();
+            let mut server = lock_server(server_handle);
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX blank remap: channel_id not assigned"))?;
@@ -2656,8 +1820,7 @@ impl Gfx {
                     .map_err(|e| anyhow!("EGFX blank remap: encode_dvc_messages failed: {e}"))?;
             let sender = self
                 .sender
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .clone()
                 .ok_or_else(|| anyhow!("EGFX blank remap: server-event sender not set"))?;
             sender
@@ -2668,7 +1831,7 @@ impl Gfx {
         }
         // Publish the fresh surface to the connection — unless a reconnect
         // swapped the context out from under the remap.
-        let mut guard = self.ctx.lock().unwrap();
+        let mut guard = lock_ctx(&self.ctx);
         match guard.as_mut() {
             Some(ctx) if Arc::ptr_eq(&ctx.server_handle, server_handle) => {
                 ctx.surface_id = Some(new_sid);
@@ -2693,7 +1856,8 @@ impl Gfx {
     /// drives the core deactivation-reactivation.
     ///
     /// Just resets the per-connection surface/encoder state so the first
-    /// frame after the reactivation re-runs `setup_locked` from scratch —
+    /// frame after the reactivation re-runs `ensure_surface` and
+    /// `setup_encoder_locked` from scratch —
     /// `resize_with_monitors` at the new size (DeleteSurface of the old
     /// surfaces + RESET_GRAPHICS + fresh surface + map) + a fresh
     /// VideoToolbox encoder + ship thread + IDR — the exact sequence a
@@ -2717,9 +1881,7 @@ impl Gfx {
     /// Whether lossless refinement still has tiles to send (capture keeps
     /// ticking while this is true).
     pub(crate) fn refine_pending(&self) -> bool {
-        self.ctx
-            .lock()
-            .unwrap()
+        lock_ctx(&self.ctx)
             .as_ref()
             .is_some_and(|ctx| ctx.refine.has_pending())
     }
@@ -2734,7 +1896,7 @@ impl Gfx {
     pub(crate) fn refine_tick(&self, bgra: &[u8], stride: usize, piggyback: bool) -> Result<()> {
         let now = Instant::now();
         let (surface_id, server_handle, epoch, ready, tiles) = {
-            let mut guard = self.ctx.lock().unwrap();
+            let mut guard = lock_ctx(&self.ctx);
             let Some(ctx) = guard.as_mut() else {
                 return Ok(());
             };
@@ -2799,7 +1961,7 @@ impl Gfx {
         };
         let ts_ms = u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
         let sent = {
-            let mut server = server_handle.lock().unwrap();
+            let mut server = lock_server(&server_handle);
             match server.channel_id() {
                 Some(channel) if server.send_mixed_frame(surface_id, tiles, ts_ms).is_some() => {
                     Some((server.drain_output(), channel))
@@ -2808,7 +1970,7 @@ impl Gfx {
             }
         };
         let Some((dvc_messages, egfx_channel_id)) = sent else {
-            if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
                 Self::refine_failed(ctx, &ready, now);
             }
             return Ok(());
@@ -2821,8 +1983,7 @@ impl Gfx {
                 .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
         let sender = self
             .sender
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .clone()
             .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
         sender
@@ -2844,13 +2005,13 @@ impl Gfx {
     }
 
     pub(crate) fn reset_for_live_resize(&self) {
-        let mut guard = self.ctx.lock().unwrap();
+        let mut guard = lock_ctx(&self.ctx);
         if let Some(ctx) = guard.as_mut() {
             // Order matters only in that both must be cleared before the
             // post-reactivation submit: encoder drop tears down the old VT
             // session + ship thread now; surface_id=None makes the next
-            // `submit_bgra` run `setup_locked` (which also rebuilds the
-            // encoder and resets the throttle counters).
+            // `submit_bgra` run `ensure_surface` and `setup_encoder_locked`
+            // (which rebuilds the encoder and resets the throttle counters).
             ctx.encoder = None;
             ctx.aux_encoder = None;
             ctx.region_queue.clear();
@@ -2868,7 +2029,7 @@ impl Gfx {
     /// `reactivate_request`; the capture loop drains it and emits a no-op
     /// `DisplayUpdate::Resize` to that size, which the vendored server turns
     /// into Server Deactivate All → new Demand Active while PRESERVING the
-    /// static channels (so the EGFX DVC + our surface survive; `setup_locked`
+    /// static channels (so the EGFX DVC + our surface survive; `ensure_surface`
     /// skips, no `resize_with_monitors`/DeleteSurface). The post-reactivation
     /// IDR was already armed under ctx in the decision block.
     fn perform_blank_reactivate(&self, width: u16, height: u16) -> Result<()> {
@@ -2885,7 +2046,7 @@ impl Gfx {
     }
 
     /// Manual A/V resync (the `Ctrl+Alt+Shift+R` hotkey — see `input.rs` and the
-    /// `crate::RESYNC_VIDEO` flag). Arms a forced IDR keyframe so the next frame
+    /// shared `ResyncSignal`). Arms a forced IDR keyframe so the next frame
     /// is a clean, self-contained repaint — enough to recover a stale/idle-blanked
     /// mstsc presentation without the heavyweight core Deactivation–Reactivation,
     /// which on the `--virtual-display`/`--capture-primary` headless path cascades
@@ -2895,10 +2056,8 @@ impl Gfx {
     /// case on some client, [`request_reactivation`] is the heavier escalation.
     /// `capture.rs` calls this when it observes the flag.
     pub(crate) fn force_keyframe(&self) {
-        if let Ok(mut guard) = self.ctx.lock() {
-            if let Some(ctx) = guard.as_mut() {
-                ctx.need_keyframe = true;
-            }
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
+            ctx.need_keyframe = true;
         }
         info!("manual A/V resync (Ctrl+Alt+Shift+R): forcing an IDR keyframe");
     }
@@ -2913,10 +2072,8 @@ impl Gfx {
     pub(crate) fn request_reactivation(&self, width: u16, height: u16) {
         let packed = (u32::from(width) << 16) | u32::from(height);
         self.reactivate_request.store(packed, Ordering::Relaxed);
-        if let Ok(mut guard) = self.ctx.lock() {
-            if let Some(ctx) = guard.as_mut() {
-                ctx.need_keyframe = true;
-            }
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
+            ctx.need_keyframe = true;
         }
         info!(
             width,
@@ -2952,8 +2109,7 @@ impl Gfx {
     fn perform_blank_drop(&self) -> Result<()> {
         let sender = self
             .sender
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .clone()
             .ok_or_else(|| anyhow!("EGFX blank drop: server-event sender not set"))?;
         warn!(
@@ -2992,7 +2148,7 @@ impl Gfx {
                 ship_times,
                 frame_regions,
             ) = {
-                let mut guard = self.ctx.lock().unwrap();
+                let mut guard = lock_ctx(&self.ctx);
                 let ctx = guard
                     .as_mut()
                     .ok_or_else(|| anyhow!("EGFX: ctx vanished mid-submit"))?;
@@ -3061,7 +2217,7 @@ impl Gfx {
             };
 
             // Phase 2: lock `server_handle` ALONE (ctx already released).
-            let mut server = server_handle.lock().unwrap();
+            let mut server = lock_server(&server_handle);
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
@@ -3106,7 +2262,7 @@ impl Gfx {
                 // round trip for the queue-delay congestion signal.
                 if let Some(frame_id) = sent {
                     last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
-                    ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
+                    ship_times.lock_or_recover()[frame_id as usize % RTT_RING] =
                         (u64::from(frame_id), Instant::now());
                 }
                 match sent {
@@ -3146,8 +2302,7 @@ impl Gfx {
                 .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
         let sender = self
             .sender
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .clone()
             .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
         sender
@@ -3197,7 +2352,7 @@ impl core::fmt::Debug for Gfx {
 
 impl ServerEventSender for Gfx {
     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
-        *self.sender.lock().unwrap() = Some(sender);
+        *self.sender.lock_or_recover() = Some(sender);
     }
 }
 
@@ -3249,7 +2404,7 @@ impl GfxServerFactory for Gfx {
         } else {
             self.bitrate_bps
         };
-        *self.ctx.lock().unwrap() = Some(ConnectionContext {
+        *lock_ctx(&self.ctx) = Some(ConnectionContext {
             avc444: false,
             aux_encoder: None,
             avc444_buf: Avc444Buffers::default(),
@@ -3374,16 +2529,16 @@ impl GraphicsPipelineHandler for GfxHandler {
             "EGFX: client advertised capabilities"
         );
         let avc444 = crate::negotiator::video::caps_from_egfx(&typed).avc444
-            && std::env::var("MACRDP_AVC444").as_deref() != Ok("0");
+            && crate::tunables::var("MACRDP_AVC444").as_deref() != Ok("0");
         info!(target: "macrdp::negotiator", avc444, "video: AVC444 {}", if avc444 { "on (client advertises it)" } else { "off" });
-        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             ctx.client_supports_avc = supports_avc;
             ctx.avc444 = avc444;
         }
     }
 
     fn on_ready(&mut self, negotiated: &CapabilitySet) {
-        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             // Only drive the H.264 path if the client advertised AVC420 decode
             // support. Otherwise leave is_ready false → submit_bgra returns
             // Ok(false) → capture.rs uses legacy BitmapUpdate. Shipping AVC420
@@ -3421,7 +2576,7 @@ impl GraphicsPipelineHandler for GfxHandler {
         // Feed ack-driven IDR recovery (EGFX-on-lossy): record liveness, and note
         // whether the client suspended acks (queueDepth == SUSPEND_FRAME_
         // ACKNOWLEDGEMENT 0xFFFFFFFF) — with acks off, loss can't be inferred.
-        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             ctx.last_ack_at = Instant::now();
             ctx.acks_suspended = queue_depth == 0xFFFF_FFFF;
             // Record decode progress for the UDP frame-ack-lag backpressure gate.
@@ -3437,7 +2592,7 @@ impl GraphicsPipelineHandler for GfxHandler {
                 // Ack-RTT sample for the adaptive controller's queue-delay
                 // signal: time since this exact frame left send_avc420_frame.
                 let (slot_id, shipped_at) =
-                    ctx.ship_times.lock().unwrap()[frame_id as usize % RTT_RING];
+                    ctx.ship_times.lock_or_recover()[frame_id as usize % RTT_RING];
                 let sample_ms = if slot_id == u64::from(frame_id) {
                     // Exact match: the frame's true ship→ack round trip.
                     Some(shipped_at.elapsed().as_secs_f64() * 1000.0)
@@ -3508,7 +2663,7 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// (like `on_frame_ack`), so it only touches ctx — never `server_handle`.
     fn on_qoe_metrics(&mut self, metrics: QoeMetrics) {
         trace!(?metrics, "EGFX on_qoe_metrics");
-        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             let was = ctx.qoe;
             ctx.qoe.record(metrics.time_diff_dr);
             if metrics.time_diff_dr > 0 {
@@ -3578,7 +2733,7 @@ impl GraphicsPipelineHandler for GfxHandler {
         // We can only log our own per-connection view here: the
         // `GraphicsPipelineServer` mutex is held while this callback runs, so we
         // must not lock `server_handle`.
-        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+        if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             debug!(
                 surface_id = ?ctx.surface_id,
                 dims = ?ctx.dims,
@@ -3611,46 +2766,46 @@ impl GraphicsPipelineHandler for StubHandler {
     }
 }
 
-/// Rewrite AVCC (4-byte length-prefixed NALs) to Annex-B (`00 00 00 01` start
-/// codes), prepending SPS/PPS on keyframes. Only used when `MACRDP_H264_ANNEXB`
-/// selects Annex-B framing.
-pub(crate) fn avcc_to_annex_b(
-    avcc: &[u8],
-    parameter_sets: &[Vec<u8>],
-    is_keyframe: bool,
-) -> Vec<u8> {
-    const START_CODE: [u8; 4] = [0, 0, 0, 1];
-    let mut out = Vec::with_capacity(avcc.len() + 64);
-
-    if is_keyframe {
-        for ps in parameter_sets {
-            out.extend_from_slice(&START_CODE);
-            out.extend_from_slice(ps);
-        }
-    }
-
-    let mut i = 0;
-    while i + 4 <= avcc.len() {
-        let nal_len = u32::from_be_bytes([avcc[i], avcc[i + 1], avcc[i + 2], avcc[i + 3]]) as usize;
-        i += 4;
-        if i + nal_len > avcc.len() {
-            warn!(
-                avcc_len = avcc.len(),
-                offset = i,
-                nal_len,
-                "AVCC NAL length overflows buffer; truncating"
-            );
-            break;
-        }
-        out.extend_from_slice(&START_CODE);
-        out.extend_from_slice(&avcc[i..i + nal_len]);
-        i += nal_len;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
+    use super::{lock_ctx, lock_server, ConnectionContext, GfxHandler, GfxServerHandle};
+    use ironrdp_egfx::server::GraphicsPipelineServer;
+
+    fn server_and_ctx() -> (GfxServerHandle, std::sync::Mutex<Option<ConnectionContext>>) {
+        let handler = Box::new(GfxHandler {
+            ctx: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        });
+        let server =
+            std::sync::Arc::new(std::sync::Mutex::new(GraphicsPipelineServer::new(handler)));
+        (server, std::sync::Mutex::new(None))
+    }
+
+    /// The documented order (server, then ctx) is allowed.
+    #[test]
+    fn server_then_ctx_is_allowed() {
+        let (server, ctx) = server_and_ctx();
+        let _s = lock_server(&server);
+        let _c = lock_ctx(&ctx);
+    }
+
+    /// The reversed order panics in debug builds instead of deadlocking.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "lock order")]
+    fn server_under_ctx_panics_in_debug() {
+        let (server, ctx) = server_and_ctx();
+        let _c = lock_ctx(&ctx);
+        let _s = lock_server(&server);
+    }
+
+    /// Dropping the ctx guard lifts the restriction again.
+    #[test]
+    fn server_after_ctx_is_released_is_allowed() {
+        let (server, ctx) = server_and_ctx();
+        drop(lock_ctx(&ctx));
+        let _s = lock_server(&server);
+    }
+
     use super::*;
 
     fn recovery_params() -> RecoveryParams {
@@ -5168,96 +4323,5 @@ mod tests {
         assert_eq!(&out[11..14], pps.as_slice());
         assert_eq!(&out[14..18], &[0, 0, 0, 1]);
         assert_eq!(&out[18..20], &[0x65, 0x88]);
-    }
-}
-
-/// AVC420 regions for one shipped frame: the queued dirty rects (clipped,
-/// inclusive edges), the bounding box beyond [`MAX_AVC_REGIONS`], or the whole
-/// surface when `rects` is `None`/empty.
-fn avc_regions(
-    rects: Option<&[crate::refine::Rect]>,
-    width: u16,
-    height: u16,
-) -> Vec<Avc420Region> {
-    let region = |l: u32, t: u32, r: u32, b: u32| Avc420Region {
-        left: l as u16,
-        top: t as u16,
-        right: r as u16,
-        bottom: b as u16,
-        quantization_parameter: 22,
-        quality: 100,
-    };
-    let (w, h) = (u32::from(width), u32::from(height));
-    let full = || vec![region(0, 0, w.saturating_sub(1), h.saturating_sub(1))];
-    let Some(rects) = rects.filter(|r| !r.is_empty()) else {
-        return full();
-    };
-    let clipped: Vec<(u32, u32, u32, u32)> = rects
-        .iter()
-        .filter(|r| r.w > 0 && r.h > 0 && r.x < w && r.y < h)
-        .map(|r| (r.x, r.y, (r.x + r.w).min(w) - 1, (r.y + r.h).min(h) - 1))
-        .collect();
-    if clipped.is_empty() {
-        return full();
-    }
-    if clipped.len() > MAX_AVC_REGIONS {
-        let l = clipped.iter().map(|c| c.0).min().unwrap_or(0);
-        let t = clipped.iter().map(|c| c.1).min().unwrap_or(0);
-        let r = clipped.iter().map(|c| c.2).max().unwrap_or(0);
-        let b = clipped.iter().map(|c| c.3).max().unwrap_or(0);
-        return vec![region(l, t, r, b)];
-    }
-    clipped
-        .into_iter()
-        .map(|(l, t, r, b)| region(l, t, r, b))
-        .collect()
-}
-
-#[cfg(test)]
-mod avc_region_tests {
-    use super::avc_regions;
-    use crate::refine::Rect;
-
-    #[test]
-    fn none_or_empty_means_whole_surface() {
-        for rs in [None, Some(&[][..])] {
-            let v = avc_regions(rs, 1714, 1287);
-            assert_eq!((v.len(), v[0].right, v[0].bottom), (1, 1713, 1286));
-        }
-    }
-
-    #[test]
-    fn rects_are_clipped_with_inclusive_edges() {
-        let v = avc_regions(
-            Some(&[Rect {
-                x: 1700,
-                y: 10,
-                w: 100,
-                h: 5,
-            }]),
-            1714,
-            1287,
-        );
-        assert_eq!(
-            (v[0].left, v[0].top, v[0].right, v[0].bottom),
-            (1700, 10, 1713, 14)
-        );
-    }
-
-    #[test]
-    fn many_rects_collapse_to_bounding_box() {
-        let rs: Vec<Rect> = (0..20)
-            .map(|i| Rect {
-                x: i * 10,
-                y: i,
-                w: 5,
-                h: 5,
-            })
-            .collect();
-        let v = avc_regions(Some(&rs), 1920, 1080);
-        assert_eq!(
-            (v.len(), v[0].left, v[0].top, v[0].right, v[0].bottom),
-            (1, 0, 0, 194, 23)
-        );
     }
 }

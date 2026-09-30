@@ -54,7 +54,7 @@ const FORMAT_H264: u8 = 0x01;
 /// cross-platform `on_media_type`, so gating this on macOS breaks the Linux stub build.
 pub(crate) fn camera_dump_enabled() -> bool {
     matches!(
-        std::env::var("MACRDP_CAMERA_DUMP").as_deref(),
+        crate::tunables::var("MACRDP_CAMERA_DUMP").as_deref(),
         Ok("1") | Ok("true")
     )
 }

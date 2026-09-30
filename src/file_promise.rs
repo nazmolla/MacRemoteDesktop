@@ -24,11 +24,11 @@
 
 #![cfg(target_os = "macos")]
 
+use crate::sync_ext::LockExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::pdu::{FileContentsFlags, FileContentsRequest, FileContentsResponse};
@@ -111,7 +111,7 @@ impl DownloadRouter {
             sid = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         }
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(sid, tx);
+        self.pending.lock_or_recover().insert(sid, tx);
         (sid, rx)
     }
 
@@ -120,7 +120,7 @@ impl DownloadRouter {
     /// silently if no one's waiting (e.g. paste was cancelled).
     pub fn deliver(&self, response: FileContentsResponse<'static>) {
         let stream_id = response.stream_id();
-        if let Some(tx) = self.pending.lock().unwrap().remove(&stream_id) {
+        if let Some(tx) = self.pending.lock_or_recover().remove(&stream_id) {
             let _ = tx.send(response);
         } else {
             debug!(stream_id, "no awaiter for FileContentsResponse; dropping");
@@ -161,7 +161,7 @@ pub fn spawn_remote_paste(
     rt_handle.spawn(async move {
         // Wipe any previous temp dir before starting the new download so
         // /tmp doesn't accumulate stale paste data across copies.
-        if let Some(old) = current_temp_dir.lock().unwrap().take() {
+        if let Some(old) = current_temp_dir.lock_or_recover().take() {
             let _ = std::fs::remove_dir_all(&old);
         }
         let dir = match make_temp_dir() {
@@ -171,7 +171,7 @@ pub fn spawn_remote_paste(
                 return;
             }
         };
-        *current_temp_dir.lock().unwrap() = Some(dir.clone());
+        *current_temp_dir.lock_or_recover() = Some(dir.clone());
 
         // Compute every entry's full destination path up front. Path-
         // safety check rejects anything that escapes the temp root via
@@ -306,7 +306,7 @@ fn ready_signal() {
 }
 
 fn play_glass() {
-    if let Err(e) = std::process::Command::new("afplay")
+    if let Err(e) = std::process::Command::new("/usr/bin/afplay")
         .arg("/System/Library/Sounds/Glass.aiff")
         .spawn()
     {
@@ -326,7 +326,7 @@ fn auto_paste_if_finder_front() {
             end if
         end tell
     "#;
-    let output = match std::process::Command::new("osascript")
+    let output = match std::process::Command::new("/usr/bin/osascript")
         .arg("-e")
         .arg(script)
         .output()
@@ -351,15 +351,12 @@ fn auto_paste_if_finder_front() {
 }
 
 fn make_temp_dir() -> std::io::Result<PathBuf> {
-    // Pid + nanos is unique enough for a single-process tool; we don't
-    // need /dev/urandom for collision avoidance.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("macrdp-paste-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    // `macrdp-paste-<pid>-<random>`: the pid lets `reap_stale` find leftovers
+    // of a dead process; the directory is always freshly created (0700).
+    crate::private_dir::create_unique(
+        &std::env::temp_dir(),
+        &format!("macrdp-paste-{}-", std::process::id()),
+    )
 }
 
 /// Reap eager-paste temp dirs (`$TMPDIR/macrdp-paste-<pid>-<nanos>`) left by a
@@ -389,6 +386,7 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
         .filter_map(|p| {
             let s = p.to_str()?;
             let ns = NSString::from_str(s);
+            // SAFETY: `ns` is a valid NSString for the duration of the call.
             unsafe { NSURL::fileURLWithPath(&ns) }.into()
         })
         .collect();
@@ -407,6 +405,8 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
     // (NSPasteboard is not thread-safe). The changeCount read stays inside the
     // guard so no other writer can bump it between our write and the capture.
     let _pb_guard = crate::clipboard::pasteboard_guard();
+    // SAFETY: NSPasteboard is only touched while `_pb_guard` is held, which serialises every
+    // pasteboard access in the process; `array` is a valid NSArray of NSURLs.
     let new_change_count = unsafe {
         let pb = NSPasteboard::generalPasteboard();
         pb.clearContents();
@@ -615,7 +615,7 @@ async fn fetch_range(
 }
 
 fn push_request(sender: &EventSender, req: FileContentsRequest) -> Result<(), String> {
-    let guard = sender.lock().unwrap();
+    let guard = sender.lock_or_recover();
     let s = guard
         .as_ref()
         .ok_or_else(|| "event sender unavailable (server shutting down?)".to_string())?;

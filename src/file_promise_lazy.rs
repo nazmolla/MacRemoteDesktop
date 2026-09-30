@@ -49,11 +49,11 @@
 
 #![cfg(target_os = "macos")]
 
+use crate::sync_ext::LockExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use block2::Block;
 use objc2::rc::{Allocated, Retained};
@@ -90,7 +90,11 @@ struct PresenterState {
 /// because every method we invoke on NSURL/NSOperationQueue is documented
 /// thread-safe (immutable string-like accessors and queue operations).
 struct SendRetained<T>(Retained<T>);
+// SAFETY: only thread-safe NSURL and NSOperationQueue methods are called through this wrapper (see
+// the struct docs).
 unsafe impl<T> Send for SendRetained<T> {}
+// SAFETY: only thread-safe NSURL and NSOperationQueue methods are called through this wrapper (see
+// the struct docs).
 unsafe impl<T> Sync for SendRetained<T> {}
 
 static REGISTRY: OnceLock<Mutex<HashMap<u64, Arc<PresenterState>>>> = OnceLock::new();
@@ -130,7 +134,9 @@ declare_class!(
     unsafe impl LazyPresenter {
         #[method_id(init)]
         fn init(this: Allocated<Self>) -> Option<Retained<Self>> {
-            let this = this.set_ivars(LazyPresenterIvars { id: 0 });
+            let this = this.set_ivars(LazyPresenterIvars { id: AtomicU64::new(0) });
+            // SAFETY: standard NSObject init chaining for a declared subclass; `this` has its ivars
+            // set.
             unsafe { msg_send_id![super(this), init] }
         }
     }
@@ -139,10 +145,9 @@ declare_class!(
         #[method_id(presentedItemURL)]
         #[allow(non_snake_case)]
         fn presentedItemURL(&self) -> Option<Retained<NSURL>> {
-            let id = self.ivars().id;
+            let id = self.ivars().id.load(Ordering::Relaxed);
             registry()
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .get(&id)
                 .map(|s| s.url.clone())
         }
@@ -150,16 +155,17 @@ declare_class!(
         #[method_id(presentedItemOperationQueue)]
         #[allow(non_snake_case)]
         fn presentedItemOperationQueue(&self) -> Retained<NSOperationQueue> {
-            let id = self.ivars().id;
+            let id = self.ivars().id.load(Ordering::Relaxed);
             // If the entry has been removed (paste superseded), fall back
             // to the main queue so the framework doesn't crash; the
             // reader block we get will be invoked with the queue already
             // gone, but returning Some path is correct.
             registry()
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .get(&id)
                 .map(|s| s.queue.clone())
+                // SAFETY: mainQueue returns the shared main operation queue, which lives for the
+                // process.
                 .unwrap_or_else(|| unsafe { NSOperationQueue::mainQueue() })
         }
 
@@ -168,8 +174,8 @@ declare_class!(
             &self,
             reader: *mut Block<dyn Fn(*mut Block<dyn Fn()>)>,
         ) {
-            let id = self.ivars().id;
-            let state = match registry().lock().unwrap().get(&id).cloned() {
+            let id = self.ivars().id.load(Ordering::Relaxed);
+            let state = match registry().lock_or_recover().get(&id).cloned() {
                 Some(s) => s,
                 None => {
                     // Entry gone; still call back so Finder isn't stuck.
@@ -184,7 +190,7 @@ declare_class!(
             // queue thread — Apple's coordination model expects us to be
             // able to block arbitrarily long here, while showing native
             // "Preparing to paste" progress UI).
-            let mut done = state.downloaded.lock().unwrap();
+            let mut done = state.downloaded.lock_or_recover();
             if !*done {
                 debug!(id, path = ?state.dst, "lazy presenter: downloading on read");
                 let res = state.rt.block_on(crate::file_promise::fetch_one_file(
@@ -220,7 +226,7 @@ declare_class!(
                         // doesn't try to re-fetch into the now-missing
                         // file (it'd hit the "Entry gone" path and
                         // immediately return reader(nil)).
-                        registry().lock().unwrap().remove(&id);
+                        registry().lock_or_recover().remove(&id);
                     }
                 }
             }
@@ -232,10 +238,14 @@ declare_class!(
     }
 );
 
+// SAFETY: LazyPresenter subclasses NSObject, so it satisfies the NSObject protocol.
 unsafe impl NSObjectProtocol for LazyPresenter {}
 
 struct LazyPresenterIvars {
-    id: u64,
+    /// Registry key, set once right after creation. Atomic because the
+    /// presenter is shared (`&self`) by then; a plain field would need a write
+    /// through a shared reference.
+    id: AtomicU64,
 }
 
 /// Entry point analogous to `crate::file_promise::spawn_remote_paste`.
@@ -285,7 +295,7 @@ pub fn spawn_lazy_paste(
             return false;
         }
     };
-    *current_temp_dir.lock().unwrap() = Some(dir.clone());
+    *current_temp_dir.lock_or_recover() = Some(dir.clone());
 
     // Plan every entry's on-disk destination up front, applying the same
     // path-traversal rejection rules as the eager path. If any entry's
@@ -336,6 +346,7 @@ pub fn spawn_lazy_paste(
             // pasteboard so Finder gets the whole tree.
             if is_top_level {
                 let path_ns = NSString::from_str(dst.to_str().unwrap());
+                // SAFETY: `path_ns` is a valid NSString for the call.
                 let url = unsafe { NSURL::fileURLWithPath(&path_ns) };
                 top_level_urls.push(SendRetained(url));
             }
@@ -365,7 +376,9 @@ pub fn spawn_lazy_paste(
         }
 
         let path_ns = NSString::from_str(dst.to_str().unwrap());
+        // SAFETY: `path_ns` is a valid NSString for the call.
         let url = unsafe { NSURL::fileURLWithPath(&path_ns) };
+        // SAFETY: creating an NSOperationQueue has no preconditions.
         let queue = unsafe { NSOperationQueue::new() };
 
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -380,15 +393,15 @@ pub fn spawn_lazy_paste(
             rt: rt_handle.clone(),
             downloaded: Mutex::new(false),
         };
-        registry().lock().unwrap().insert(id, Arc::new(state));
+        registry().lock_or_recover().insert(id, Arc::new(state));
 
         let presenter: Retained<LazyPresenter> =
+            // SAFETY: `new` on the declared LazyPresenter class runs its `init`, which sets the
+            // ivars.
             unsafe { msg_send_id![LazyPresenter::class(), new] };
-        unsafe {
-            let ivars_ptr =
-                (*presenter).ivars() as *const LazyPresenterIvars as *mut LazyPresenterIvars;
-            (*ivars_ptr).id = id;
-        }
+        // Set before the presenter is shared (registered below), so any
+        // callback that reads it sees this id.
+        presenter.ivars().id.store(id, Ordering::Relaxed);
 
         if is_top_level {
             top_level_urls.push(SendRetained(url));
@@ -400,12 +413,14 @@ pub fn spawn_lazy_paste(
     let self_cc = self_change_count.clone();
     runloop_thread::submit(move || {
         for (id, presenter) in to_register {
+            // SAFETY: runs on the dedicated run-loop thread, where every presenter is added and
+            // removed; `presenter` is retained by `to_register` for the call.
             unsafe {
                 let proto: &ProtocolObject<dyn NSFilePresenter> =
                     ProtocolObject::from_ref(&*presenter.0);
                 NSFileCoordinator::addFilePresenter(proto);
             }
-            live_presenters().lock().unwrap().insert(id, presenter);
+            live_presenters().lock_or_recover().insert(id, presenter);
         }
 
         publish_to_pasteboard(&top_level_urls, &self_cc);
@@ -420,18 +435,18 @@ pub fn spawn_lazy_paste(
 }
 
 fn cleanup_previous(current_temp_dir: &Arc<Mutex<Option<PathBuf>>>) {
-    if let Some(old) = current_temp_dir.lock().unwrap().take() {
+    if let Some(old) = current_temp_dir.lock_or_recover().take() {
         let _ = std::fs::remove_dir_all(&old);
     }
     // Drain LIVE_PRESENTERS and removeFilePresenter: each on the runloop
     // thread. Drop the REGISTRY entries here so any in-flight read sees
     // "entry gone" and exits cleanly.
     let drained: Vec<(u64, SendRetained<LazyPresenter>)> = {
-        let mut g = live_presenters().lock().unwrap();
+        let mut g = live_presenters().lock_or_recover();
         g.drain().collect()
     };
     {
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock_or_recover();
         for (id, _) in &drained {
             reg.remove(id);
         }
@@ -439,6 +454,8 @@ fn cleanup_previous(current_temp_dir: &Arc<Mutex<Option<PathBuf>>>) {
     if drained.is_empty() {
         return;
     }
+    // SAFETY: runs on the dedicated run-loop thread, where every presenter is added and removed;
+    // each presenter is retained by `drained` until after removal.
     runloop_thread::submit(move || unsafe {
         for (_, p) in drained {
             let proto: &ProtocolObject<dyn NSFilePresenter> = ProtocolObject::from_ref(&*p.0);
@@ -507,11 +524,13 @@ pub fn clear_pasteboard_if_stale(self_change_count: &SelfChangeCount) {
     // it's atomic (no other writer can bump changeCount between them) and race-
     // free against the advertise poller (NSPasteboard is not thread-safe).
     let _pb_guard = crate::clipboard::pasteboard_guard();
+    // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the process.
     let current_cc = unsafe { NSPasteboard::generalPasteboard().changeCount() } as i64;
     if current_cc != our_cc {
         // Something else owns the clipboard now — leave it alone.
         return;
     }
+    // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the process.
     unsafe {
         let pb = NSPasteboard::generalPasteboard();
         pb.clearContents();
@@ -558,8 +577,11 @@ pub fn cleanup_on_disconnect(
     // Atomic check-then-clear under the shared pasteboard guard (NSPasteboard is
     // not thread-safe; this Drop path races the advertise poller during churn).
     let _pb_guard = crate::clipboard::pasteboard_guard();
+    // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the process.
     let current_cc = unsafe { NSPasteboard::generalPasteboard().changeCount() } as i64;
     if current_cc == our_cc {
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process.
         unsafe {
             // clearContents bumps changeCount; record it as a self-write
             // so the change-count poller doesn't read the now-empty
@@ -583,14 +605,12 @@ pub fn cleanup_on_disconnect(
 }
 
 fn make_temp_dir() -> std::io::Result<PathBuf> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir =
-        std::env::temp_dir().join(format!("macrdp-lazy-paste-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    // `macrdp-lazy-paste-<pid>-<random>`, always freshly created (0700); see
+    // file_promise.rs.
+    crate::private_dir::create_unique(
+        &std::env::temp_dir(),
+        &format!("macrdp-lazy-paste-{}-", std::process::id()),
+    )
 }
 
 /// Reap lazy-paste temp dirs (`$TMPDIR/macrdp-lazy-paste-<pid>-<nanos>`) left by
@@ -623,6 +643,8 @@ fn publish_to_pasteboard(urls: &[SendRetained<NSURL>], self_change_count: &SelfC
     // Serialize against the advertise poller + other pasteboard writers, and
     // keep the changeCount capture inside the guard so it's our write's count.
     let _pb_guard = crate::clipboard::pasteboard_guard();
+    // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the process;
+    // `array` is a valid NSArray of NSURLs.
     let new_change_count = unsafe {
         let pb = NSPasteboard::generalPasteboard();
         pb.clearContents();

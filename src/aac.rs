@@ -94,6 +94,8 @@ impl AacEncoder {
         };
 
         let mut converter: ffi::AudioConverterRef = std::ptr::null_mut();
+        // SAFETY: `src` and `dst` are fully initialised stream descriptions that outlive the call,
+        // and `converter` is a valid out-pointer the call writes once.
         let status = unsafe { ffi::AudioConverterNew(&src, &dst, &mut converter) };
         if status != 0 || converter.is_null() {
             bail!(
@@ -112,6 +114,8 @@ impl AacEncoder {
         // still encodes at its default rate — but we surface it so an
         // out-of-range `--aac-bitrate` is visible rather than silently ignored.
         let br: u32 = bitrate;
+        // SAFETY: `converter` was checked non-null after AudioConverterNew and is owned by this
+        // encoder; `br` is a u32 on the stack and the size passed matches it.
         let st = unsafe {
             ffi::AudioConverterSetProperty(
                 converter,
@@ -182,6 +186,10 @@ impl AacEncoder {
                 m_data_byte_size: 0,
             };
 
+            // SAFETY: `converter` is owned by this encoder and live; `ctx`, `num_packets`,
+            // `buffer_list` and `pkt_desc` are locals that outlive this synchronous call, and
+            // `buffer_list` points into `out`, whose length is the byte size given.
+            // `input_data_proc` only reads `ctx` through the pointer passed here.
             let status = unsafe {
                 ffi::AudioConverterFillComplexBuffer(
                     self.converter,
@@ -226,6 +234,8 @@ impl AacEncoder {
 impl Drop for AacEncoder {
     fn drop(&mut self) {
         if !self.converter.is_null() {
+            // SAFETY: `converter` is non-null (checked above), owned by this encoder, and disposed
+            // exactly once because it is nulled right after.
             unsafe { ffi::AudioConverterDispose(self.converter) };
             self.converter = std::ptr::null_mut();
         }

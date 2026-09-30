@@ -1,0 +1,12 @@
+#!/bin/bash
+# Fake compiler for type-checking only: create any -o outputs as empty files.
+out=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  case "$a" in -o*) [ "$a" != "-o" ] && out="${a#-o}";; esac
+  prev="$a"
+done
+if [ -n "$out" ]; then : > "$out"; fi
+# Answer version/preprocessor probes harmlessly.
+for a in "$@"; do case "$a" in -E) echo "";; --version|-v) echo "clang version 18";; esac; done
+exit 0

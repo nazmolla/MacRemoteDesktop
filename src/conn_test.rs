@@ -23,6 +23,7 @@
 //! client gets the server's own size. (Pure-fn coverage of the adopt decision
 //! lives in `capture.rs::adopt_client_size`; this proves the wire path.)
 
+use crate::sync_ext::LockExt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -570,7 +571,7 @@ async fn server_survives_many_reconnects() -> anyhow::Result<()> {
     use anyhow::Context as _;
     init_tracing();
 
-    let n: usize = std::env::var("MACRDP_SOAK_RECONNECTS")
+    let n: usize = crate::tunables::var("MACRDP_SOAK_RECONNECTS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(25);
@@ -1016,10 +1017,9 @@ async fn a_just_evicted_peer_cannot_immediately_preempt_back() -> anyhow::Result
 
 /// A silent candidate MUST NOT be able to wedge the accept loop.
 ///
-/// `negotiate_candidate` blocks on socket reads from a peer that has not
-/// authenticated. Before `CANDIDATE_NEGOTIATION_TIMEOUT` /
-/// `CANDIDATE_HANDOFF_GRACE` (vendored divergence 23) the probe was awaited
-/// unbounded: a peer that completed the TCP handshake and then sent NOTHING
+/// A handshake blocks on socket reads from a peer that has not authenticated.
+/// Before handshakes had deadlines (now `HandshakeLimits`), the probe was
+/// awaited unbounded: a peer that completed the TCP handshake and then sent NOTHING
 /// parked it forever, and once the live session ended the accept loop blocked
 /// on the handoff await with no `select!` left — no further accepts, no event
 /// drain, so the server stopped answering entirely until restarted. That is an
@@ -1089,6 +1089,145 @@ async fn a_silent_candidate_cannot_wedge_the_accept_loop() -> anyhow::Result<()>
         .await
 }
 
+/// Run `body` against a real accept loop on an ephemeral loopback port, with
+/// the given handshake limits, inside a `LocalSet`.
+async fn with_running_server<F, Fut>(
+    limits: ironrdp_server::HandshakeLimits,
+    body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let mut server = build_test_server_full(
+                addr.port(),
+                1024,
+                768,
+                true,
+                None,
+                crate::bitmap_codecs(),
+                true,
+            );
+            server.set_handshake_limits(limits);
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+            let result = body(addr).await;
+            server_task.abort();
+            result
+        })
+        .await
+}
+
+/// Whether the server closes `stream` within `within`, i.e. a read returns
+/// end-of-file or an error.
+async fn closed_by_server(stream: &mut tokio::net::TcpStream, within: std::time::Duration) -> bool {
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = [0u8; 64];
+    matches!(
+        tokio::time::timeout(within, stream.read(&mut buf)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
+
+/// Silent connections must not delay a real client. The old accept loop served
+/// the first connection straight away with no deadline and negotiated later
+/// ones one at a time, so three silent peers held a real user off for ~30 s.
+/// Handshakes now run concurrently, so the real client is served at once.
+#[tokio::test]
+async fn silent_peers_do_not_delay_a_real_client() -> anyhow::Result<()> {
+    init_tracing();
+    let limits = ironrdp_server::HandshakeLimits {
+        // Loopback: every peer shares one source, so lift the per-source cap
+        // to exercise concurrency rather than the cap.
+        max_per_source: 8,
+        ..Default::default()
+    };
+    with_running_server(limits, |addr| async move {
+        let mut silent = Vec::new();
+        for _ in 0..3 {
+            silent.push(connect_with_retry(addr).await?);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let started = std::time::Instant::now();
+        let real = connect_with_retry(addr).await?;
+        let served = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect_client(real, 1280, 800),
+        )
+        .await;
+        assert!(
+            matches!(served, Ok(Ok(_))),
+            "a real client behind three silent peers was not served within 5 s"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        drop(silent);
+        anyhow::Ok(())
+    })
+    .await
+}
+
+/// A connection that never sends its X.224 request is closed once the pre-TLS
+/// deadline passes, instead of holding a handshake slot indefinitely.
+#[tokio::test]
+async fn a_stalled_handshake_is_closed_after_its_deadline() -> anyhow::Result<()> {
+    init_tracing();
+    let limits = ironrdp_server::HandshakeLimits {
+        pre_tls: std::time::Duration::from_millis(300),
+        ..Default::default()
+    };
+    with_running_server(limits, |addr| async move {
+        let mut silent = connect_with_retry(addr).await?;
+        assert!(
+            closed_by_server(&mut silent, std::time::Duration::from_secs(3)).await,
+            "a silent connection outlived the 300 ms pre-TLS deadline"
+        );
+        anyhow::Ok(())
+    })
+    .await
+}
+
+/// One source may hold at most `max_per_source` handshakes; a further
+/// connection from it is closed immediately, while the ones in flight are
+/// left alone.
+#[tokio::test]
+async fn handshakes_are_capped_per_source() -> anyhow::Result<()> {
+    init_tracing();
+    let limits = ironrdp_server::HandshakeLimits {
+        max_per_source: 2,
+        ..Default::default()
+    };
+    with_running_server(limits, |addr| async move {
+        let mut first = connect_with_retry(addr).await?;
+        let mut second = connect_with_retry(addr).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut third = connect_with_retry(addr).await?;
+        assert!(
+            closed_by_server(&mut third, std::time::Duration::from_secs(1)).await,
+            "a third handshake from one source was not refused"
+        );
+        let short = std::time::Duration::from_millis(200);
+        assert!(
+            !closed_by_server(&mut first, short).await,
+            "first handshake was dropped"
+        );
+        assert!(
+            !closed_by_server(&mut second, short).await,
+            "second handshake was dropped"
+        );
+        anyhow::Ok(())
+    })
+    .await
+}
+
 /// The listener needs a moment to bind after `run()` is spawned; retry briefly
 /// so the test isn't racy on a loaded machine.
 async fn connect_with_retry(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {
@@ -1155,8 +1294,8 @@ struct RecordClientDisplay {
 }
 
 impl ConnectionHandler for RecordClientDisplay {
-    fn on_client_display(&mut self, info: &ironrdp_acceptor::ClientDisplayInfo) {
-        *self.seen.lock().unwrap() = Some(info.clone());
+    fn on_client_display(&mut self, _peer: SocketAddr, info: &ironrdp_acceptor::ClientDisplayInfo) {
+        *self.seen.lock_or_recover() = Some(info.clone());
     }
 }
 
@@ -1199,8 +1338,7 @@ async fn client_display_info_reaches_the_connection_handler() -> anyhow::Result<
         .await?;
 
     let got = seen
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .clone()
         .expect("on_client_display called");
     assert_eq!(got.desktop_scale_factor, Some(150));

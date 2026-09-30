@@ -98,7 +98,7 @@ pub fn global() -> Option<&'static Arc<SessionStats>> {
 /// Endpoint port (`MACRDP_STATS_PORT`, default 40245 — next after the shield
 /// helper's 40244).
 pub fn default_port() -> u16 {
-    std::env::var("MACRDP_STATS_PORT")
+    crate::tunables::var("MACRDP_STATS_PORT")
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(40245)

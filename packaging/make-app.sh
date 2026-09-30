@@ -137,7 +137,7 @@ fi
 
 # 2d. Embed the app-switcher HUD helper (--app-switcher-hud). A small Swift
 #     executable built from gui/; macrdp spawns it from Contents/Resources/macrdphud
-#     (see locate_hud_helper in src/main.rs). Signed before the outer bundle is
+#     (see locate_hud_helper in src/app/helpers.rs). Signed before the outer bundle is
 #     sealed so the deep signature stays valid + it passes notarization.
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     echo "==> swift build -c release (macrdphud)"
@@ -155,7 +155,7 @@ fi
 
 # 2e. Embed the black shield-window helper (--shield-primary). Same shape as the
 #     HUD helper: a small Swift executable macrdp spawns from
-#     Contents/Resources/macrdpshield (see locate_shield_helper in src/main.rs),
+#     Contents/Resources/macrdpshield (see locate_shield_helper in src/app/helpers.rs),
 #     signed before the outer bundle seal.
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     echo "==> swift build -c release (macrdpshield)"

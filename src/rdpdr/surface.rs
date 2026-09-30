@@ -21,6 +21,7 @@
 
 #![cfg(target_os = "macos")]
 
+use crate::sync_ext::LockExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -223,7 +224,7 @@ impl RdpdrFs {
     /// `(fileid, entry)` pairs. The cache lock is never held across the await.
     async fn list_and_cache(&self, dirid: fileid3) -> Result<Vec<(fileid3, RdpEntry)>, nfsstat3> {
         let dir_path = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.lock_or_recover();
             let n = c.id_to_node.get(&dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
             if !n.is_dir {
                 return Err(nfsstat3::NFS3ERR_NOTDIR);
@@ -236,7 +237,7 @@ impl RdpdrFs {
             .await
             .map_err(|e| nfs_err("list_dir failed", &e))?;
         let mut out = Vec::with_capacity(entries.len());
-        let mut c = self.cache.lock().unwrap();
+        let mut c = self.cache.lock_or_recover();
         for e in entries {
             let child = join_remote(&dir_path, &e.name);
             let id = c.intern(dirid, &child, e.is_dir, e.size);
@@ -248,7 +249,7 @@ impl RdpdrFs {
     /// Resolve a directory fileid to its remote path (errors if unknown or not a
     /// directory).
     fn dir_path_of(&self, dirid: fileid3) -> Result<String, nfsstat3> {
-        let c = self.cache.lock().unwrap();
+        let c = self.cache.lock_or_recover();
         let n = c.id_to_node.get(&dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
         if !n.is_dir {
             return Err(nfsstat3::NFS3ERR_NOTDIR);
@@ -273,7 +274,7 @@ impl NFSFileSystem for RdpdrFs {
             return Ok(dirid);
         }
         if name == ".." {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.lock_or_recover();
             return c
                 .id_to_node
                 .get(&dirid)
@@ -283,7 +284,7 @@ impl NFSFileSystem for RdpdrFs {
 
         // Fast path: already interned (e.g. from a prior readdir).
         let (dir_path, cached) = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.lock_or_recover();
             let n = c.id_to_node.get(&dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
             if !n.is_dir {
                 return Err(nfsstat3::NFS3ERR_NOTDIR);
@@ -298,8 +299,7 @@ impl NFSFileSystem for RdpdrFs {
         // Slow path: enumerate the parent to discover the child.
         self.list_and_cache(dirid).await?;
         self.cache
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .path_to_id
             .get(&dir_path)
             .copied()
@@ -308,7 +308,7 @@ impl NFSFileSystem for RdpdrFs {
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let (is_dir, size) = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.lock_or_recover();
             let n = c.id_to_node.get(&id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
             (n.is_dir, n.size)
         };
@@ -322,7 +322,7 @@ impl NFSFileSystem for RdpdrFs {
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let (remote_path, is_dir, size) = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.lock_or_recover();
             let n = c.id_to_node.get(&id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
             (n.remote_path.clone(), n.is_dir, n.size)
         };
@@ -376,7 +376,7 @@ impl NFSFileSystem for RdpdrFs {
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let (remote_path, is_dir) = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.lock_or_recover();
             let n = c.id_to_node.get(&id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
             (n.remote_path.clone(), n.is_dir)
         };
@@ -388,11 +388,11 @@ impl NFSFileSystem for RdpdrFs {
                     .set_len(self.device_id, &remote_path, new_size)
                     .await
                     .map_err(|e| nfs_err("set_len failed", &e))?;
-                self.cache.lock().unwrap().set_size(id, new_size);
+                self.cache.lock_or_recover().set_size(id, new_size);
             }
         }
         let size = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.lock_or_recover();
             c.id_to_node.get(&id).map(|n| n.size).unwrap_or(0)
         };
         Ok(self.attr(id, is_dir, size))
@@ -400,7 +400,7 @@ impl NFSFileSystem for RdpdrFs {
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let (remote_path, is_dir) = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.lock_or_recover();
             let n = c.id_to_node.get(&id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
             (n.remote_path.clone(), n.is_dir)
         };
@@ -412,7 +412,7 @@ impl NFSFileSystem for RdpdrFs {
             .await
             .map_err(|e| nfs_err("write_file failed", &e))?;
         let new_size = {
-            let mut c = self.cache.lock().unwrap();
+            let mut c = self.cache.lock_or_recover();
             let cur = c.id_to_node.get(&id).map(|n| n.size).unwrap_or(0);
             let ns = cur.max(offset + data.len() as u64);
             c.set_size(id, ns);
@@ -434,7 +434,7 @@ impl NFSFileSystem for RdpdrFs {
             .create_file(self.device_id, &child, false)
             .await
             .map_err(|e| nfs_err("create_file failed", &e))?;
-        let id = self.cache.lock().unwrap().intern(dirid, &child, false, 0);
+        let id = self.cache.lock_or_recover().intern(dirid, &child, false, 0);
         Ok((id, self.attr(id, false, 0)))
     }
 
@@ -450,7 +450,7 @@ impl NFSFileSystem for RdpdrFs {
             .create_file(self.device_id, &child, true)
             .await
             .map_err(|e| nfs_err("create_exclusive failed", &e))?;
-        Ok(self.cache.lock().unwrap().intern(dirid, &child, false, 0))
+        Ok(self.cache.lock_or_recover().intern(dirid, &child, false, 0))
     }
 
     async fn mkdir(
@@ -465,7 +465,7 @@ impl NFSFileSystem for RdpdrFs {
             .create_dir(self.device_id, &child)
             .await
             .map_err(|e| nfs_err("create_dir failed", &e))?;
-        let id = self.cache.lock().unwrap().intern(dirid, &child, true, 0);
+        let id = self.cache.lock_or_recover().intern(dirid, &child, true, 0);
         Ok((id, self.attr(id, true, 0)))
     }
 
@@ -475,7 +475,7 @@ impl NFSFileSystem for RdpdrFs {
         let child = join_remote(&dir_path, &name);
         // Resolve the target's id + kind; enumerate the parent if not yet cached.
         let mut resolved = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.lock_or_recover();
             c.path_to_id
                 .get(&child)
                 .copied()
@@ -484,7 +484,7 @@ impl NFSFileSystem for RdpdrFs {
         if resolved.is_none() {
             self.list_and_cache(dirid).await?;
             resolved = {
-                let c = self.cache.lock().unwrap();
+                let c = self.cache.lock_or_recover();
                 c.path_to_id
                     .get(&child)
                     .copied()
@@ -496,7 +496,7 @@ impl NFSFileSystem for RdpdrFs {
             .remove(self.device_id, &child, is_dir)
             .await
             .map_err(|e| nfs_err("remove failed", &e))?;
-        self.cache.lock().unwrap().forget(id);
+        self.cache.lock_or_recover().forget(id);
         Ok(())
     }
 
@@ -515,7 +515,7 @@ impl NFSFileSystem for RdpdrFs {
         let to_path = join_remote(&to_dir, &to_name);
 
         let mut src = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.lock_or_recover();
             c.path_to_id
                 .get(&from_path)
                 .copied()
@@ -524,7 +524,7 @@ impl NFSFileSystem for RdpdrFs {
         if src.is_none() {
             self.list_and_cache(from_dirid).await?;
             src = {
-                let c = self.cache.lock().unwrap();
+                let c = self.cache.lock_or_recover();
                 c.path_to_id
                     .get(&from_path)
                     .copied()
@@ -536,7 +536,7 @@ impl NFSFileSystem for RdpdrFs {
             .rename(self.device_id, &from_path, &to_path, true)
             .await
             .map_err(|e| nfs_err("rename failed", &e))?;
-        let mut c = self.cache.lock().unwrap();
+        let mut c = self.cache.lock_or_recover();
         c.forget(src_id);
         c.intern(to_dirid, &to_path, is_dir, size);
         Ok(())
@@ -671,11 +671,11 @@ fn live_mounts() -> &'static Mutex<Vec<PathBuf>> {
 }
 
 fn register_mount(mp: &Path) {
-    live_mounts().lock().unwrap().push(mp.to_path_buf());
+    live_mounts().lock_or_recover().push(mp.to_path_buf());
 }
 
 fn unregister_mount(mp: &Path) {
-    live_mounts().lock().unwrap().retain(|p| p != mp);
+    live_mounts().lock_or_recover().retain(|p| p != mp);
 }
 
 /// `umount -f` the mountpoint, remove it, and prune the empty per-pid parent.
@@ -704,7 +704,7 @@ fn unmount_at(mp: &Path) {
 /// doesn't strand a mount pointing at the now-dead NFS server. Synchronous and
 /// best-effort; runs to completion before exit.
 pub fn shutdown_cleanup() {
-    let mounts: Vec<PathBuf> = std::mem::take(&mut *live_mounts().lock().unwrap());
+    let mounts: Vec<PathBuf> = std::mem::take(&mut *live_mounts().lock_or_recover());
     if mounts.is_empty() {
         return;
     }
@@ -801,16 +801,31 @@ fn prepare_mountpoint(label: &str) -> std::io::Result<PathBuf> {
     match std::fs::create_dir(&candidate) {
         Ok(()) => Ok(candidate),
         Err(_) => {
-            let tmp = std::env::temp_dir()
-                .join(format!("macrdp-rdpdr-{}", std::process::id()))
-                .join(label);
-            std::fs::create_dir_all(&tmp)?;
-            Ok(tmp)
+            // Fallback: a fresh directory inside a private per-process one.
+            // `create_child` refuses a name that would leave the parent and
+            // anything that already exists, so the client-chosen label can
+            // never place the mount somewhere else.
+            let parent = std::env::temp_dir().join(format!("macrdp-rdpdr-{}", std::process::id()));
+            crate::private_dir::ensure(&parent)?;
+            let mut name = label.to_owned();
+            let mut n = 1;
+            loop {
+                match crate::private_dir::create_child(&parent, &name) {
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 50 => {
+                        name = format!("{label}-{n}");
+                        n += 1;
+                    }
+                    other => return other,
+                }
+            }
         }
     }
 }
 
-/// Make a drive label safe for a single path component (no `/`, `:` etc.).
+/// Make a drive label safe for a single path component. The label is the
+/// client's own device name, so it is untrusted: separators, `:` and control
+/// characters become `_`, and leading dots are replaced so the result can never
+/// be `.`, `..` or a hidden name.
 fn sanitize_label(label: &str) -> String {
     let trimmed = label.trim().trim_end_matches(':');
     let cleaned: String = trimmed
@@ -823,9 +838,32 @@ fn sanitize_label(label: &str) -> String {
             }
         })
         .collect();
-    if cleaned.is_empty() {
+    let dots = cleaned.len() - cleaned.trim_start_matches('.').len();
+    let cleaned = format!("{}{}", "_".repeat(dots), &cleaned[dots..]);
+    if cleaned.trim_matches('_').is_empty() {
         "drive".to_owned()
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::sanitize_label;
+
+    #[test]
+    fn labels_cannot_name_a_parent_or_hidden_directory() {
+        for (raw, want) in [
+            ("C:", "C"),
+            ("..", "drive"),
+            (".", "drive"),
+            ("", "drive"),
+            ("../x", "___x"),
+            (".hidden", "_hidden"),
+            ("a/b\\c", "a_b_c"),
+            ("My Drive", "My Drive"),
+        ] {
+            assert_eq!(sanitize_label(raw), want, "{raw:?}");
+        }
     }
 }

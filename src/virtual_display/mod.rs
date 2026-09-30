@@ -64,6 +64,8 @@ mod macos {
         }
         let mut ids = [0u32; 32];
         let mut count = 0u32;
+        // SAFETY: `ids` has room for 32 entries, which is the capacity passed, so the returned
+        // count is at most 32; `count` is a valid out-pointer.
         unsafe {
             if CGGetOnlineDisplayList(32, ids.as_mut_ptr(), &mut count) != 0 {
                 return Vec::new();
@@ -126,6 +128,9 @@ mod macos {
                 display_count: *mut u32,
             ) -> CGError;
         }
+        // SAFETY: the first call passes a null buffer with capacity 0 to get the count; the second
+        // passes a buffer of exactly that many entries with that capacity, and the result is
+        // truncated to the number written.
         unsafe {
             let mut count: u32 = 0;
             let r = CGGetOnlineDisplayList(0, std::ptr::null_mut(), &mut count);
@@ -191,6 +196,10 @@ mod macos {
 
         /// Create a display sized and scaled per a negotiated [`DisplayPlan`]
         /// (Retina twin selected when `plan.hidpi`, sRGB primaries always).
+        #[allow(
+            dead_code,
+            reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
+        )]
         pub fn new_planned(plan: &crate::negotiator::display::DisplayPlan) -> Result<Self> {
             let mut vd = Self::new(plan.points_w, plan.points_h, 60)?;
             vd.apply_plan(plan)?;
@@ -235,6 +244,10 @@ mod macos {
         }
 
         /// The display's framebuffer size in pixels (2× points in Retina modes).
+        #[allow(
+            dead_code,
+            reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
+        )]
         pub fn backing_pixels(&self) -> (u32, u32) {
             // Not CGDisplayPixelsWide: it reports points for Retina modes.
             private_api::current_mode(self.display_id)
@@ -852,11 +865,15 @@ mod macos {
             // some panels captured and others live.
             let mut held: Vec<(u32, (i32, i32))> = Vec::with_capacity(targets.len());
             for (id, origin) in &targets {
+                // SAFETY: CGDisplayCapture takes a display id by value; every successful capture is
+                // recorded in `held` and released on the failure path or in Drop.
                 let err = unsafe { CGDisplayCapture(*id) };
                 if err == 0 {
                     held.push((*id, *origin));
                 } else {
                     for (rid, _) in &held {
+                        // SAFETY: `rid` was captured by this process just above, so releasing it is
+                        // balanced.
                         let _ = unsafe { CGDisplayRelease(*rid) };
                     }
                     return Err(anyhow!(
@@ -872,6 +889,8 @@ mod macos {
             // rejection means that one panel keeps showing the desktop,
             // but the capture is still in effect.
             for (id, _) in &held {
+                // SAFETY: CGSetDisplayTransferByFormula takes a display id and plain floats; it
+                // only changes that display's gamma, which Drop restores.
                 let err = unsafe {
                     CGSetDisplayTransferByFormula(*id, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0)
                 };
@@ -929,6 +948,8 @@ mod macos {
         pub fn reassert_blanking(&self) -> usize {
             let mut failed = 0usize;
             for (id, _) in &self.captured {
+                // SAFETY: CGSetDisplayTransferByFormula takes a display id and plain floats; it
+                // only changes that display's gamma, which Drop restores.
                 let err = unsafe {
                     CGSetDisplayTransferByFormula(*id, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0)
                 };
@@ -956,6 +977,8 @@ mod macos {
             // reverts every display whose LUT THIS process altered to
             // the user's ColorSync profile — it does not clobber gamma
             // changes made by other apps.
+            // SAFETY: CGDisplayRestoreColorSyncSettings takes no arguments and only restores gamma
+            // tables this process changed.
             unsafe { CGDisplayRestoreColorSyncSettings() };
 
             // Release the capture tokens. CGDisplayRelease is best-effort
@@ -963,6 +986,8 @@ mod macos {
             // never held it (process-scoped capture may have already
             // been auto-released).
             for (id, _) in &self.captured {
+                // SAFETY: each id in `captured` was captured by this process, and this Drop
+                // releases it once.
                 let err = unsafe { CGDisplayRelease(*id) };
                 if err != 0 {
                     tracing::warn!(
@@ -1093,7 +1118,7 @@ mod macos {
     /// (lock visibility wins); `MACRDP_SHIELD_KEEP_PHYSICAL_MAIN=0` restores the
     /// old vd-as-main behaviour for A/B comparison.
     pub fn shield_keeps_physical_main() -> bool {
-        match std::env::var("MACRDP_SHIELD_KEEP_PHYSICAL_MAIN") {
+        match crate::tunables::var("MACRDP_SHIELD_KEEP_PHYSICAL_MAIN") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false") && !v.is_empty(),
             Err(_) => true,
         }
@@ -1841,6 +1866,9 @@ mod planned_tests {
             ) -> CGColorRef;
             fn CGColorGetComponents(color: CGColorRef) -> *const f64;
         }
+        // SAFETY: test-only and run by hand on a Mac. The display colour space, the named sRGB
+        // space and a four-component RGBA colour are valid inputs, and the converted colour has at
+        // least three components; a null result would fail this ignored test, not the server.
         unsafe {
             let disp = CGDisplayCopyColorSpace(id);
             let srgb = CGColorSpaceCreateWithName(

@@ -1,0 +1,4 @@
+#!/bin/bash
+# Stand-in for Apple's xcrun: report an SDK version, otherwise the stub SDK path.
+here="$(cd "$(dirname "$0")/.." && pwd)"
+case "$*" in *version*) echo 15.0;; *) echo "$here/sdk";; esac

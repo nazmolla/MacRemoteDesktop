@@ -4,6 +4,7 @@
 //! get a static-rectangle stub so the protocol layer still builds and can be
 //! exercised on Linux CI.
 
+use crate::sync_ext::LockExt;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -92,6 +93,12 @@ impl Default for ClickSignal {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Clamp a display dimension into the u16 range RDP sizes use.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn saturate_u16(v: u32) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
 }
 
 fn pack_size(width: u16, height: u16) -> u32 {
@@ -400,6 +407,9 @@ pub struct CaptureDisplay {
     /// very next call to skip re-adopting the client's reactivation-echo
     /// size. See `request_initial_size`'s doc comment for why this exists.
     pub suppress_next_adopt: Arc<AtomicBool>,
+    /// The Ctrl+Alt+Shift+R resync request (raised by the input handler);
+    /// the capture loop consumes its video half by forcing an IDR.
+    pub resync: crate::resync::ResyncSignal,
     /// The `--virtual-display` this session serves, when there is one.
     /// Shared with `main.rs`, which created it. Enables live client-driven
     /// resize on the virtual-display path:
@@ -663,7 +673,7 @@ impl CaptureDisplay {
         let Some(vd) = self.virtual_display.clone() else {
             return (width, height);
         };
-        let mut vd = vd.lock().expect("virtual display mutex poisoned");
+        let mut vd = vd.lock_or_recover();
         let plan = self.client_advert.as_ref().map(|advert| {
             crate::negotiator::display::plan_display(crate::negotiator::display::ClientMonitor {
                 width_px: u32::from(width),
@@ -763,7 +773,7 @@ impl CaptureDisplay {
                     //    No-op for --detach-primary (slot is None; that mode
                     //    disables the panel, not gamma).
                     if let Some(cap) = self.captured_primary.as_ref() {
-                        if let Some(g) = cap.lock().expect("captured_primary poisoned").as_ref() {
+                        if let Some(g) = cap.lock_or_recover().as_ref() {
                             let failed = g.reassert_blanking();
                             tracing::info!(
                                 failed,
@@ -775,7 +785,7 @@ impl CaptureDisplay {
                     // the panels' new frames. Cheap and idempotent (SHOW
                     // reconciles rather than stacking).
                     if let Some(sh) = self.shielded_primary.as_ref() {
-                        if let Some(g) = sh.lock().expect("shielded_primary poisoned").as_ref() {
+                        if let Some(g) = sh.lock_or_recover().as_ref() {
                             let failed = g.reassert_blanking();
                             tracing::info!(failed, "re-fitted shield windows after re-mode");
                         }
@@ -795,16 +805,12 @@ impl CaptureDisplay {
                         // the re-assert has to run AFTER each sweep, here.
                         let reblank = || {
                             if let Some(cap) = captured_primary.as_ref() {
-                                if let Some(g) =
-                                    cap.lock().expect("captured_primary poisoned").as_ref()
-                                {
+                                if let Some(g) = cap.lock_or_recover().as_ref() {
                                     g.reassert_blanking();
                                 }
                             }
                             if let Some(sh) = shielded_primary.as_ref() {
-                                if let Some(g) =
-                                    sh.lock().expect("shielded_primary poisoned").as_ref()
-                                {
+                                if let Some(g) = sh.lock_or_recover().as_ref() {
                                     g.reassert_blanking();
                                 }
                             }
@@ -843,9 +849,10 @@ impl CaptureDisplay {
                 // Keep serving what the display currently shows: the last applied
                 // plan's client-pixel size, else the display's own size.
                 let (w, h) = match self.applied_plan.as_ref() {
-                    Some(p) => (p.capture_w as u16, p.capture_h as u16),
+                    Some(p) => (saturate_u16(p.capture_w), saturate_u16(p.capture_h)),
                     None => {
                         let (cur_w, cur_h) = vd.size_pts();
+                        // f64 -> u16 `as` saturates, so this cannot wrap.
                         (cur_w as u16, cur_h as u16)
                     }
                 };
@@ -889,6 +896,7 @@ impl CaptureDisplay {
                 self.desktop_size.clone(),
                 self.pending_resize.clone(),
                 self.suppress_next_adopt.clone(),
+                self.resync.clone(),
             )
             .await?,
         );
@@ -1098,6 +1106,8 @@ mod macos {
         /// reactivation's `request_initial_size` call doesn't re-adopt
         /// whatever size the client's Confirm Active echoes.
         suppress_next_adopt: Arc<AtomicBool>,
+        /// See `CaptureDisplay::resync`.
+        resync: crate::resync::ResyncSignal,
     }
 
     impl ScreenCaptureUpdates {
@@ -1120,6 +1130,7 @@ mod macos {
             desktop_size: SharedDesktopSize,
             pending_resize: PendingResize,
             suppress_next_adopt: Arc<AtomicBool>,
+            resync: crate::resync::ResyncSignal,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -1298,6 +1309,7 @@ mod macos {
                 pending_resize,
                 desktop_size,
                 suppress_next_adopt,
+                resync,
             })
         }
     }
@@ -1377,13 +1389,13 @@ mod macos {
                 // forced IDR was already armed on the ctx.
                 if let Some(gfx) = self.gfx.as_ref() {
                     // Manual A/V resync hotkey (Ctrl+Alt+Shift+R, set in
-                    // input.rs via crate::RESYNC_VIDEO): force a clean IDR
+                    // input.rs through the shared ResyncSignal): force a clean IDR
                     // keyframe to repaint a stale/idle-blanked mstsc presentation.
                     // Deliberately lighter than the full core reactivation
                     // (gfx.request_reactivation), which on the headless
                     // virtual-display path cascades into a visible session
                     // re-cycle — see Gfx::force_keyframe.
-                    if crate::RESYNC_VIDEO.swap(false, Ordering::Relaxed) {
+                    if self.resync.take_video() {
                         gfx.force_keyframe();
                     }
                     if let Some((w, h)) = gfx.take_reactivate_request() {

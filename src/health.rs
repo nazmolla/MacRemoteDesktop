@@ -71,19 +71,21 @@ impl HealthConfig {
         let d = Self::default();
         Self {
             probe_interval: parse_secs(
-                std::env::var("MACRDP_HEALTHCHECK_INTERVAL_SECS")
+                crate::tunables::var("MACRDP_HEALTHCHECK_INTERVAL_SECS")
                     .ok()
                     .as_deref(),
                 d.probe_interval,
             ),
             timeout: parse_secs(
-                std::env::var("MACRDP_HEALTHCHECK_TIMEOUT_SECS")
+                crate::tunables::var("MACRDP_HEALTHCHECK_TIMEOUT_SECS")
                     .ok()
                     .as_deref(),
                 d.timeout,
             ),
             failures_before_exit: parse_u32(
-                std::env::var("MACRDP_HEALTHCHECK_FAILURES").ok().as_deref(),
+                crate::tunables::var("MACRDP_HEALTHCHECK_FAILURES")
+                    .ok()
+                    .as_deref(),
                 d.failures_before_exit,
             ),
         }
