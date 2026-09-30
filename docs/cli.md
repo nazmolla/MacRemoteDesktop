@@ -562,3 +562,14 @@ and point Wireshark at that file (Preferences → Protocols → TLS → "(Pre)-M
 filename"). Covers the TCP RDP connection and the reliable-UDP multitransport flow (rustls);
 the lossy flow's DTLS is not covered. macrdp warns loudly at startup while the var is set —
 session keys on disk break the capture's confidentiality, so use it only for protocol debugging.
+
+
+## Testing the fork's additions
+
+- Toolchain: stable Rust (`rust-toolchain.toml`), `cmake` (boring-sys). macOS-only code is `#[cfg(target_os = "macos")]` with Linux stubs.
+- **Linux (cloud):** `cargo test --locked` must pass (upstream CI does this). macOS APIs (VideoToolbox, ScreenCaptureKit, CGVirtualDisplay) are stubbed and cannot run.
+- **macOS:** `cargo test --locked`; ignored integration tests need a WindowServer / ffmpeg:
+  - `cargo test --locked --release color_roundtrip -- --ignored --nocapture` (color ΔE harness)
+  - `cargo test --locked planned_tests::<name> -- --ignored` (virtual display; **one test per process** — a second virtual display in the same process never comes online)
+  - `scripts/verify/phase1-loopback.sh` (negotiation across sizes/scales)
+- Lint: `cargo clippy --all-targets -- -D warnings` currently fails on **pre-existing upstream** code under rustc 1.98 (new lints); fork files are kept clean.
