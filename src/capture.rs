@@ -95,6 +95,12 @@ impl Default for ClickSignal {
     }
 }
 
+/// Clamp a display dimension into the u16 range RDP sizes use.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn saturate_u16(v: u32) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
+}
+
 fn pack_size(width: u16, height: u16) -> u32 {
     (u32::from(width) << 16) | u32::from(height)
 }
@@ -840,9 +846,10 @@ impl CaptureDisplay {
                 // Keep serving what the display currently shows: the last applied
                 // plan's client-pixel size, else the display's own size.
                 let (w, h) = match self.applied_plan.as_ref() {
-                    Some(p) => (p.capture_w as u16, p.capture_h as u16),
+                    Some(p) => (saturate_u16(p.capture_w), saturate_u16(p.capture_h)),
                     None => {
                         let (cur_w, cur_h) = vd.size_pts();
+                        // f64 -> u16 `as` saturates, so this cannot wrap.
                         (cur_w as u16, cur_h as u16)
                     }
                 };

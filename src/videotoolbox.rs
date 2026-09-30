@@ -1064,6 +1064,10 @@ mod ffi {
         },
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one call site per source kind; the arguments are the frame's parameters"
+    )]
     pub(super) fn encode_frame(
         guard: &SessionGuard,
         source: Source<'_>,

@@ -221,16 +221,24 @@ fn png_or_tiff_to_dib(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     let (w, h) = (img.width(), img.height());
     let row_bytes = (w as usize) * 4;
     let pixel_bytes = row_bytes * (h as usize);
+    // The DIB header stores the size as i32 width/height and a u32 byte count.
+    let (Ok(w_i32), Ok(h_i32), Ok(size_u32)) = (
+        i32::try_from(w),
+        i32::try_from(h),
+        u32::try_from(pixel_bytes),
+    ) else {
+        anyhow::bail!("image {w}x{h} is too large for a DIB");
+    };
 
     let mut out = Vec::with_capacity(40 + pixel_bytes);
     // BITMAPINFOHEADER
     out.extend_from_slice(&40u32.to_le_bytes()); // biSize
-    out.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
-    out.extend_from_slice(&(-(h as i32)).to_le_bytes()); // biHeight (negative = top-down)
+    out.extend_from_slice(&w_i32.to_le_bytes()); // biWidth
+    out.extend_from_slice(&(-h_i32).to_le_bytes()); // biHeight (negative = top-down)
     out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
     out.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
     out.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
-    out.extend_from_slice(&(pixel_bytes as u32).to_le_bytes()); // biSizeImage
+    out.extend_from_slice(&size_u32.to_le_bytes()); // biSizeImage
     out.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
     out.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
     out.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
@@ -1202,7 +1210,7 @@ impl CliprdrBackend for MacCliprdrBackend {
             // Default to text if we don't know what we asked for — matches
             // the original text-only behaviour.
             Some(Want::Text(_)) | None => {
-                if data.len() % 2 != 0 {
+                if !data.len().is_multiple_of(2) {
                     warn!(len = data.len(), "odd-length UTF-16 payload");
                 } else {
                     let mut units: Vec<u16> = data

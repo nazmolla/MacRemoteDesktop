@@ -186,93 +186,6 @@ fn is_remappable_shortcut(vk: u16) -> bool {
     )
 }
 
-#[cfg(test)]
-mod coord_tests {
-    use super::{is_remappable_shortcut, map_client_to_display};
-
-    fn approx(a: f64, b: f64) -> bool {
-        (a - b).abs() < 0.5
-    }
-
-    #[test]
-    fn curated_keys_remap_and_q_does_not() {
-        // Curated editing keys (C, V, X, A, Z, S) remap.
-        for vk in [0x08u16, 0x09, 0x07, 0x00, 0x06, 0x01] {
-            assert!(is_remappable_shortcut(vk), "vk {vk:#x} should remap");
-        }
-        // Q (0x0C) is deliberately excluded so Ctrl+Q can't become Cmd+Q.
-        assert!(!is_remappable_shortcut(0x0C));
-        // Arrows / nav keys are untouched (e.g. left arrow 0x7B).
-        assert!(!is_remappable_shortcut(0x7B));
-    }
-
-    #[test]
-    fn stretch_maps_full_frame() {
-        // 16:9 client onto a 16:10 Mac, fill mode: corners map to corners.
-        // The far corner clamps to the LAST pixel (1511,981), not the size
-        // (1512,982) — see the `s - 1` note in map_client_to_display.
-        let (mx, my) = map_client_to_display(1920, 1080, 1920, 1080, 1512.0, 982.0, false);
-        assert!(approx(mx, 1511.0) && approx(my, 981.0));
-        let (mx, my) = map_client_to_display(960, 540, 1920, 1080, 1512.0, 982.0, false);
-        assert!(approx(mx, 756.0) && approx(my, 491.0)); // center
-    }
-
-    #[test]
-    fn stretch_clamps_a_client_coordinate_past_its_own_desktop_bounds() {
-        // A 1:1 client/Mac size (the client-resolution auto-adopt path,
-        // which forces letterbox=false since there's no aspect mismatch to
-        // bar). Some clients (iOS Windows App's "Mouse pointer" mode) report
-        // y past their own negotiated desktop_h when the user keeps dragging
-        // beyond where their on-screen cursor visually stopped. Unclamped,
-        // that posts the Mac cursor below the display's real bottom edge
-        // instead of pinned at it.
-        // Clamped to the LAST ROW (504), not the height (505) — y == sh is the
-        // first row past the display, which on a headless-vd layout is dead
-        // space owned by no display, so the Dock's edge trigger never fires.
-        let (_, my) = map_client_to_display(356, 549, 944, 505, 944.0, 505.0, false);
-        assert!(approx(my, 504.0));
-        // Same one-pixel rule horizontally: x == sw would be the physical
-        // panel's first column when it's parked at (sw, 0).
-        let (mx, _) = map_client_to_display(1200, 300, 944, 505, 944.0, 505.0, false);
-        assert!(approx(mx, 943.0));
-    }
-
-    #[test]
-    fn pillarbox_when_client_wider_than_mac() {
-        // Mac 1512x982 (~1.54) into 1920x1080 (~1.78, wider) → bars left/right.
-        // content_w = 1080 * 1.54 = 1663.7, off_x = (1920-1663.7)/2 = 128.1.
-        let sw = 1512.0;
-        let sh = 982.0;
-        // center stays center
-        let (mx, my) = map_client_to_display(960, 540, 1920, 1080, sw, sh, true);
-        assert!(approx(mx, sw / 2.0) && approx(my, sh / 2.0));
-        // left bar (x=50 < off_x) clamps to the left edge
-        let (mx, _) = map_client_to_display(50, 540, 1920, 1080, sw, sh, true);
-        assert!(approx(mx, 0.0));
-        // right bar clamps to the right edge
-        let (mx, _) = map_client_to_display(1900, 540, 1920, 1080, sw, sh, true);
-        assert!(approx(mx, sw - 1.0));
-        // top/bottom fill the height → no vertical clamp at extremes
-        let (_, my) = map_client_to_display(960, 0, 1920, 1080, sw, sh, true);
-        assert!(approx(my, 0.0));
-        let (_, my) = map_client_to_display(960, 1080, 1920, 1080, sw, sh, true);
-        assert!(approx(my, sh - 1.0));
-    }
-
-    #[test]
-    fn letterbox_when_client_taller_than_mac() {
-        // Mac 1512x982 (~1.54) into 1280x1024 (1.25, taller) → bars top/bottom.
-        let sw = 1512.0;
-        let sh = 982.0;
-        let (mx, my) = map_client_to_display(640, 512, 1280, 1024, sw, sh, true);
-        assert!(approx(mx, sw / 2.0) && approx(my, sh / 2.0)); // center
-        let (_, my) = map_client_to_display(640, 5, 1280, 1024, sw, sh, true);
-        assert!(approx(my, 0.0)); // top bar clamps up
-        let (mx, _) = map_client_to_display(0, 512, 1280, 1024, sw, sh, true);
-        assert!(approx(mx, 0.0)); // full width → left edge maps to 0
-    }
-}
-
 /// When true, Cmd+Tab un-minimizes the target app's window (sets `AXMinimized`
 /// to false) instead of leaving it minimized in the Dock. Off by default, which
 /// matches native macOS Cmd+Tab (it activates the app but doesn't restore a
@@ -3417,4 +3330,91 @@ pub fn ensure_accessibility_access() -> bool {
 #[cfg(not(target_os = "macos"))]
 pub fn ensure_accessibility_access() -> bool {
     true
+}
+
+#[cfg(test)]
+mod coord_tests {
+    use super::{is_remappable_shortcut, map_client_to_display};
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 0.5
+    }
+
+    #[test]
+    fn curated_keys_remap_and_q_does_not() {
+        // Curated editing keys (C, V, X, A, Z, S) remap.
+        for vk in [0x08u16, 0x09, 0x07, 0x00, 0x06, 0x01] {
+            assert!(is_remappable_shortcut(vk), "vk {vk:#x} should remap");
+        }
+        // Q (0x0C) is deliberately excluded so Ctrl+Q can't become Cmd+Q.
+        assert!(!is_remappable_shortcut(0x0C));
+        // Arrows / nav keys are untouched (e.g. left arrow 0x7B).
+        assert!(!is_remappable_shortcut(0x7B));
+    }
+
+    #[test]
+    fn stretch_maps_full_frame() {
+        // 16:9 client onto a 16:10 Mac, fill mode: corners map to corners.
+        // The far corner clamps to the LAST pixel (1511,981), not the size
+        // (1512,982) — see the `s - 1` note in map_client_to_display.
+        let (mx, my) = map_client_to_display(1920, 1080, 1920, 1080, 1512.0, 982.0, false);
+        assert!(approx(mx, 1511.0) && approx(my, 981.0));
+        let (mx, my) = map_client_to_display(960, 540, 1920, 1080, 1512.0, 982.0, false);
+        assert!(approx(mx, 756.0) && approx(my, 491.0)); // center
+    }
+
+    #[test]
+    fn stretch_clamps_a_client_coordinate_past_its_own_desktop_bounds() {
+        // A 1:1 client/Mac size (the client-resolution auto-adopt path,
+        // which forces letterbox=false since there's no aspect mismatch to
+        // bar). Some clients (iOS Windows App's "Mouse pointer" mode) report
+        // y past their own negotiated desktop_h when the user keeps dragging
+        // beyond where their on-screen cursor visually stopped. Unclamped,
+        // that posts the Mac cursor below the display's real bottom edge
+        // instead of pinned at it.
+        // Clamped to the LAST ROW (504), not the height (505) — y == sh is the
+        // first row past the display, which on a headless-vd layout is dead
+        // space owned by no display, so the Dock's edge trigger never fires.
+        let (_, my) = map_client_to_display(356, 549, 944, 505, 944.0, 505.0, false);
+        assert!(approx(my, 504.0));
+        // Same one-pixel rule horizontally: x == sw would be the physical
+        // panel's first column when it's parked at (sw, 0).
+        let (mx, _) = map_client_to_display(1200, 300, 944, 505, 944.0, 505.0, false);
+        assert!(approx(mx, 943.0));
+    }
+
+    #[test]
+    fn pillarbox_when_client_wider_than_mac() {
+        // Mac 1512x982 (~1.54) into 1920x1080 (~1.78, wider) → bars left/right.
+        // content_w = 1080 * 1.54 = 1663.7, off_x = (1920-1663.7)/2 = 128.1.
+        let sw = 1512.0;
+        let sh = 982.0;
+        // center stays center
+        let (mx, my) = map_client_to_display(960, 540, 1920, 1080, sw, sh, true);
+        assert!(approx(mx, sw / 2.0) && approx(my, sh / 2.0));
+        // left bar (x=50 < off_x) clamps to the left edge
+        let (mx, _) = map_client_to_display(50, 540, 1920, 1080, sw, sh, true);
+        assert!(approx(mx, 0.0));
+        // right bar clamps to the right edge
+        let (mx, _) = map_client_to_display(1900, 540, 1920, 1080, sw, sh, true);
+        assert!(approx(mx, sw - 1.0));
+        // top/bottom fill the height → no vertical clamp at extremes
+        let (_, my) = map_client_to_display(960, 0, 1920, 1080, sw, sh, true);
+        assert!(approx(my, 0.0));
+        let (_, my) = map_client_to_display(960, 1080, 1920, 1080, sw, sh, true);
+        assert!(approx(my, sh - 1.0));
+    }
+
+    #[test]
+    fn letterbox_when_client_taller_than_mac() {
+        // Mac 1512x982 (~1.54) into 1280x1024 (1.25, taller) → bars top/bottom.
+        let sw = 1512.0;
+        let sh = 982.0;
+        let (mx, my) = map_client_to_display(640, 512, 1280, 1024, sw, sh, true);
+        assert!(approx(mx, sw / 2.0) && approx(my, sh / 2.0)); // center
+        let (_, my) = map_client_to_display(640, 5, 1280, 1024, sw, sh, true);
+        assert!(approx(my, 0.0)); // top bar clamps up
+        let (mx, _) = map_client_to_display(0, 512, 1280, 1024, sw, sh, true);
+        assert!(approx(mx, 0.0)); // full width → left edge maps to 0
+    }
 }

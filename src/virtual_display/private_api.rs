@@ -499,16 +499,20 @@ mod cg_modes {
     }
 }
 
+/// Active mode of `display_id` as `(points_w, points_h, pixels_w, pixels_h)`.
+#[allow(
+    dead_code,
+    reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
+)]
+pub(super) fn current_mode(display_id: u32) -> Option<(u32, u32, u32, u32)> {
+    cg_modes::current(display_id)
+}
+
 /// Select the `points_w × points_h` mode of `display_id`, 1× or Retina (2×
 /// backing), and wait until the WindowServer reports it active. Retina variants
 /// are only listed with `kCGDisplayShowDuplicateLowResolutionModes`. A switch can
 /// report success yet not take effect (observed in the HiDPI spike), so the result
 /// is verified and the configuration retried once before giving up.
-/// Active mode of `display_id` as `(points_w, points_h, pixels_w, pixels_h)`.
-pub(super) fn current_mode(display_id: u32) -> Option<(u32, u32, u32, u32)> {
-    cg_modes::current(display_id)
-}
-
 pub(super) fn select_mode(
     display_id: u32,
     points_w: u32,

@@ -1736,6 +1736,10 @@ impl Gfx {
     /// particular frame was skipped for backpressure or isn't encoded yet).
     /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
+    #[allow(
+        dead_code,
+        reason = "whole-frame entry point; capture currently calls submit_bgra_regions"
+    )]
     pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
         self.submit_bgra_regions(bgra, stride, request_keyframe, FrameRegions::Full)
     }
