@@ -36,12 +36,20 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 /// safe to use from any thread (we only ever `CFRunLoopSourceSignal` it,
 /// which Apple documents as thread-safe).
 struct SafeSourceRef(CFRunLoopSourceRef);
+// SAFETY: the only call made through this pointer from other threads is CFRunLoopSourceSignal,
+// which is thread-safe (see the struct docs).
 unsafe impl Send for SafeSourceRef {}
+// SAFETY: the only call made through this pointer from other threads is CFRunLoopSourceSignal,
+// which is thread-safe (see the struct docs).
 unsafe impl Sync for SafeSourceRef {}
 
 /// Likewise: `CFRunLoopWakeUp` is documented thread-safe.
 struct SafeRunLoop(CFRunLoop);
+// SAFETY: the only call made through this from other threads is CFRunLoopWakeUp, which is thread-
+// safe.
 unsafe impl Send for SafeRunLoop {}
+// SAFETY: the only call made through this from other threads is CFRunLoopWakeUp, which is thread-
+// safe.
 unsafe impl Sync for SafeRunLoop {}
 
 struct State {
@@ -89,8 +97,12 @@ fn ensure_started() -> &'static State {
                 cancel: None,
                 perform,
             };
+            // SAFETY: `context` is fully initialised and CF copies it during this call; `perform`
+            // is an `extern "C"` function that lives for the process.
             let src_ref = unsafe { CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &mut context) };
             assert!(!src_ref.is_null(), "CFRunLoopSourceCreate returned null");
+            // SAFETY: `runloop` is this thread's run loop and `src_ref` was checked non-null just
+            // above.
             unsafe {
                 CFRunLoopAddSource(
                     runloop.as_concrete_TypeRef(),
@@ -124,6 +136,8 @@ fn ensure_started() -> &'static State {
 pub fn submit<F: FnOnce() + Send + 'static>(f: F) {
     let state = ensure_started();
     state.queue.lock_or_recover().push(Box::new(f));
+    // SAFETY: `state.source` and `state.runloop` are leaked for the process lifetime, and
+    // CFRunLoopSourceSignal and CFRunLoopWakeUp are documented as callable from any thread.
     unsafe {
         CFRunLoopSourceSignal(state.source.0);
         CFRunLoopWakeUp(state.runloop.0.as_concrete_TypeRef());

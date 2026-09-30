@@ -24,6 +24,7 @@
 //! connects fail and we report "no card".
 
 #![allow(non_snake_case)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 // The IFDH* functions are C entry points called by slotd with pointers it
 // owns; each checks its pointers for null before use. Marking them `unsafe fn`
 // would change nothing for the C caller.
@@ -236,11 +237,14 @@ pub extern "C" fn IFDHGetCapabilities(
         if Length.is_null() {
             return IFD_COMMUNICATION_ERROR;
         }
+        // SAFETY: `Length` was checked non-null above and slotd passes a readable DWORD.
         let cap = unsafe { *Length } as usize;
         let write_bytes = |bytes: &[u8]| -> bool {
             if Value.is_null() || cap < bytes.len() {
                 return false;
             }
+            // SAFETY: `Value` is non-null and holds `cap` bytes per the IFDHandler contract, and
+            // `bytes.len()` is at most `cap` (checked above); `Length` is non-null.
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), Value, bytes.len());
                 *Length = bytes.len() as u32;
@@ -330,6 +334,9 @@ pub extern "C" fn IFDHPowerICC(
                         // MAX_ATR_SIZE (33) and `*AtrLength` is OUTPUT-only — macOS
                         // slotd passes it in as 0, so we must NOT treat it as an input
                         // capacity bound. We already guard atr.len() <= MAX_ATR above.
+                        // SAFETY: per the IFDHandler v3.0 contract `Atr` is a MAX_ATR_SIZE (33)
+                        // buffer, both pointers were checked non-null above, and `atr.len()` is at
+                        // most MAX_ATR.
                         unsafe {
                             std::ptr::copy_nonoverlapping(atr.as_ptr(), Atr, atr.len());
                             *AtrLength = atr.len() as u32;
@@ -339,6 +346,7 @@ pub extern "C" fn IFDHPowerICC(
                     _ => {
                         s.atr.clear();
                         if !AtrLength.is_null() {
+                            // SAFETY: `AtrLength` is non-null (checked on the line above).
                             unsafe { *AtrLength = 0 };
                         }
                         IFD_ERROR_POWER_ACTION
@@ -351,6 +359,7 @@ pub extern "C" fn IFDHPowerICC(
                 });
                 s.atr.clear();
                 if !AtrLength.is_null() {
+                    // SAFETY: `AtrLength` is non-null (checked on the line above).
                     unsafe { *AtrLength = 0 };
                 }
                 IFD_SUCCESS
@@ -377,11 +386,14 @@ pub extern "C" fn IFDHTransmitToICC(
         }
         // Caller's recv-buffer capacity; forwarded so the server requests exactly
         // this much from the card (extended responses need more than a fixed cap).
+        // SAFETY: `RxLength` was checked non-null above and slotd passes a readable DWORD.
         let recv_cap: u32 = unsafe { *RxLength };
         let cap = recv_cap as usize;
         let apdu: Vec<u8> = if TxLength == 0 || TxBuffer.is_null() {
             Vec::new()
         } else {
+            // SAFETY: `TxBuffer` is non-null and, per the IFDHandler contract, points at `TxLength`
+            // readable bytes for the duration of the call.
             unsafe { std::slice::from_raw_parts(TxBuffer, TxLength as usize).to_vec() }
         };
 
@@ -406,6 +418,9 @@ pub extern "C" fn IFDHTransmitToICC(
                 if RxBuffer.is_null() || cap < resp.len() {
                     return IFD_COMMUNICATION_ERROR;
                 }
+                // SAFETY: `RxBuffer` is non-null and holds `cap` bytes per the contract, and
+                // `resp.len()` is at most `cap` (checked above, and `read_vec` capped it too);
+                // `RxLength` is non-null; `RecvPci` is written only when non-null.
                 unsafe {
                     std::ptr::copy_nonoverlapping(resp.as_ptr(), RxBuffer, resp.len());
                     *RxLength = resp.len() as u32;
@@ -431,6 +446,7 @@ pub extern "C" fn IFDHControl(
     pdwBytesReturned: PDword,
 ) -> ResponseCode {
     if !pdwBytesReturned.is_null() {
+        // SAFETY: `pdwBytesReturned` is non-null (checked on the line above).
         unsafe { *pdwBytesReturned = 0 };
     }
     IFD_NOT_SUPPORTED

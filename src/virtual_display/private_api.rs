@@ -73,6 +73,9 @@ extern "C" {
 /// mechanism with a longer track record, not a drop-in replacement for this
 /// function's shape.
 pub(super) fn screen_is_locked() -> Option<bool> {
+    // SAFETY: `name` is a NUL-terminated string that outlives dlsym; the symbol is only called when
+    // found, with the no-argument signature it has; the returned dictionary is checked for null,
+    // read with a CFString key that outlives the lookup, and released once.
     unsafe {
         let rtld_default = -2isize as *mut c_void;
         let name = CString::new("CGSessionCopyCurrentDictionary").unwrap();
@@ -104,6 +107,8 @@ pub(super) struct DisplayEnabler(unsafe extern "C" fn(*mut c_void, CGDirectDispl
 
 impl DisplayEnabler {
     pub(super) fn load() -> Result<Self> {
+        // SAFETY: `name` is a NUL-terminated string that outlives dlsym, and the pointer is only
+        // transmuted to the function type after a null check.
         unsafe {
             let rtld_default = -2isize as *mut c_void;
             let name = CString::new("CGSConfigureDisplayEnabled").unwrap();
@@ -126,6 +131,8 @@ impl DisplayEnabler {
     /// `CGDisplay::begin_configuration` — its layout is `*mut c_void` in
     /// the core-graphics crate, which is what the FFI expects.
     pub(super) fn set(&self, config: *mut c_void, display: u32, enabled: bool) -> Result<()> {
+        // SAFETY: `self.0` was resolved as CGSConfigureDisplayEnabled, and `config` is the open
+        // configuration the caller got from begin_configuration.
         let err = unsafe { (self.0)(config, display, enabled) };
         if err == 0 {
             Ok(())
@@ -234,11 +241,16 @@ fn apply_single_mode_hidpi(
     extern "C" {
         fn CGRestorePermanentDisplayConfiguration();
     }
+    // SAFETY: CGRestorePermanentDisplayConfiguration takes no arguments.
     unsafe { CGRestorePermanentDisplayConfiguration() };
     let settings_class = class_required("CGVirtualDisplaySettings")?;
     let mode_class = class_required("CGVirtualDisplayMode")?;
     let nsarray_class = class_required("NSArray")?;
 
+    // SAFETY: the classes were resolved by name above and each message uses the selector and
+    // argument types the class implements (see the BetterDisplay reference in docs/macos-
+    // gotchas.md); every init result is checked for nil before use, and `display` is the live
+    // CGVirtualDisplay the caller owns.
     unsafe {
         let mode: *mut AnyObject = msg_send![mode_class, alloc];
         let mode: *mut AnyObject = msg_send![
@@ -278,6 +290,8 @@ fn apply_single_mode_hidpi(
 impl Drop for Handle {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            // SAFETY: `raw` is the non-null CGVirtualDisplay this handle owns; it is released once
+            // and then nulled.
             unsafe {
                 let _: () = msg_send![self.raw, release];
             }
@@ -299,6 +313,10 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
 
     let ns_name = NSString::from_str(name);
 
+    // SAFETY: the classes were resolved by name above and each message uses the selector and
+    // argument types the class implements; every alloc/init result is checked for nil before use,
+    // `ns_name` outlives the setter, and `display` is released on each failure path before
+    // returning.
     unsafe {
         // 1. Descriptor: alloc/init + property setters. Every property
         //    is cosmetic except the pixel dimensions; the rest just
@@ -432,6 +450,8 @@ mod cg_modes {
     }
 
     pub fn current(display: u32) -> Option<Dims> {
+        // SAFETY: the +1 mode from CGDisplayCopyDisplayMode is checked for null, read, and released
+        // once.
         unsafe {
             let m = CGDisplayCopyDisplayMode(display);
             if m.is_null() {
@@ -444,6 +464,8 @@ mod cg_modes {
     }
 
     pub fn list(display: u32, options: CFDictionaryRef) -> Vec<Dims> {
+        // SAFETY: the +1 array is checked for null; each element is borrowed from it (indices below
+        // its count) and read while the array is alive; the array is released once.
         unsafe {
             let arr = CGDisplayCopyAllDisplayModes(display, options);
             if arr.is_null() {
@@ -460,6 +482,9 @@ mod cg_modes {
     /// Find a mode with exactly `want` dims and switch to it (session-scoped).
     /// `Ok(false)` = no such mode offered; `Err(code)` = a CG call failed.
     pub fn switch_to(display: u32, options: CFDictionaryRef, want: Dims) -> Result<bool, i32> {
+        // SAFETY: the +1 array is checked for null and every mode read from it is borrowed while it
+        // is alive; `cfg` is a valid out-pointer and a configuration that was begun is always
+        // completed; the array is released once at the end.
         unsafe {
             let arr = CGDisplayCopyAllDisplayModes(display, options);
             if arr.is_null() {
@@ -529,6 +554,8 @@ pub(super) fn select_mode(
         return Ok(want);
     }
     let opts = CFDictionary::from_CFType_pairs(&[(
+        // SAFETY: `kCGDisplayShowDuplicateLowResolutionModes` is a static CFString constant, so a
+        // get-rule wrap is balanced.
         unsafe { CFString::wrap_under_get_rule(kCGDisplayShowDuplicateLowResolutionModes) },
         CFBoolean::true_value(),
     )]);

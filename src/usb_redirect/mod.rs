@@ -262,6 +262,7 @@ mod imp {
     /// failed. Must run inside the signed+provisioned app bundle or the managed
     /// entitlement isn't honored.
     pub fn run_spike() -> i32 {
+        // SAFETY: the spike entry point takes no arguments and returns a status code.
         unsafe { macrdp_usb_spike_run() as i32 }
     }
 
@@ -301,6 +302,8 @@ mod imp {
         // points at 8 readable bytes (the ObjC side's stack SETUP packet).
         let ctx = unsafe { &*(ctx as *const CallbackCtx) };
         let mut setup = [0u8; 8];
+        // SAFETY: `setup8` points at 8 readable bytes (the ObjC side's SETUP packet) and `setup`
+        // has room for 8.
         unsafe { std::ptr::copy_nonoverlapping(setup8, setup.as_mut_ptr(), 8) };
         let _ = ctx.tx.send(TransferReq::ControlIn {
             token,
@@ -320,8 +323,12 @@ mod imp {
         // bytes; for a payload request `out_data` points at `out_len` readable bytes.
         let ctx = unsafe { &*(ctx as *const CallbackCtx) };
         let mut setup = [0u8; 8];
+        // SAFETY: `setup8` points at 8 readable bytes (the ObjC side's SETUP packet) and `setup`
+        // has room for 8.
         unsafe { std::ptr::copy_nonoverlapping(setup8, setup.as_mut_ptr(), 8) };
         let data = if !out_data.is_null() && out_len > 0 {
+            // SAFETY: `out_data` is non-null and points at `out_len` readable bytes owned by the
+            // ObjC side for the duration of this callback; they are copied out before returning.
             unsafe { std::slice::from_raw_parts(out_data, out_len as usize).to_vec() }
         } else {
             Vec::new()
@@ -342,6 +349,8 @@ mod imp {
         let ctx = unsafe { &*(ctx as *const CallbackCtx) };
         let is_in = is_in != 0;
         let data = if !is_in && !out_data.is_null() && out_len > 0 {
+            // SAFETY: `out_data` is non-null and points at `out_len` readable bytes owned by the
+            // ObjC side for the duration of this callback; they are copied out before returning.
             unsafe { std::slice::from_raw_parts(out_data, out_len as usize).to_vec() }
         } else {
             Vec::new()
@@ -362,12 +371,19 @@ mod imp {
     /// serial queue (Send for the move into tasks, Sync for `Arc` sharing between
     /// them; `destroy` needs `&mut`/drop, so it can't race the shared calls).
     struct ControllerHandle(*mut c_void);
+    // SAFETY: shared calls only enqueue work on the controller's serial queue, and destroy needs
+    // the last owner (see the struct docs).
     unsafe impl Send for ControllerHandle {}
+    // SAFETY: shared calls only enqueue work on the controller's serial queue, and destroy needs
+    // the last owner (see the struct docs).
     unsafe impl Sync for ControllerHandle {}
     impl ControllerHandle {
         /// Complete an IN transfer (control-IN or bulk-IN): `bytes` are copied into
         /// the kernel's transfer buffer.
         fn complete_in(&self, token: u64, bytes: &[u8], status: i32) {
+            // SAFETY: `self.0` is a live controller (destroyed only when the last handle drops) and
+            // `bytes` is readable for the length passed; the ObjC side copies them before
+            // returning.
             unsafe {
                 macrdp_usb_complete_transfer(
                     self.0,
@@ -382,11 +398,15 @@ mod imp {
         /// Complete an OUT transfer: no data to copy back; `moved` is the number of
         /// bytes the device accepted (reported as the transfer length).
         fn complete_out(&self, token: u64, moved: u32, status: i32) {
+            // SAFETY: `self.0` is a live controller; a null buffer with an OUT completion is the
+            // documented form.
             unsafe { macrdp_usb_complete_transfer(self.0, token, std::ptr::null(), moved, status) };
         }
     }
     impl Drop for ControllerHandle {
         fn drop(&mut self) {
+            // SAFETY: this is the last handle to the controller, so nothing else can use it after
+            // destroy.
             unsafe { macrdp_usb_controller_destroy(self.0) };
         }
     }
@@ -408,6 +428,8 @@ mod imp {
         // which the controller destroy doesn't promise; not worth the risk.
         let ctx = Box::into_raw(Box::new(CallbackCtx { tx }));
         let mut err: c_int = 0;
+        // SAFETY: the three callbacks are `extern "C"` functions with the signatures the ObjC side
+        // expects; `ctx` is leaked, so it outlives every callback; `err` is a valid out-pointer.
         let raw = unsafe {
             macrdp_usb_controller_create(
                 control_in_cb,

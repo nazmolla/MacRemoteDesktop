@@ -117,6 +117,8 @@ mod macos {
         /// active input source.
         pub fn resolve(spec: &str) -> Option<KeyboardLayout> {
             let _tis = tis_lock();
+            // SAFETY: LMGetKbdType takes no arguments and only reads the current keyboard type; TIS
+            // access is serialised by `_tis`.
             let kbd_type = u32::from(unsafe { LMGetKbdType() });
             let spec = spec.trim();
 
@@ -163,7 +165,12 @@ mod macos {
         /// the only correct reference.
         pub fn current() -> Option<KeyboardLayout> {
             let _tis = tis_lock();
+            // SAFETY: LMGetKbdType takes no arguments and only reads the current keyboard type; TIS
+            // access is serialised by `_tis`.
             let kbd_type = u32::from(unsafe { LMGetKbdType() });
+            // SAFETY: TISCopyCurrentKeyboardLayoutInputSource returns a +1 reference that is
+            // checked for null and released once below; `uchr_from_source` retains its own copy of
+            // the layout data first. TIS access is serialised by `_tis`.
             unsafe {
                 let source = TISCopyCurrentKeyboardLayoutInputSource();
                 if source.is_null() {
@@ -241,6 +248,8 @@ mod macos {
             option: bool,
             caps: bool,
         ) -> Option<String> {
+            // SAFETY: `uchr` is a retained CFData owned by this layout, so its byte pointer is
+            // valid for as long as `self`.
             let ptr = unsafe { CFDataGetBytePtr(self.uchr.as_concrete_TypeRef() as *const c_void) };
             if ptr.is_null() {
                 return None;
@@ -258,6 +267,9 @@ mod macos {
             let mut buf = [0u16; 8];
             let mut actual = 0usize;
             let _tis = tis_lock();
+            // SAFETY: `ptr` points at the retained UCKeyboardLayout data in `self.uchr`;
+            // `dead_key_state`, `actual` and `buf` are valid for writes, and the length passed is
+            // `buf`'s length. Serialised by `_tis`.
             let status = unsafe {
                 UCKeyTranslate(
                     ptr as *const c_void,
@@ -294,6 +306,9 @@ mod macos {
     }
 
     fn source_data_for_id(id: &str) -> Option<CFData> {
+        // SAFETY: `kTISPropertyInputSourceID` is a static CFString constant; the dictionary lives
+        // across the call; the +1 list from TISCreateInputSourceList is checked for null and
+        // released once, and the index read is below its count.
         unsafe {
             let key = CFString::wrap_under_get_rule(kTISPropertyInputSourceID);
             let value = CFString::new(id);
@@ -314,6 +329,8 @@ mod macos {
     }
 
     fn source_data_for_language(lang: &str) -> Option<CFData> {
+        // SAFETY: `cflang` outlives the call; the +1 source from TISCopyInputSourceForLanguage is
+        // checked for null and released once after its data is retained.
         unsafe {
             let cflang = CFString::new(lang);
             let source = TISCopyInputSourceForLanguage(cflang.as_concrete_TypeRef());

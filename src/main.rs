@@ -7,6 +7,8 @@
     not(target_os = "macos"),
     allow(dead_code, unused_imports, unused_variables, unused_mut)
 )]
+// Every `unsafe` block states why it is sound (review finding Q2).
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 mod aac;
 mod audio;
@@ -1518,6 +1520,8 @@ fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
     // the attempt entirely while Caps Lock is on — this check runs before
     // anything is typed, so no submission budget is spent, and the next
     // reconnect tries again for free once Caps Lock is off.
+    // SAFETY: CGEventSourceFlagsState only reads the modifier state of a system event source; it
+    // takes an enum by value and has no pointer arguments.
     let caps_lock_on = unsafe { CGEventSourceFlagsState(CGEventSourceStateID::HIDSystemState) }
         .contains(CGEventFlags::CGEventFlagAlphaShift);
     if caps_lock_on {
@@ -2187,6 +2191,8 @@ fn boost_thread_qos() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: c_uint, relative_priority: c_int) -> c_int;
     }
+    // SAFETY: pthread_set_qos_class_self_np only changes the calling thread's QoS class and takes
+    // plain integers.
     unsafe {
         let _ = pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
     }

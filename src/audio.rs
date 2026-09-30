@@ -315,6 +315,8 @@ fn boost_audio_qos() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: c_uint, relative_priority: c_int) -> c_int;
     }
+    // SAFETY: pthread_set_qos_class_self_np only changes the calling thread's QoS class and takes
+    // plain integers.
     unsafe {
         let _ = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     }

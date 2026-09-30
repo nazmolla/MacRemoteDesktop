@@ -67,6 +67,8 @@ type SLSGetGlobalCursorDataFn = unsafe extern "C" fn(
 /// hiding it, etc.).
 fn resolve<T: Copy>(name: &str) -> Option<T> {
     let cname = CString::new(name).ok()?;
+    // SAFETY: `cname` is a NUL-terminated string that outlives the call; dlsym with RTLD_DEFAULT
+    // only looks the name up.
     let sym = unsafe { dlsym(RTLD_DEFAULT, cname.as_ptr()) };
     if sym.is_null() {
         return None;
@@ -102,6 +104,9 @@ pub fn copy_current_system_cursor() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
     let size_fn = cursor_data_size_fn()?;
     let data_fn = cursor_data_fn()?;
 
+    // SAFETY: the three function pointers were resolved by name with the signatures SkyLight
+    // exports; every out-pointer is a local that outlives the call, and `buf` is allocated with
+    // exactly `data_size` bytes, which is the capacity passed in `size_inout`.
     unsafe {
         let cid = main_conn();
 

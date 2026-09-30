@@ -386,6 +386,7 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
         .filter_map(|p| {
             let s = p.to_str()?;
             let ns = NSString::from_str(s);
+            // SAFETY: `ns` is a valid NSString for the duration of the call.
             unsafe { NSURL::fileURLWithPath(&ns) }.into()
         })
         .collect();
@@ -404,6 +405,8 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
     // (NSPasteboard is not thread-safe). The changeCount read stays inside the
     // guard so no other writer can bump it between our write and the capture.
     let _pb_guard = crate::clipboard::pasteboard_guard();
+    // SAFETY: NSPasteboard is only touched while `_pb_guard` is held, which serialises every
+    // pasteboard access in the process; `array` is a valid NSArray of NSURLs.
     let new_change_count = unsafe {
         let pb = NSPasteboard::generalPasteboard();
         pb.clearContents();
