@@ -21,6 +21,10 @@ pub struct ClientAdvert {
 }
 
 impl ClientAdvert {
+    #[allow(
+        dead_code,
+        reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
+    )]
     pub fn platform(&self) -> ClientPlatform {
         match self.platform.load(Ordering::Relaxed) {
             1 => ClientPlatform::Windows,

@@ -85,6 +85,17 @@ mod macos {
     const MOD_CAPS: u32 = 0x04;
     const MOD_OPTION: u32 = 0x08;
 
+    /// Serialises every Text Input Sources and UCKeyTranslate call. These
+    /// Carbon APIs are not documented as thread-safe, and concurrent calls
+    /// (the input thread translating keys while auto-unlock builds its reverse
+    /// map, or the test harness running layout tests in parallel) aborted the
+    /// process intermittently with no panic message.
+    fn tis_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A resolved keyboard layout we can translate keystrokes against.
     /// `uchr` owns the `UCKeyboardLayout` byte buffer (a retained `CFData`), so
     /// it outlives the input source it came from; `dead_key_state` carries
@@ -105,6 +116,7 @@ mod macos {
         /// (and warns) if nothing matched, so callers fall back to the Mac's
         /// active input source.
         pub fn resolve(spec: &str) -> Option<KeyboardLayout> {
+            let _tis = tis_lock();
             let kbd_type = u32::from(unsafe { LMGetKbdType() });
             let spec = spec.trim();
 
@@ -150,6 +162,7 @@ mod macos {
         /// produce the right characters *on this Mac*, so the active layout is
         /// the only correct reference.
         pub fn current() -> Option<KeyboardLayout> {
+            let _tis = tis_lock();
             let kbd_type = u32::from(unsafe { LMGetKbdType() });
             unsafe {
                 let source = TISCopyCurrentKeyboardLayoutInputSource();
@@ -244,6 +257,7 @@ mod macos {
             }
             let mut buf = [0u16; 8];
             let mut actual = 0usize;
+            let _tis = tis_lock();
             let status = unsafe {
                 UCKeyTranslate(
                     ptr as *const c_void,

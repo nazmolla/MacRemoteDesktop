@@ -191,6 +191,10 @@ mod macos {
 
         /// Create a display sized and scaled per a negotiated [`DisplayPlan`]
         /// (Retina twin selected when `plan.hidpi`, sRGB primaries always).
+        #[allow(
+            dead_code,
+            reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
+        )]
         pub fn new_planned(plan: &crate::negotiator::display::DisplayPlan) -> Result<Self> {
             let mut vd = Self::new(plan.points_w, plan.points_h, 60)?;
             vd.apply_plan(plan)?;
@@ -235,6 +239,10 @@ mod macos {
         }
 
         /// The display's framebuffer size in pixels (2× points in Retina modes).
+        #[allow(
+            dead_code,
+            reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
+        )]
         pub fn backing_pixels(&self) -> (u32, u32) {
             // Not CGDisplayPixelsWide: it reports points for Retina modes.
             private_api::current_mode(self.display_id)

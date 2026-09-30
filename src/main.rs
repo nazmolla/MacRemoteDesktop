@@ -2830,22 +2830,17 @@ async fn async_main() -> Result<()> {
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("shutdown signal received — exiting");
-        if let Some(ovr) = cleanup_detach.lock_or_recover().take() {
-            drop(ovr); // re-enables the built-in display
-        }
-        if let Some(ovr) = cleanup_capture.lock_or_recover().take() {
-            drop(ovr); // releases captured displays
-        }
-        if let Some(ovr) = cleanup_shield.lock_or_recover().take() {
-            drop(ovr); // lowers the shield windows
-        }
-        if let Some(ovr) = cleanup_primary.lock_or_recover().take() {
-            drop(ovr); // restores display arrangement
-        }
-        // Lazy paste leaves NSFilePresenters registered + a temp dir on
-        // disk + URLs on NSPasteboard. Process::exit skips Drop on the
-        // cliprdr backend, so flush that state explicitly. No-op if
-        // MacCliprdr was never constructed.
+        // Taking each guard out of its slot drops it right here, in this
+        // order; their Drop impls do the restoring on macOS (the non-macOS
+        // stubs are empty).
+        let _ = cleanup_detach.lock_or_recover().take(); // re-enables the built-in display
+        let _ = cleanup_capture.lock_or_recover().take(); // releases captured displays
+        let _ = cleanup_shield.lock_or_recover().take(); // lowers the shield windows
+        let _ = cleanup_primary.lock_or_recover().take(); // restores display arrangement
+                                                          // Lazy paste leaves NSFilePresenters registered + a temp dir on
+                                                          // disk + URLs on NSPasteboard. Process::exit skips Drop on the
+                                                          // cliprdr backend, so flush that state explicitly. No-op if
+                                                          // MacCliprdr was never constructed.
         #[cfg(target_os = "macos")]
         file_promise_lazy::shutdown_cleanup();
         // RDPDR NFS volumes are unmounted on disconnect by Surface::Drop, but
