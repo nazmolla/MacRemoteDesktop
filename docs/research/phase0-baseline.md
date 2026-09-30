@@ -21,3 +21,11 @@ and thin UI lines look smeared today.
 **Finding (Phase 2):** an odd frame height (legal in RDP; only widths must be even) loses
 its last pixel row — `1714×1287` decodes as `1714×1286`, because the encoder is handed
 the odd size. Production must pad to even/16 and let the client crop.
+
+## Color — AVC444 v1 (Phase 2a, 2026-09-30)
+Same harness, 1920×1080, main + auxiliary H.264 streams from the production VideoToolbox encoder, recombined after ffmpeg decode.
+| | Patch mean ΔE00 | Patch max ΔE00 | Chroma-edge mean ΔE00 |
+|---|---|---|---|
+| AVC420 (baseline) | 0.239 | 0.615 | 31.900 |
+| **AVC444 v1** | 0.238 | 0.615 | **0.180** |
+Command: `cargo test --locked --release color_roundtrip_avc444 -- --ignored --nocapture`

@@ -166,7 +166,137 @@ impl WireFormat {
 
 /// Per-connection state, shared between the `Gfx` factory/handle (capture
 /// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
+/// Which part of the client surface a submitted frame updates (MS-RDPEGFX
+/// AVC420 region rects). Areas outside the regions keep what the client has —
+/// which is what lets lossless refinement survive later frames (spec §8.3).
+#[derive(Debug, Clone)]
+pub(crate) enum FrameRegions {
+    /// Whole surface.
+    Full,
+    /// Only these rectangles changed.
+    Rects(Vec<crate::refine::Rect>),
+    /// Same pixels as the previous submit (flush frames): reuse its regions.
+    SameAsLast,
+}
+
+/// A tile unchanged this long is re-sent losslessly (spec §8.3: ~150–300 ms).
+const REFINE_IDLE: std::time::Duration = std::time::Duration::from_millis(200);
+/// Tiles per refinement tick (64×64 each) — bounds one tick's burst.
+const REFINE_BUDGET_TILES: usize = 48;
+
+/// Regions submitted but not yet carried by an encoded frame. A dropped
+/// capture's change must ride on the next encoded frame (review I1).
+#[derive(Debug, Clone, Default)]
+enum RegionDebt {
+    #[default]
+    None,
+    Full,
+    Rects(Vec<crate::refine::Rect>),
+}
+
+impl RegionDebt {
+    /// Add a frame's regions; `None` = whole surface.
+    fn add(&mut self, rects: Option<&[crate::refine::Rect]>) {
+        *self = match (std::mem::take(self), rects) {
+            (Self::Full, _) | (_, None) => Self::Full,
+            (Self::None, Some(r)) => Self::Rects(r.to_vec()),
+            (Self::Rects(mut v), Some(r)) => {
+                v.extend_from_slice(r);
+                if v.len() > 4 * MAX_AVC_REGIONS {
+                    Self::Full
+                } else {
+                    Self::Rects(v)
+                }
+            }
+        };
+    }
+
+    /// Regions for the frame being encoded now (`None` = whole surface).
+    fn take(&mut self) -> Option<Vec<crate::refine::Rect>> {
+        match std::mem::take(self) {
+            Self::Full => None,
+            Self::None => Some(Vec::new()),
+            Self::Rects(v) => Some(v),
+        }
+    }
+}
+
+/// Cap before collapsing a frame's regions into their bounding box.
+const MAX_AVC_REGIONS: usize = 16;
+
+/// Reused planes for AVC444: full YUV444, then the main and auxiliary I420
+/// views (MS-RDPEGFX §3.3.8.3.2 v1 layout, see `crate::avc444`).
+#[derive(Default)]
+struct Avc444Buffers {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+    main: [Vec<u8>; 3],
+    aux: [Vec<u8>; 3],
+}
+
+impl Avc444Buffers {
+    /// Convert `bgra` (`width×height`) and split it; the encode height is
+    /// `height` rounded up to even (last row replicated).
+    fn fill(&mut self, bgra: &[u8], stride: usize, width: usize, height: usize) {
+        let he = height + (height & 1);
+        let (cw, ch) = (width / 2, he / 2);
+        let ah = crate::avc444::padded_aux_height(he);
+        for p in [&mut self.y, &mut self.u, &mut self.v] {
+            p.resize(width * he, 0);
+        }
+        crate::avc444::bgra_to_yuv444_full_bt709_into(
+            bgra,
+            stride,
+            width,
+            height,
+            &mut self.y,
+            &mut self.u,
+            &mut self.v,
+            width,
+        );
+        if he != height {
+            for p in [&mut self.y, &mut self.u, &mut self.v] {
+                p.copy_within(width * (height - 1)..width * height, width * height);
+            }
+        }
+        let sizes = [(width * he), (cw * ch), (cw * ch)];
+        let aux_sizes = [(width * ah), (cw * ah / 2), (cw * ah / 2)];
+        for (p, n) in self.main.iter_mut().zip(sizes) {
+            p.resize(n, 0);
+        }
+        for (p, n) in self.aux.iter_mut().zip(aux_sizes) {
+            p.resize(n, 0);
+        }
+        let [my, mu, mv] = &mut self.main;
+        let [ay, au, av] = &mut self.aux;
+        crate::avc444::split_yuv444_to_yuv420_v1(
+            &self.y, &self.u, &self.v, width, width, width, my, mu, mv, width, cw, cw, ay, au, av,
+            width, cw, cw, width, he,
+        );
+    }
+}
+
 struct ConnectionContext {
+    /// Client negotiated AVC444 (spec §8.2 codec ladder): frames are encoded as
+    /// a main + auxiliary H.264 pair and shipped with `send_avc444_frame`.
+    avc444: bool,
+    /// Encoder for the AVC444 auxiliary (chroma-detail) view.
+    aux_encoder: Option<Encoder>,
+    avc444_buf: Avc444Buffers,
+    /// Regions for frames submitted but not yet shipped, keyed by encoder PTS.
+    /// `None` = whole surface.
+    region_queue: std::collections::VecDeque<(i64, Option<Vec<crate::refine::Rect>>)>,
+    /// Regions of the last submitted frame (for `FrameRegions::SameAsLast`).
+    last_regions: Option<Vec<crate::refine::Rect>>,
+    /// Regions of dropped captures still owed to the client.
+    region_debt: RegionDebt,
+    /// Rate limit for refinement ticks piggybacking on submits (review I4).
+    last_refine_at: Instant,
+    /// Tiles changed by AVC frames and not yet re-sent losslessly.
+    refine: crate::refine::Tracker,
+    /// Per-connection ClearCodec encoder (its glyph cache mirrors the client's).
+    clearcodec: ironrdp_graphics::clearcodec::ClearCodecEncoder,
     server_handle: GfxServerHandle,
     encoder: Option<Encoder>,
     surface_id: Option<u16>,
@@ -1606,6 +1736,17 @@ impl Gfx {
     /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
     pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
+        self.submit_bgra_regions(bgra, stride, request_keyframe, FrameRegions::Full)
+    }
+
+    /// [`Self::submit_bgra`] with the surface regions this frame updates.
+    pub(crate) fn submit_bgra_regions(
+        &self,
+        bgra: &[u8],
+        stride: usize,
+        request_keyframe: bool,
+        regions: FrameRegions,
+    ) -> Result<bool> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
         // pulls each encoded frame off VT's output channel and ships it the
@@ -1622,6 +1763,16 @@ impl Gfx {
             let Some(ctx) = guard.as_mut() else {
                 return Ok(false); // no active connection
             };
+            // Record this capture's regions before any drop decision, so a
+            // dropped frame's change rides on the next encoded one (review I1).
+            match &regions {
+                FrameRegions::Full => ctx.region_debt.add(None),
+                FrameRegions::Rects(r) => ctx.region_debt.add(Some(r)),
+                FrameRegions::SameAsLast => {
+                    let last = ctx.last_regions.clone();
+                    ctx.region_debt.add(last.as_deref());
+                }
+            }
             if !ctx.is_ready {
                 return Ok(false); // channel not negotiated yet (or non-EGFX client)
             }
@@ -2008,13 +2159,34 @@ impl Gfx {
                 if let Err(e) = encoder.set_bitrate(bps) {
                     trace!(error = ?e, bps, "adaptive set_bitrate failed");
                 }
+                if let Some(aux) = ctx.aux_encoder.as_ref() {
+                    let _ = aux.set_bitrate(bps);
+                }
             }
             if let Some(frames) = adaptive.keyframe_frames {
                 if let Err(e) = encoder.set_keyframe_interval(frames) {
                     trace!(error = ?e, frames, "adaptive set_keyframe_interval failed");
                 }
             }
-            encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            let pts = encoder.next_pts();
+            match ctx.aux_encoder.as_mut() {
+                Some(aux) if ctx.avc444 => {
+                    let (w, h) = (usize::from(ctx.dims.0), usize::from(ctx.dims.1));
+                    ctx.avc444_buf.fill(bgra, stride, w, h);
+                    let [my, mu, mv] = &ctx.avc444_buf.main;
+                    let [ay, au, av] = &ctx.avc444_buf.aux;
+                    encoder.encode_yuv420(my, mu, mv, force_keyframe)?;
+                    aux.encode_yuv420(ay, au, av, force_keyframe)?;
+                }
+                _ => encoder.encode_bgra(bgra, stride, force_keyframe)?,
+            }
+            let debt = ctx.region_debt.take();
+            let resolved = if force_keyframe { None } else { debt };
+            ctx.last_regions = resolved.clone();
+            ctx.region_queue.push_back((pts, resolved));
+            while ctx.region_queue.len() > 128 {
+                ctx.region_queue.pop_front();
+            }
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
         Ok(true)
@@ -2273,15 +2445,43 @@ impl Gfx {
     /// capture tick. Bumps `shipped` per frame so the capture thread's
     /// drop-to-latest throttle can bound the pipeline depth. Exits when the
     /// channel closes (encoder dropped on connection teardown).
-    fn ship_loop(&self, rx: std::sync::mpsc::Receiver<EncodedFrame>, shipped: Arc<AtomicU64>) {
+    fn ship_loop(
+        &self,
+        rx: std::sync::mpsc::Receiver<EncodedFrame>,
+        aux_rx: Option<std::sync::mpsc::Receiver<EncodedFrame>>,
+        shipped: Arc<AtomicU64>,
+    ) {
+        let mut aux_ahead: Option<EncodedFrame> = None;
         while let Ok(frame) = rx.recv() {
             // Sweep up any others VT delivered alongside it (keeps order).
             let mut frames = vec![frame];
             while let Ok(f) = rx.try_recv() {
                 frames.push(f);
             }
+            // Pair each main frame with the auxiliary frame of the same PTS; a
+            // missing one (VT drop) ships the main view alone as AVC420.
+            let aux: Vec<Option<EncodedFrame>> = match aux_rx.as_ref() {
+                None => vec![None; frames.len()],
+                Some(arx) => frames
+                    .iter()
+                    .map(|f| loop {
+                        let next = aux_ahead
+                            .take()
+                            .or_else(|| arx.recv_timeout(Duration::from_millis(250)).ok());
+                        match next {
+                            Some(a) if a.pts < f.pts => continue,
+                            Some(a) if a.pts == f.pts => break Some(a),
+                            Some(a) => {
+                                aux_ahead = Some(a);
+                                break None;
+                            }
+                            None => break None,
+                        }
+                    })
+                    .collect(),
+            };
             let n = frames.len() as u64;
-            if let Err(e) = self.ship_frames(&frames) {
+            if let Err(e) = self.ship_frames(&frames, &aux) {
                 warn!(error = ?e, "EGFX ship_frames failed");
             }
             shipped.fetch_add(n, Ordering::Relaxed);
@@ -2365,6 +2565,26 @@ impl Gfx {
                 .take_receiver()
                 .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
             ctx.encoder = Some(encoder);
+            let aux_rx = if ctx.avc444 {
+                let he = height + (height & 1);
+                let mut aux = Encoder::new(
+                    width,
+                    crate::avc444::padded_aux_height(usize::from(he)) as u16,
+                    self.fps,
+                    ctx.adaptive_target_bps,
+                    self.keyframe_secs,
+                )?;
+                let aux_rx = aux
+                    .take_receiver()
+                    .ok_or_else(|| anyhow!("EGFX: aux encoder receiver already taken"))?;
+                ctx.aux_encoder = Some(aux);
+                Some(aux_rx)
+            } else {
+                ctx.aux_encoder = None;
+                None
+            };
+            ctx.region_queue.clear();
+            ctx.region_debt = RegionDebt::Full;
             // Fresh throttle counters for this connection.
             ctx.submitted.store(0, Ordering::Relaxed);
             ctx.shipped.store(0, Ordering::Relaxed);
@@ -2372,7 +2592,7 @@ impl Gfx {
             let shipped = ctx.shipped.clone();
             std::thread::Builder::new()
                 .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped))
+                .spawn(move || gfx.ship_loop(rx, aux_rx, shipped))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
             info!("EGFX VideoToolbox encoder initialized + ship thread started");
         }
@@ -2494,6 +2714,135 @@ impl Gfx {
     /// client-requested resize/reactivation window where the client expects
     /// a graphics reset — the same position it occupies on every fresh
     /// connection.
+    /// Whether lossless refinement still has tiles to send (capture keeps
+    /// ticking while this is true).
+    pub(crate) fn refine_pending(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| ctx.refine.has_pending())
+    }
+
+    /// Re-send tiles idle for [`REFINE_IDLE`] losslessly (ClearCodec) so static
+    /// content ends bit-exact (spec §8.3). `bgra` is the latest captured frame:
+    /// tiles are refined with the newest pixels, and a later AVC frame that
+    /// repaints a tile re-marks it at ship time, so no in-flight gate is needed.
+    /// Lock order elsewhere is `server_handle` → `ctx`, so tiles are prepared
+    /// under `ctx`, which is released before `server_handle` is taken.
+    /// `piggyback` calls (after a submit) are rate-limited to one per 100 ms.
+    pub(crate) fn refine_tick(&self, bgra: &[u8], stride: usize, piggyback: bool) -> Result<()> {
+        let now = Instant::now();
+        let (surface_id, server_handle, epoch, ready, tiles) = {
+            let mut guard = self.ctx.lock().unwrap();
+            let Some(ctx) = guard.as_mut() else {
+                return Ok(());
+            };
+            if piggyback && now.duration_since(ctx.last_refine_at) < Duration::from_millis(100) {
+                return Ok(());
+            }
+            ctx.last_refine_at = now;
+            let Some(surface_id) = ctx.surface_id else {
+                return Ok(());
+            };
+            let (w, h) = ctx.dims;
+            if !ctx.is_ready
+                || stride < usize::from(w) * 4
+                || bgra.len() < stride * usize::from(h)
+                || ctx.refine.size() != (u32::from(w), u32::from(h))
+            {
+                trace!(
+                    len = bgra.len(),
+                    stride,
+                    w,
+                    h,
+                    "refine: frame not usable yet"
+                );
+                return Ok(());
+            }
+            let ready = ctx.refine.take_ready(now, REFINE_IDLE, REFINE_BUDGET_TILES);
+            trace!(piggyback, ready = ready.len(), "refine: tick");
+            if ready.is_empty() {
+                return Ok(());
+            }
+            let mut tiles = Vec::with_capacity(ready.len());
+            for r in &ready {
+                match crate::lossless::encode_region(
+                    &mut ctx.clearcodec,
+                    bgra,
+                    stride,
+                    u32::from(h),
+                    *r,
+                ) {
+                    Ok(data) => tiles.push(ironrdp_egfx::server::MixedTilePayload::ClearCodec {
+                        destination: ironrdp_pdu::geometry::ExclusiveRectangle {
+                            left: r.x as u16,
+                            top: r.y as u16,
+                            right: (r.x + r.w) as u16,
+                            bottom: (r.y + r.h) as u16,
+                        },
+                        bitmap_data: data,
+                    }),
+                    Err(e) => {
+                        Self::refine_failed(ctx, &ready, now);
+                        return Err(e);
+                    }
+                }
+            }
+            (
+                surface_id,
+                ctx.server_handle.clone(),
+                ctx.epoch,
+                ready,
+                tiles,
+            )
+        };
+        let ts_ms = u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
+        let sent = {
+            let mut server = server_handle.lock().unwrap();
+            match server.channel_id() {
+                Some(channel) if server.send_mixed_frame(surface_id, tiles, ts_ms).is_some() => {
+                    Some((server.drain_output(), channel))
+                }
+                _ => None,
+            }
+        };
+        let Some((dvc_messages, egfx_channel_id)) = sent else {
+            if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+                Self::refine_failed(ctx, &ready, now);
+            }
+            return Ok(());
+        };
+        if dvc_messages.is_empty() {
+            return Ok(());
+        }
+        let svc_messages =
+            encode_dvc_messages(egfx_channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
+        let sender = self
+            .sender
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
+        sender
+            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                messages: svc_messages,
+            }))
+            .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
+        debug!(tiles = ready.len(), "lossless refinement sent");
+        Ok(())
+    }
+
+    /// Undo a refinement batch that never reached the client (review I5): the
+    /// tiles become due again, and the ClearCodec glyph cache restarts so the
+    /// encoder never assumes glyphs the client did not receive.
+    fn refine_failed(ctx: &mut ConnectionContext, ready: &[crate::refine::Rect], now: Instant) {
+        ctx.refine
+            .mark_dirty(ready, now.checked_sub(REFINE_IDLE).unwrap_or(now));
+        ctx.clearcodec = ironrdp_graphics::clearcodec::ClearCodecEncoder::new();
+    }
+
     pub(crate) fn reset_for_live_resize(&self) {
         let mut guard = self.ctx.lock().unwrap();
         if let Some(ctx) = guard.as_mut() {
@@ -2503,6 +2852,10 @@ impl Gfx {
             // `submit_bgra` run `setup_locked` (which also rebuilds the
             // encoder and resets the throttle counters).
             ctx.encoder = None;
+            ctx.aux_encoder = None;
+            ctx.region_queue.clear();
+            ctx.last_regions = None;
+            ctx.region_debt = RegionDebt::Full;
             ctx.surface_id = None;
             ctx.need_keyframe = true;
             info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
@@ -2615,7 +2968,7 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(&self, frames: &[EncodedFrame]) -> Result<()> {
+    fn ship_frames(&self, frames: &[EncodedFrame], aux: &[Option<EncodedFrame>]) -> Result<()> {
         let (dvc_messages, egfx_channel_id) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
@@ -2629,7 +2982,16 @@ impl Gfx {
             // few seconds" stall, far more likely once acks ride the UDP tunnel).
             // Cloning the `server_handle` Arc and releasing `ctx` first keeps the
             // lock order consistent (server_handle is never nested under ctx).
-            let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times) = {
+            let (
+                surface_id,
+                width,
+                height,
+                epoch,
+                server_handle,
+                last_shipped,
+                ship_times,
+                frame_regions,
+            ) = {
                 let mut guard = self.ctx.lock().unwrap();
                 let ctx = guard
                     .as_mut()
@@ -2653,6 +3015,48 @@ impl Gfx {
                     ctx.server_handle.clone(),
                     ctx.last_shipped_frame_id.clone(),
                     ctx.ship_times.clone(),
+                    {
+                        // Pop each frame's queued regions (drop entries for frames
+                        // the encoder skipped).
+                        let q = &mut ctx.region_queue;
+                        let v = frames
+                            .iter()
+                            .map(|f| {
+                                while q.front().is_some_and(|(pts, _)| *pts < f.pts) {
+                                    q.pop_front();
+                                }
+                                match q.front() {
+                                    Some((pts, _)) if *pts == f.pts => {
+                                        q.pop_front().and_then(|(_, r)| r)
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        // Mark refinement from what is actually painted: a
+                        // keyframe or full region repaints every tile (review C2).
+                        let (dw, dh) = (u32::from(ctx.dims.0), u32::from(ctx.dims.1));
+                        if ctx.refine.size() != (dw, dh) {
+                            ctx.refine.resize(dw, dh);
+                        }
+                        let full = [crate::refine::Rect {
+                            x: 0,
+                            y: 0,
+                            w: dw,
+                            h: dh,
+                        }];
+                        let now = Instant::now();
+                        for (f, r) in frames.iter().zip(&v) {
+                            match r {
+                                Some(rects) if !f.is_keyframe && !rects.is_empty() => {
+                                    ctx.refine.mark_dirty(rects, now)
+                                }
+                                _ => ctx.refine.mark_dirty(&full, now),
+                            }
+                        }
+                        trace!(dims = ?ctx.dims, frames = frames.len(), rects = ?v.iter().map(|r| r.as_ref().map(Vec::len)).collect::<Vec<_>>(), pending = ctx.refine.has_pending(), "refine: marked at ship");
+                        v
+                    },
                 )
             };
 
@@ -2662,17 +3066,12 @@ impl Gfx {
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
-            for f in frames {
-                // Region = full actual frame, inclusive bounds. QP 22 /
-                // quality 100 are first-light defaults; tuned in M3. Rebuilt
-                // per frame because `Avc420Region` isn't `Copy`.
-                let region = Avc420Region {
-                    left: 0,
-                    top: 0,
-                    right: width.saturating_sub(1),
-                    bottom: height.saturating_sub(1),
-                    quantization_parameter: 22,
-                    quality: 100,
+            for ((f, rects), aux_frame) in frames.iter().zip(frame_regions.iter()).zip(aux) {
+                // A keyframe always repaints the whole surface.
+                let regions = if f.is_keyframe {
+                    avc_regions(None, width, height)
+                } else {
+                    avc_regions(rects.as_deref(), width, height)
                 };
                 let payload = self.frame_payload(f);
                 let ts_ms =
@@ -2686,7 +3085,21 @@ impl Gfx {
                 // the surface stays blank.
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
-                let sent = server.send_avc420_frame(surface_id, &payload, &[region], ts_ms);
+                let avc444 = aux_frame.is_some() && server.supports_avc444();
+                let sent = match aux_frame {
+                    Some(a) if avc444 => {
+                        let aux_payload = self.frame_payload(a);
+                        server.send_avc444_frame(
+                            surface_id,
+                            &payload,
+                            &regions,
+                            Some(&aux_payload),
+                            Some(&regions),
+                            ts_ms,
+                        )
+                    }
+                    _ => server.send_avc420_frame(surface_id, &payload, &regions, ts_ms),
+                };
                 // Record the newest shipped frame id for the UDP frame-ack-lag
                 // backpressure gate (`submit_bgra`), and stamp the ship time
                 // into the RTT ring so `on_frame_ack` can time this frame's
@@ -2706,6 +3119,7 @@ impl Gfx {
                         "EGFX shipped keyframe (IDR)"
                     ),
                     Some(frame_id) => trace!(
+                        avc444,
                         frame_id,
                         keyframe = false,
                         payload_bytes = payload.len(),
@@ -2836,6 +3250,15 @@ impl GfxServerFactory for Gfx {
             self.bitrate_bps
         };
         *self.ctx.lock().unwrap() = Some(ConnectionContext {
+            avc444: false,
+            aux_encoder: None,
+            avc444_buf: Avc444Buffers::default(),
+            region_queue: std::collections::VecDeque::new(),
+            last_regions: None,
+            region_debt: RegionDebt::Full,
+            last_refine_at: Instant::now(),
+            refine: crate::refine::Tracker::new(0, 0),
+            clearcodec: ironrdp_graphics::clearcodec::ClearCodecEncoder::new(),
             server_handle: handle.clone(),
             encoder: None,
             surface_id: None,
@@ -2950,8 +3373,12 @@ impl GraphicsPipelineHandler for GfxHandler {
             caps = ?typed,
             "EGFX: client advertised capabilities"
         );
+        let avc444 = crate::negotiator::video::caps_from_egfx(&typed).avc444
+            && std::env::var("MACRDP_AVC444").as_deref() != Ok("0");
+        info!(target: "macrdp::negotiator", avc444, "video: AVC444 {}", if avc444 { "on (client advertises it)" } else { "off" });
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.client_supports_avc = supports_avc;
+            ctx.avc444 = avc444;
         }
     }
 
@@ -3161,6 +3588,10 @@ impl GraphicsPipelineHandler for GfxHandler {
             );
             ctx.is_ready = false;
             ctx.encoder = None;
+            ctx.aux_encoder = None;
+            ctx.region_queue.clear();
+            ctx.last_regions = None;
+            ctx.region_debt = RegionDebt::Full;
             ctx.surface_id = None;
             ctx.need_keyframe = true;
         } else {
@@ -4737,5 +5168,96 @@ mod tests {
         assert_eq!(&out[11..14], pps.as_slice());
         assert_eq!(&out[14..18], &[0, 0, 0, 1]);
         assert_eq!(&out[18..20], &[0x65, 0x88]);
+    }
+}
+
+/// AVC420 regions for one shipped frame: the queued dirty rects (clipped,
+/// inclusive edges), the bounding box beyond [`MAX_AVC_REGIONS`], or the whole
+/// surface when `rects` is `None`/empty.
+fn avc_regions(
+    rects: Option<&[crate::refine::Rect]>,
+    width: u16,
+    height: u16,
+) -> Vec<Avc420Region> {
+    let region = |l: u32, t: u32, r: u32, b: u32| Avc420Region {
+        left: l as u16,
+        top: t as u16,
+        right: r as u16,
+        bottom: b as u16,
+        quantization_parameter: 22,
+        quality: 100,
+    };
+    let (w, h) = (u32::from(width), u32::from(height));
+    let full = || vec![region(0, 0, w.saturating_sub(1), h.saturating_sub(1))];
+    let Some(rects) = rects.filter(|r| !r.is_empty()) else {
+        return full();
+    };
+    let clipped: Vec<(u32, u32, u32, u32)> = rects
+        .iter()
+        .filter(|r| r.w > 0 && r.h > 0 && r.x < w && r.y < h)
+        .map(|r| (r.x, r.y, (r.x + r.w).min(w) - 1, (r.y + r.h).min(h) - 1))
+        .collect();
+    if clipped.is_empty() {
+        return full();
+    }
+    if clipped.len() > MAX_AVC_REGIONS {
+        let l = clipped.iter().map(|c| c.0).min().unwrap_or(0);
+        let t = clipped.iter().map(|c| c.1).min().unwrap_or(0);
+        let r = clipped.iter().map(|c| c.2).max().unwrap_or(0);
+        let b = clipped.iter().map(|c| c.3).max().unwrap_or(0);
+        return vec![region(l, t, r, b)];
+    }
+    clipped
+        .into_iter()
+        .map(|(l, t, r, b)| region(l, t, r, b))
+        .collect()
+}
+
+#[cfg(test)]
+mod avc_region_tests {
+    use super::avc_regions;
+    use crate::refine::Rect;
+
+    #[test]
+    fn none_or_empty_means_whole_surface() {
+        for rs in [None, Some(&[][..])] {
+            let v = avc_regions(rs, 1714, 1287);
+            assert_eq!((v.len(), v[0].right, v[0].bottom), (1, 1713, 1286));
+        }
+    }
+
+    #[test]
+    fn rects_are_clipped_with_inclusive_edges() {
+        let v = avc_regions(
+            Some(&[Rect {
+                x: 1700,
+                y: 10,
+                w: 100,
+                h: 5,
+            }]),
+            1714,
+            1287,
+        );
+        assert_eq!(
+            (v[0].left, v[0].top, v[0].right, v[0].bottom),
+            (1700, 10, 1713, 14)
+        );
+    }
+
+    #[test]
+    fn many_rects_collapse_to_bounding_box() {
+        let rs: Vec<Rect> = (0..20)
+            .map(|i| Rect {
+                x: i * 10,
+                y: i,
+                w: 5,
+                h: 5,
+            })
+            .collect();
+        let v = avc_regions(Some(&rs), 1920, 1080);
+        assert_eq!(
+            (v.len(), v[0].left, v[0].top, v[0].right, v[0].bottom),
+            (1, 0, 0, 194, 23)
+        );
     }
 }

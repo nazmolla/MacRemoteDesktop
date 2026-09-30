@@ -37,10 +37,13 @@ mod input;
 mod keyboard_layout;
 mod lock_activity;
 mod logging;
+#[allow(dead_code)]
+mod lossless;
 mod multitransport;
 mod negotiator;
 mod rdpdr;
 mod reaper;
+mod refine;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
 mod shield;
@@ -2547,7 +2550,11 @@ fn args_from_config(path: &Path) -> Result<Args> {
 /// §6.3). Flags can only switch features ON, so an explicit flag is never
 /// overridden; `MACRDP_NEGOTIATE=0` keeps upstream's flag-only behaviour.
 /// Returns the reasons to log.
-fn apply_negotiated_defaults(args: &mut Args, host: &negotiator::session::HostCaps) -> Vec<String> {
+fn apply_negotiated_defaults(
+    args: &mut Args,
+    host: &negotiator::session::HostCaps,
+    shield_helper_available: bool,
+) -> Vec<String> {
     let d = negotiator::session::connect_defaults(host);
     let mut reasons = d.reasons.clone();
     args.enable_h264 |= d.enable_h264;
@@ -2562,7 +2569,18 @@ fn apply_negotiated_defaults(args: &mut Args, host: &negotiator::session::HostCa
         args.height = Some(1080);
     }
     let mode_chosen = args.detach_primary || args.capture_primary || args.shield_primary;
-    if args.virtual_display && host.physical_displays > 0 && !mode_chosen {
+    if args.virtual_display
+        && host.physical_displays > 0
+        && !mode_chosen
+        && !shield_helper_available
+    {
+        // A negotiated default must never stop the server from starting.
+        reasons.push(format!(
+            "privacy: NOT shielding {} physical display(s) — the macrdpshield helper is missing \
+             (build gui/make-shield-helper.sh or install the app bundle)",
+            host.physical_displays
+        ));
+    } else if args.virtual_display && host.physical_displays > 0 && !mode_chosen {
         args.shield_primary = true;
         reasons.push(format!(
             "privacy: shielding {} physical display(s) while a client is connected",
@@ -2589,7 +2607,11 @@ async fn async_main() -> Result<()> {
             .len(),
             virtual_display_available: virtual_display::virtual_display_available(),
         };
-        apply_negotiated_defaults(&mut args, &host)
+        #[cfg(target_os = "macos")]
+        let shield_helper_available = locate_shield_helper().is_some();
+        #[cfg(not(target_os = "macos"))]
+        let shield_helper_available = false;
+        apply_negotiated_defaults(&mut args, &host, shield_helper_available)
     };
 
     // Research spike (Phase-1b USB-redirection go/no-go): run the UserHCI probe
@@ -3802,6 +3824,7 @@ mod auto_unlock_flag_tests {
                 physical_displays: 0,
                 virtual_display_available: true,
             },
+            true,
         );
         assert!(
             a.enable_h264 && a.adaptive_bitrate && a.enable_udp_multitransport && a.virtual_display
@@ -3816,6 +3839,7 @@ mod auto_unlock_flag_tests {
                 physical_displays: 1,
                 virtual_display_available: true,
             },
+            true,
         );
         assert!(a.shield_primary);
 
@@ -3828,6 +3852,7 @@ mod auto_unlock_flag_tests {
                 physical_displays: 1,
                 virtual_display_available: true,
             },
+            true,
         );
         assert!(!a.shield_primary, "an explicit headless mode is kept");
 
@@ -3839,6 +3864,7 @@ mod auto_unlock_flag_tests {
                 physical_displays: 0,
                 virtual_display_available: true,
             },
+            true,
         );
         assert!(!a.virtual_display, "a pinned size keeps mirror capture");
 
@@ -3849,6 +3875,7 @@ mod auto_unlock_flag_tests {
                 physical_displays: 1,
                 virtual_display_available: false,
             },
+            true,
         );
         assert!(!a.virtual_display && !a.shield_primary);
     }
