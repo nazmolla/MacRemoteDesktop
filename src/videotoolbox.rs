@@ -165,7 +165,7 @@ impl Encoder {
     pub fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<()> {
         // Odd source height: the session is one row taller (see `new`) than
         // the caller's buffer, so replicate its last row into a reused buffer.
-        let src_rows = if stride == 0 { 0 } else { bgra.len() / stride };
+        let src_rows = bgra.len().checked_div(stride).unwrap_or(0);
         let mut padded: Option<Vec<u8>> = None;
         if src_rows > 0 && src_rows + 1 == usize::from(self.height) {
             let mut buf = std::mem::take(&mut self.pad_buf);
