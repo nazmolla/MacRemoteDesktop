@@ -41,18 +41,21 @@ impl MacInputHandler {
         click_signal: Option<crate::capture::ClickSignal>,
         keyboard_layout: Option<String>,
         keyboard_layout_klid: Option<SharedKeyboardLayout>,
+        resync: crate::resync::ResyncSignal,
     ) -> anyhow::Result<Self> {
         #[cfg(target_os = "macos")]
         let inner = macos::Inner::new(
             target_display_id,
             keyboard_layout.as_deref(),
             keyboard_layout_klid,
+            resync,
         )?;
         #[cfg(not(target_os = "macos"))]
         {
             let _ = target_display_id;
             let _ = keyboard_layout;
             let _ = keyboard_layout_klid;
+            let _ = resync;
         }
         Ok(Self {
             desktop_size,
@@ -568,6 +571,8 @@ mod macos {
         klid_handle: Option<super::SharedKeyboardLayout>,
         last_klid: u32,
         auto_layout: bool,
+        // The Ctrl+Alt+Shift+R resync request, consumed by capture and audio.
+        resync: crate::resync::ResyncSignal,
     }
 
     impl Inner {
@@ -575,6 +580,7 @@ mod macos {
             target_display_id: Option<u32>,
             keyboard_layout: Option<&str>,
             klid_handle: Option<super::SharedKeyboardLayout>,
+            resync: crate::resync::ResyncSignal,
         ) -> Result<Self> {
             // Two sources because macOS has two independent modifier-state
             // machines and different consumers read from different ones:
@@ -644,6 +650,7 @@ mod macos {
                 klid_handle,
                 last_klid: 0,
                 auto_layout,
+                resync,
             })
         }
 
@@ -1013,7 +1020,7 @@ mod macos {
             // stale after a long idle — a blanked mstsc surface and/or drifted
             // audio (Windows' audiodg buffers playback downstream where the
             // server can't see it, so this is a manual lever, not auto-detected).
-            // Sets two crate-global flags: the video path (`capture.rs`) forces a
+            // Raises the shared resync request: the video path (`capture.rs`) forces a
             // clean IDR keyframe to repaint a stale/idle-blanked mstsc
             // presentation (live-verified to un-blank with no reconnect flicker —
             // the heavier core reactivation cascades into a session re-cycle on
@@ -1025,8 +1032,7 @@ mod macos {
             // not a system shortcut on either OS. Cheap atomic stores, so no
             // off-thread hop needed; the consumers act on their next poll.
             if ctrl && opt && shift && !cmd && vk == VK_R {
-                crate::RESYNC_VIDEO.store(true, std::sync::atomic::Ordering::Relaxed);
-                crate::RESYNC_AUDIO.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.resync.request();
                 tracing::info!(
                     "on-demand A/V resync hotkey (Ctrl+Option+Shift+R) — refreshing video (IDR) + rebuilding audio"
                 );

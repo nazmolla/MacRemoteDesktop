@@ -79,6 +79,9 @@ pub struct MacRdpsnd {
     /// virtual display survives both, so audio must follow it, not
     /// `displays.first()` (which is the physical primary).
     target_display_id: Option<u32>,
+    /// The Ctrl+Alt+Shift+R resync request (raised by the input handler);
+    /// the capture loop consumes its audio half by rebuilding the stream.
+    resync: crate::resync::ResyncSignal,
 }
 
 impl MacRdpsnd {
@@ -88,6 +91,7 @@ impl MacRdpsnd {
         enable_aac: bool,
         aac_bitrate: u32,
         target_display_id: Option<u32>,
+        resync: crate::resync::ResyncSignal,
     ) -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
@@ -98,6 +102,7 @@ impl MacRdpsnd {
             enable_aac,
             aac_bitrate,
             target_display_id,
+            resync,
         }
     }
 }
@@ -124,6 +129,7 @@ impl SoundServerFactory for MacRdpsnd {
             mute_on_minimize: self.mute_on_minimize,
             aac_bitrate: self.aac_bitrate,
             target_display_id: self.target_display_id,
+            resync: self.resync.clone(),
         })
     }
 
@@ -195,6 +201,8 @@ struct MacRdpsndBackend {
     aac_bitrate: u32,
     /// Display the audio SCStream binds to — see [`MacRdpsnd::target_display_id`].
     target_display_id: Option<u32>,
+    /// See [`MacRdpsnd::resync`].
+    resync: crate::resync::ResyncSignal,
 }
 
 // Note: format negotiation (server-preference selection + the client-list
@@ -245,6 +253,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         let mute_on_minimize = self.mute_on_minimize;
         let aac_bitrate = self.aac_bitrate;
         let target_display_id = self.target_display_id;
+        let resync = self.resync.clone();
         // Dedicated OS thread at USER_INTERACTIVE QoS for the entire
         // capture / resample / channel-send pipeline. Tokio workers ride
         // USER_INITIATED (see main.rs::boost_thread_qos) which a cargo
@@ -279,6 +288,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
                         use_aac,
                         aac_bitrate,
                         target_display_id,
+                        resync,
                     )
                     .await
                     {
@@ -334,6 +344,7 @@ async fn capture_loop(
     use_aac: bool,
     aac_bitrate: u32,
     target_display_id: Option<u32>,
+    resync: crate::resync::ResyncSignal,
 ) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
     use rubato::Resampler;
@@ -526,12 +537,12 @@ async fn capture_loop(
                 break 'reconnect;
             }
             // Manual A/V resync hotkey (Ctrl+Alt+Shift+R, set in input.rs via
-            // crate::RESYNC_AUDIO): rebuild the SCK stream now. The brief capture
+            // the shared ResyncSignal): rebuild the SCK stream now. The brief capture
             // gap lets the client's downstream audio backlog (audiodg) drain and
             // re-baselines the server-side wave timing — the same effect a
             // minimize→unminimize achieves. This is a deliberate resync, not a
             // failure, so reset the backoff and rebuild immediately.
-            if crate::RESYNC_AUDIO.swap(false, Ordering::Relaxed) {
+            if resync.take_audio() {
                 let _ = stream.stop_capture();
                 consecutive_failures = 0;
                 info!(
@@ -785,6 +796,7 @@ async fn capture_loop(
     _use_aac: bool,
     _aac_bitrate: u32,
     _target_display_id: Option<u32>,
+    _resync: crate::resync::ResyncSignal,
 ) -> anyhow::Result<()> {
     Ok(())
 }

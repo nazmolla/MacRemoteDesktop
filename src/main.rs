@@ -50,6 +50,7 @@ mod private_dir;
 mod rdpdr;
 mod reaper;
 mod refine;
+mod resync;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
 mod shield;
@@ -59,18 +60,6 @@ mod sync_ext;
 mod usb_redirect;
 mod videotoolbox;
 mod virtual_display;
-
-/// Manual A/V resync hotkey (Ctrl+Alt+Shift+R — handled in `input.rs`). Set true
-/// by the input handler on the chord; consumed independently by the video path
-/// (`capture.rs` → a bare core reactivation + forced IDR, reusing the
-/// blank-recovery machinery) and the audio path (`audio.rs` → an SCK stream
-/// rebuild). Two flags so each consumer swaps its own back to false. Lets a user
-/// recover a session gone stale after a long idle — a blanked mstsc surface
-/// and/or drifted audio — on demand, without disconnecting.
-pub(crate) static RESYNC_VIDEO: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-pub(crate) static RESYNC_AUDIO: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 use crate::sync_ext::{LockExt, RwLockExt};
 use std::fs;
@@ -3325,6 +3314,9 @@ async fn async_main() -> Result<()> {
     // Negotiator (spec §6): what the client advertised at handshake, shared
     // between the connection-handler decorator and the display path.
     let client_advert = std::sync::Arc::new(negotiator::handler::ClientAdvert::default());
+    // The Ctrl+Alt+Shift+R resync request: raised by the input handler,
+    // consumed by the capture and audio loops.
+    let resync = resync::ResyncSignal::default();
     let display = CaptureDisplay {
         desktop_size: desktop_size.clone(),
         auto_size,
@@ -3374,6 +3366,7 @@ async fn async_main() -> Result<()> {
         },
         client_advert: Some(client_advert.clone()),
         applied_plan: None,
+        resync: resync.clone(),
     };
 
     // Shared cell the server fills with the connecting client's keyboard-layout
@@ -3386,6 +3379,7 @@ async fn async_main() -> Result<()> {
         click_signal,
         args.keyboard_layout.clone(),
         Some(keyboard_layout_klid.clone()),
+        resync.clone(),
     )?;
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
@@ -3409,6 +3403,7 @@ async fn async_main() -> Result<()> {
         // / --capture-primary (which disable/capture the physical panel) don't
         // kill the audio stream's content source.
         capture_display_id,
+        resync,
     ));
 
     // with_hybrid advertises HYBRID | HYBRID_EX so clients run CredSSP/NLA

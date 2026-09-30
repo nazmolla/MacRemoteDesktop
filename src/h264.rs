@@ -2976,7 +2976,7 @@ impl Gfx {
     }
 
     /// Manual A/V resync (the `Ctrl+Alt+Shift+R` hotkey — see `input.rs` and the
-    /// `crate::RESYNC_VIDEO` flag). Arms a forced IDR keyframe so the next frame
+    /// shared `ResyncSignal`). Arms a forced IDR keyframe so the next frame
     /// is a clean, self-contained repaint — enough to recover a stale/idle-blanked
     /// mstsc presentation without the heavyweight core Deactivation–Reactivation,
     /// which on the `--virtual-display`/`--capture-primary` headless path cascades
