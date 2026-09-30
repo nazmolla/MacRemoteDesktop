@@ -1970,3 +1970,19 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     `a_stalled_handshake_is_closed_after_its_deadline`, `handshakes_are_capped_per_source`,
     plus the existing preemption tests) and `src/multitransport.rs`
     (`listener_ignores_a_short_syn`, `listener_only_answers_sources_holding_an_offer`).
+
+(26-fork) The crate reads no environment variables (MacRemoteDesktop fork, 2026-09-30; from
+    the codebase review, finding A2). Every knob that used to be a `MACRDP_*` read inside this
+    crate is now passed in by the application, which takes the values from its tunables
+    registry (`src/tunables.rs`) and logs the ones that are set:
+    - `ListenerConfig` gains `lossy_delivery` (was `MACRDP_UDP_LOSSY_DELIVERY`),
+      `lossy_duplicate` (was `MACRDP_UDP_LOSSY_AUDIO_DUP`), `tunnel_dead_secs` (was
+      `MACRDP_UDP_TUNNEL_DEAD_SECS`, default 30) and `offer_cooldown_secs` (was
+      `MACRDP_UDP_MT_COOLDOWN_SECS`, default 600).
+    - `RdpServer::set_migrate_egfx_lossy` (was `MACRDP_UDP_MIGRATE_EGFX_LOSSY`) and
+      `RdpServer::set_multitransport_offer_max_rtt_ms` (was `MACRDP_UDP_OFFER_MAX_RTT_MS`,
+      default 80).
+    - `env_truthy` is gone. Earlier entries in this log that say a value is "read from the
+      env" (for example P2.3's `MACRDP_UDP_LOSSY_AUDIO_DUP`) now describe the application
+      side; the variable names and defaults are unchanged for operators.
+    A test in `src/tunables.rs` fails if any `std::env` read of a `MACRDP_*` name reappears.

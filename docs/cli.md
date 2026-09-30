@@ -14,7 +14,7 @@ cargo fmt                      # format
 RUST_LOG=debug cargo run       # crank logging for troubleshooting
 ```
 
-Useful CLI flags (see `src/main.rs::Args` for the full set):
+Useful CLI flags (see `src/app/args.rs::Args` for the full set):
 ```
 --bind 0.0.0.0:3390       # listen address
 --username NAME           # default: $USER
