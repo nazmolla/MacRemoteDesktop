@@ -364,6 +364,8 @@ mod macos {
     // CF types as safe to send between threads. The crate doesn't impl Send
     // because the raw NonNull pointer isn't, but our usage is single-threaded
     // anyway (RdpServer serializes input callbacks).
+    // SAFETY: the wrapped CGEventSource is a CF object, usable from any thread, and input callbacks
+    // are serialised by the server (see the note above).
     unsafe impl Send for Inner {}
 
     /// Per-side modifier state. We track left/right halves of each modifier
@@ -1464,6 +1466,8 @@ mod macos {
         extern "C" {
             fn proc_listallpids(buffer: *mut libc::c_int, buffersize: libc::c_int) -> libc::c_int;
         }
+        // SAFETY: the sizing call passes a null buffer with size 0; the second call passes `buffer`
+        // with its exact byte size, and the result is truncated to the count written.
         unsafe {
             // Sizing call: NULL buffer / 0 size returns the pid count
             // the kernel would have written. Add headroom for procs
@@ -1587,6 +1591,9 @@ mod macos {
         use std::ffi::c_void;
         use std::ptr;
 
+        // SAFETY: AX and CF calls on objects created or copied here: each +1 reference (Create/Copy
+        // rule) is checked for null before use and released exactly once on every path, and
+        // borrowed array elements are only used while their array is alive.
         unsafe {
             let systemwide = AXUIElementCreateSystemWide();
             if systemwide.is_null() {
@@ -1623,6 +1630,8 @@ mod macos {
     /// in our (non-Cocoa-runloop) process.
     fn bundle_identifier_for_pid(pid: libc::pid_t) -> Option<String> {
         // Fast path: a normal app resolves directly via NSRunningApplication.
+        // SAFETY: NSRunningApplication lookups take a pid by value and return retained objects or
+        // None.
         let direct = unsafe {
             NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
                 .and_then(|a| a.bundleIdentifier())
@@ -1658,6 +1667,8 @@ mod macos {
         }
         // PROC_PIDPATHINFO_MAXSIZE = 4 * MAXPATHLEN.
         let mut buf = vec![0u8; 4096];
+        // SAFETY: `buf` is 4096 bytes (PROC_PIDPATHINFO_MAXSIZE), which is the size passed, and
+        // only the returned length is read.
         let n = unsafe {
             proc_pidpath(
                 pid as libc::c_int,
@@ -1674,6 +1685,7 @@ mod macos {
         // .../Code Helper" → ".../Visual Studio Code.app").
         let idx = path.find(".app/")?;
         let app_path = &path[..idx + 4];
+        // SAFETY: `ns` is a valid NSString for the call; NSBundle returns retained objects or None.
         unsafe {
             let ns = objc2_foundation::NSString::from_str(app_path);
             let bundle = objc2_foundation::NSBundle::bundleWithPath(&ns)?;
@@ -1726,6 +1738,9 @@ mod macos {
     /// suppression used before: AX polling never reported VSCode focused by click,
     /// so the remap wrongly fired in its integrated terminal.
     pub(super) fn init_focus_observer() {
+        // SAFETY: runs on the dedicated run-loop thread, which pumps the CFRunLoop NSWorkspace
+        // notifications need; the observer block and every object it captures are retained by the
+        // notification center for the process lifetime.
         crate::runloop_thread::submit(|| unsafe {
             use objc2::rc::Retained;
             use objc2::runtime::AnyObject;
@@ -1815,6 +1830,9 @@ mod macos {
     /// armed when `--map-ctrl-to-cmd` is on (the only consumer). No-op if AX can't
     /// resolve a window/app at the point (menu bar, empty space).
     fn update_focus_from_click(x: f64, y: f64) {
+        // SAFETY: runs on the run-loop thread. AX and CF calls on objects created or copied here:
+        // each +1 reference (Create/Copy rule) is checked for null before use and released exactly
+        // once on every path, and borrowed array elements are only used while their array is alive.
         crate::runloop_thread::submit(move || unsafe {
             use std::ffi::c_void;
             let systemwide = AXUIElementCreateSystemWide();
@@ -1851,8 +1869,11 @@ mod macos {
     /// cache. Returns None if the bundle isn't running.
     fn pid_for_bundle(bundle: &str) -> Option<libc::pid_t> {
         for pid in list_all_pids() {
+            // SAFETY: NSRunningApplication lookups take a pid by value and return retained objects
+            // or None.
             let app = unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) };
             let Some(app) = app else { continue };
+            // SAFETY: `app` is a retained NSRunningApplication.
             let bid = unsafe { app.bundleIdentifier() };
             let Some(b) = bid else { continue };
             if b.to_string() == bundle {
@@ -2496,6 +2517,9 @@ mod macos {
 
         // Read an AXValue-typed attribute (AXPosition/AXSize) as a coordinate pair.
         let read_pair = |win: *const c_void, attr: &CFString, tag: u32| -> Option<(f64, f64)> {
+            // SAFETY: `win` is an AX window element borrowed from an array that outlives this
+            // closure; the copied AXValue is checked for null and type, read into a local, and
+            // released once.
             unsafe {
                 let mut v: CFTypeRef = ptr::null();
                 if AXUIElementCopyAttributeValue(
@@ -2521,6 +2545,8 @@ mod macos {
         let mut moved = 0usize;
         for pid in list_all_pids() {
             // Only regular (Dock) GUI apps — skip agents/daemons/accessory apps.
+            // SAFETY: NSRunningApplication lookups take a pid by value and return retained objects
+            // or None.
             let is_regular = unsafe {
                 NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
                     .map(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular)
@@ -2529,6 +2555,9 @@ mod macos {
             if !is_regular {
                 continue;
             }
+            // SAFETY: AX and CF calls on objects created or copied here: each +1 reference
+            // (Create/Copy rule) is checked for null before use and released exactly once on every
+            // path, and borrowed array elements are only used while their array is alive.
             unsafe {
                 let app = AXUIElementCreateApplication(pid);
                 if app.is_null() {
@@ -2632,6 +2661,8 @@ mod macos {
         use std::ffi::c_void;
         use std::ptr;
 
+        // SAFETY: AXUIElementCreateApplication takes a pid by value; the +1 result is checked for
+        // null here and released once at the end of this function.
         let app_ref = unsafe { AXUIElementCreateApplication(pid) };
         if app_ref.is_null() {
             return AX_ERROR_ILLEGAL_ARGUMENT;
@@ -2643,6 +2674,8 @@ mod macos {
         // first; no-op when not hidden. Also grab the bundle id for the
         // windowless-reopen fallback below.
         let mut bundle_id: Option<String> = None;
+        // SAFETY: NSRunningApplication lookups take a pid by value and return retained objects or
+        // None.
         unsafe {
             if let Some(running) =
                 NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
@@ -2656,6 +2689,8 @@ mod macos {
 
         let frontmost_attr = CFString::from_static_string("AXFrontmost");
         let true_val = CFBoolean::true_value();
+        // SAFETY: `app_ref` is non-null and live; the attribute name and value are CF objects that
+        // outlive the call.
         let frontmost_err = unsafe {
             AXUIElementSetAttributeValue(
                 app_ref,
@@ -2694,6 +2729,8 @@ mod macos {
         // the animation has settled (see schedule_refront below).
         let did_unminimize = std::cell::Cell::new(false);
         let min_attr = CFString::from_static_string("AXMinimized");
+        // SAFETY: `win` is an AX window element the caller keeps alive for this call; the copied
+        // minimized value is released once.
         let raise_and_main = |win: *mut c_void| unsafe {
             // Is this window minimized?
             let mut mv: CFTypeRef = ptr::null();
@@ -2738,11 +2775,13 @@ mod macos {
         for attr in ["AXFocusedWindow", "AXMainWindow"] {
             let a = CFString::new(attr);
             let mut win: CFTypeRef = ptr::null();
+            // SAFETY: `app_ref` is live; `a` outlives the call and `win` is a valid out-pointer.
             let err = unsafe {
                 AXUIElementCopyAttributeValue(app_ref, a.as_concrete_TypeRef().cast(), &mut win)
             };
             if err == AX_ERROR_SUCCESS && !win.is_null() {
                 raise_and_main(win as *mut c_void);
+                // SAFETY: `win` is the non-null +1 value copied above, released once.
                 unsafe { CFRelease(win.cast()) };
                 raised_via = attr;
                 break;
@@ -2753,17 +2792,22 @@ mod macos {
         if raised_via == "none" {
             let a = CFString::new("AXWindows");
             let mut arr: CFTypeRef = ptr::null();
+            // SAFETY: `app_ref` is live; `a` outlives the call and `arr` is a valid out-pointer.
             let err = unsafe {
                 AXUIElementCopyAttributeValue(app_ref, a.as_concrete_TypeRef().cast(), &mut arr)
             };
             if err == AX_ERROR_SUCCESS && !arr.is_null() {
+                // SAFETY: `arr` is the non-null +1 array copied above.
                 if unsafe { CFArrayGetCount(arr.cast()) } > 0 {
+                    // SAFETY: the index is 0 and the count was checked to be above 0; the element
+                    // is borrowed while `arr` is alive.
                     let w = unsafe { CFArrayGetValueAtIndex(arr.cast(), 0) };
                     if !w.is_null() {
                         raise_and_main(w as *mut c_void);
                         raised_via = "AXWindows[0]";
                     }
                 }
+                // SAFETY: `arr` is the non-null +1 array copied above, released once.
                 unsafe { CFRelease(arr.cast()) };
             }
         }
@@ -2797,6 +2841,8 @@ mod macos {
             }
         }
 
+        // SAFETY: `app_ref` was created non-null at the top of this function and is released once
+        // here.
         unsafe { CFRelease(app_ref as *const c_void) };
         frontmost_err
     }
@@ -2825,6 +2871,8 @@ mod macos {
         // back to workspace + the LAST_AX_ACTIVATED_PID/WORKSPACE_LIE_FRONT
         // reconciliation (`effective_front_pid`) only if AX can't resolve a
         // focused app at all (e.g. a transient AX hiccup).
+        // SAFETY: `ax_focused_application_pid` only makes balanced AX calls (see its own safety
+        // note).
         let pid = unsafe {
             match ax_focused_application_pid() {
                 Some(ax_pid) => ax_pid,
@@ -2838,6 +2886,8 @@ mod macos {
                 }
             }
         };
+        // SAFETY: AXUIElementCreateApplication takes a pid by value; the +1 result is checked for
+        // null and released on every return path below.
         let app_ref = unsafe { AXUIElementCreateApplication(pid) };
         if app_ref.is_null() {
             debug!(pid, "ax_cycle_windows_of_front: null app_ref (bad pid)");
@@ -2846,6 +2896,8 @@ mod macos {
 
         let windows_attr = CFString::from_static_string("AXWindows");
         let mut windows: CFTypeRef = ptr::null();
+        // SAFETY: `app_ref` is non-null; the attribute outlives the call and `windows` is a valid
+        // out-pointer.
         let copy_err = unsafe {
             AXUIElementCopyAttributeValue(
                 app_ref,
@@ -2860,15 +2912,18 @@ mod macos {
                 windows_null = windows.is_null(),
                 "ax_cycle_windows_of_front: AXWindows copy failed"
             );
+            // SAFETY: `app_ref` is non-null and released once on this early return.
             unsafe { CFRelease(app_ref as *const c_void) };
             return false;
         }
+        // SAFETY: `windows` is the non-null +1 array copied above.
         let count = unsafe { CFArrayGetCount(windows.cast()) };
         if count < 2 {
             debug!(
                 pid,
                 count, "ax_cycle_windows_of_front: app has <2 windows — nothing to cycle"
             );
+            // SAFETY: both are non-null +1 references, released once on this early return.
             unsafe {
                 CFRelease(windows.cast());
                 CFRelease(app_ref as *const c_void);
@@ -2881,6 +2936,8 @@ mod macos {
         // do *something* visible.
         let focused_attr = CFString::from_static_string("AXFocusedWindow");
         let mut focused: CFTypeRef = ptr::null();
+        // SAFETY: `app_ref` is non-null; the attribute outlives the call and `focused` is a valid
+        // out-pointer.
         let _ = unsafe {
             AXUIElementCopyAttributeValue(
                 app_ref,
@@ -2891,12 +2948,16 @@ mod macos {
         let mut focused_idx: isize = 0;
         if !focused.is_null() {
             for i in 0..count {
+                // SAFETY: `i` is below the array's count; the element is borrowed while `windows`
+                // is alive.
                 let w = unsafe { CFArrayGetValueAtIndex(windows.cast(), i) };
+                // SAFETY: both are live CF objects.
                 if unsafe { CFEqual(w, focused) } != 0 {
                     focused_idx = i;
                     break;
                 }
             }
+            // SAFETY: `focused` is the non-null +1 value copied above, released once.
             unsafe { CFRelease(focused.cast()) };
         }
         let next_idx = if reverse {
@@ -2904,6 +2965,8 @@ mod macos {
         } else {
             (focused_idx + 1) % count
         };
+        // SAFETY: `next_idx` is a remainder of the count, so it is in range; the element is
+        // borrowed while `windows` is alive.
         let next_window = unsafe { CFArrayGetValueAtIndex(windows.cast(), next_idx) };
         // Multi-strategy window raise. Native Cocoa apps (Terminal,
         // Finder) honor AXRaise on a window — that alone is enough.
@@ -2921,12 +2984,16 @@ mod macos {
         let main_attr = CFString::from_static_string("AXMain");
         let main_window_attr = CFString::from_static_string("AXMainWindow");
         let true_val = CFBoolean::true_value();
+        // SAFETY: `next_window` is borrowed from `windows`, which is alive; the action name
+        // outlives the call.
         let raise_err = unsafe {
             AXUIElementPerformAction(
                 next_window as *mut c_void,
                 raise_action.as_concrete_TypeRef().cast(),
             )
         };
+        // SAFETY: `next_window` is borrowed from `windows`, which is alive; attribute and value
+        // outlive the call.
         let set_main_err = unsafe {
             AXUIElementSetAttributeValue(
                 next_window as *mut c_void,
@@ -2934,6 +3001,7 @@ mod macos {
                 true_val.as_CFTypeRef() as CFTypeRef,
             )
         };
+        // SAFETY: `app_ref` is live and `next_window` is borrowed from `windows`, which is alive.
         let set_main_window_err = unsafe {
             AXUIElementSetAttributeValue(
                 app_ref,
@@ -2953,6 +3021,7 @@ mod macos {
             "ax_cycle_windows_of_front"
         );
 
+        // SAFETY: both are the +1 references created above, released once.
         unsafe {
             CFRelease(windows.cast());
             CFRelease(app_ref as *const c_void);
@@ -3014,6 +3083,9 @@ mod macos {
             debug!("ax_press_spotlight: com.apple.Spotlight not running");
             return false;
         };
+        // SAFETY: AX and CF calls on objects created or copied here: each +1 reference (Create/Copy
+        // rule) is checked for null before use and released exactly once on every path, and
+        // borrowed array elements are only used while their array is alive.
         unsafe {
             let app_ref = AXUIElementCreateApplication(pid);
             if app_ref.is_null() {
@@ -3287,8 +3359,11 @@ mod macos {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         // Local-time conversion without pulling in chrono: use libc.
+        // SAFETY: `libc::tm` is a plain C struct for which all-zero bytes are a valid value.
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         let t = secs as libc::time_t;
+        // SAFETY: `t` and `tm` are valid for reading and writing; localtime_r is the re-entrant
+        // form.
         unsafe {
             libc::localtime_r(&t, &mut tm);
         }
@@ -3324,6 +3399,7 @@ pub fn ensure_accessibility_access() -> bool {
     let key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
     let value = CFBoolean::true_value();
     let opts = CFDictionary::from_CFType_pairs(&[(key, value)]);
+    // SAFETY: `opts` is a CFDictionary that outlives the call.
     unsafe { AXIsProcessTrustedWithOptions(opts.as_concrete_TypeRef().cast()) }
 }
 

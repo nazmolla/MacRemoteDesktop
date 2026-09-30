@@ -140,20 +140,29 @@ mod pam_impl {
         if num_msg <= 0 || msgs.is_null() || out_resp.is_null() {
             return 1; // PAM_CONV_ERR
         }
+        // SAFETY: calloc with a positive count (checked above) and the element size; the result is
+        // checked for null before use.
         let arr = unsafe { libc::calloc(num_msg as usize, std::mem::size_of::<PamResponse>()) }
             as *mut PamResponse;
         if arr.is_null() {
             return 1;
         }
+        // SAFETY: libpam passes back the `appdata_ptr` set in `check`, which points at the
+        // `CString` that lives on `check`'s stack for the whole PAM transaction.
         let pw_cstr = unsafe { &*(appdata_ptr as *const CString) };
         for i in 0..(num_msg as isize) {
+            // SAFETY: `msgs` is non-null (checked above) and libpam provides `num_msg` entries; `i`
+            // is below `num_msg`.
             let m = unsafe { *msgs.offset(i) };
             if m.is_null() {
                 continue;
             }
+            // SAFETY: `m` is a non-null message pointer from libpam's array, valid for this call.
             let style = unsafe { (*m).msg_style };
             if style == PAM_PROMPT_ECHO_OFF {
                 let bytes = pw_cstr.as_bytes_with_nul();
+                // SAFETY: malloc of the password length plus NUL; the result is checked for null
+                // before use.
                 let buf = unsafe { libc::malloc(bytes.len()) } as *mut c_char;
                 if buf.is_null() {
                     // SAFETY: `arr` holds `num_msg` zero-initialised entries
@@ -161,6 +170,9 @@ mod pam_impl {
                     unsafe { free_responses(arr, i) };
                     return 1;
                 }
+                // SAFETY: `buf` has room for `bytes.len()` bytes (just allocated), the source is
+                // the CString's own bytes, the regions do not overlap, and `arr` has `num_msg`
+                // entries with `i` below it.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         bytes.as_ptr() as *const c_char,
@@ -172,6 +184,8 @@ mod pam_impl {
                 }
             }
         }
+        // SAFETY: `out_resp` is non-null (checked above); ownership of `arr` passes to libpam,
+        // which frees it.
         unsafe { *out_resp = arr };
         PAM_SUCCESS
     }
@@ -223,6 +237,8 @@ mod pam_impl {
         };
 
         let mut handle: *mut c_void = ptr::null_mut();
+        // SAFETY: all three strings are NUL-terminated CStrings that outlive the PAM handle,
+        // `conv_struct` lives until pam_end below, and `handle` is a valid out-pointer.
         let rc = unsafe {
             pam_start(
                 service_c.as_ptr(),
@@ -235,24 +251,34 @@ mod pam_impl {
             return Verdict::Unavailable(format!("pam_start failed: rc={rc}"));
         }
 
+        // SAFETY: `handle` came from a successful pam_start; `pw_c` stays alive until after
+        // pam_end, and OpenPAM copies the item anyway.
         let set_rc = unsafe { pam_set_item(handle, PAM_AUTHTOK, pw_c.as_ptr() as *const c_void) };
         if set_rc != PAM_SUCCESS {
+            // SAFETY: `handle` came from a successful pam_start and is ended exactly once on this
+            // path.
             unsafe { pam_end(handle, set_rc) };
             return Verdict::Unavailable(format!("pam_set_item(AUTHTOK) failed: rc={set_rc}"));
         }
 
+        // SAFETY: `handle` came from a successful pam_start and has not been ended.
         let auth_rc = unsafe { pam_authenticate(handle, 0) };
         let acct_rc = if auth_rc == PAM_SUCCESS {
+            // SAFETY: `handle` came from a successful pam_start and has not been ended.
             unsafe { pam_acct_mgmt(handle, 0) }
         } else {
             auth_rc
         };
 
         let err = if acct_rc != PAM_SUCCESS {
+            // SAFETY: `handle` came from a successful pam_start and has not been ended; the
+            // returned string is static PAM text.
             let msg_ptr = unsafe { pam_strerror(handle, acct_rc) };
             let msg = if msg_ptr.is_null() {
                 "unknown PAM error".to_string()
             } else {
+                // SAFETY: `msg_ptr` is non-null and points at a NUL-terminated message owned by
+                // PAM, copied out before pam_end.
                 unsafe { CStr::from_ptr(msg_ptr) }
                     .to_string_lossy()
                     .into_owned()
@@ -262,6 +288,8 @@ mod pam_impl {
             None
         };
 
+        // SAFETY: `handle` came from a successful pam_start and is ended exactly once, after its
+        // last use.
         unsafe { pam_end(handle, acct_rc) };
 
         // Overwrite the password buffer before drop. CString's Drop frees

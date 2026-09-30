@@ -1322,6 +1322,9 @@ mod pb {
 
     pub fn change_count() -> i64 {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block.
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.changeCount() as i64
@@ -1329,28 +1332,41 @@ mod pb {
     }
 
     pub fn has_string() -> bool {
+        // SAFETY: the AppKit pasteboard-type constants are immutable NSString statics exported by
+        // AppKit; reading one is only unsafe because it is an extern static.
         unsafe { has_type(NSPasteboardTypeString) }
     }
 
     pub fn has_image() -> bool {
+        // SAFETY: the AppKit pasteboard-type constants are immutable NSString statics exported by
+        // AppKit; reading one is only unsafe because it is an extern static.
         unsafe { has_type(NSPasteboardTypePNG) || has_type(NSPasteboardTypeTIFF) }
     }
 
     pub fn has_files() -> bool {
+        // SAFETY: the AppKit pasteboard-type constants are immutable NSString statics exported by
+        // AppKit; reading one is only unsafe because it is an extern static.
         unsafe { has_type(NSPasteboardTypeFileURL) }
     }
 
     pub fn has_html() -> bool {
+        // SAFETY: the AppKit pasteboard-type constants are immutable NSString statics exported by
+        // AppKit; reading one is only unsafe because it is an extern static.
         unsafe { has_type(NSPasteboardTypeHTML) }
     }
 
     pub fn has_rtf() -> bool {
+        // SAFETY: the AppKit pasteboard-type constants are immutable NSString statics exported by
+        // AppKit; reading one is only unsafe because it is an extern static.
         unsafe { has_type(NSPasteboardTypeRTF) }
     }
 
     /// The pasteboard's HTML representation (`public.html`), UTF-8 decoded.
     pub fn read_html() -> Option<String> {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. The type constant is an immutable AppKit static.
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.dataForType(NSPasteboardTypeHTML)
@@ -1361,6 +1377,9 @@ mod pb {
     /// The pasteboard's RTF representation (`public.rtf`), as raw bytes.
     pub fn read_rtf() -> Option<Vec<u8>> {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. The type constant is an immutable AppKit static.
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.dataForType(NSPasteboardTypeRTF)
@@ -1398,6 +1417,10 @@ mod pb {
     /// logged but don't abort the rest of the walk.
     pub fn read_files() -> Vec<FileEntry> {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. Every item, type and URL is a retained object owned by this autorelease
+        // pool.
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             let Some(items) = pb.pasteboardItems() else {
@@ -1515,6 +1538,7 @@ mod pb {
     /// the kernel's NSURL machinery), so we let NSURL convert it before
     /// handing the result back to Rust's std::fs.
     fn resolve_file_url(url_str: &NSString) -> Option<std::path::PathBuf> {
+        // SAFETY: `url_str` is a valid NSString; NSURL methods return retained objects or None.
         unsafe {
             let url = NSURL::URLWithString(url_str)?;
             // `URLByResolvingSymlinksInPath` is what turns the file-
@@ -1528,6 +1552,9 @@ mod pb {
 
     fn has_type(target: &objc2_app_kit::NSPasteboardType) -> bool {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block.
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             let Some(types) = pb.types() else {
@@ -1545,6 +1572,9 @@ mod pb {
 
     pub fn read_string() -> Option<String> {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. The type constant is an immutable AppKit static.
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.stringForType(NSPasteboardTypeString)
@@ -1556,6 +1586,9 @@ mod pb {
     #[cfg(test)]
     pub fn write_string(s: &str) {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block.
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.clearContents();
@@ -1569,6 +1602,9 @@ mod pb {
     /// via the `image` crate so this returns PNG either way).
     pub fn read_image_bytes() -> Option<(ImageEncoding, Vec<u8>)> {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. The type constants are immutable AppKit statics.
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             if let Some(d) = pb.dataForType(NSPasteboardTypePNG) {
@@ -1596,6 +1632,10 @@ mod pb {
         mark: &std::sync::atomic::AtomicI64,
     ) {
         let _pb_guard = super::pasteboard_guard();
+        // SAFETY: the pasteboard guard held above serialises every NSPasteboard access in the
+        // process, and generalPasteboard returns a retained shared object that is valid for the
+        // whole block. Each NSData and NSString written is created from a Rust slice or string that
+        // outlives the call.
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.clearContents();
@@ -1623,6 +1663,8 @@ mod pb {
     }
 
     fn nsdata_to_vec(d: &NSData) -> Vec<u8> {
+        // SAFETY: `bytes()` points at `length()` readable bytes owned by `d`, which outlives this
+        // copy.
         unsafe {
             let len = d.length();
             let ptr = d.bytes().as_ptr();

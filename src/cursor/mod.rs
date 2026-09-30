@@ -105,6 +105,8 @@ mod macos {
 
     // CGEventSource is a CF type — thread-safe by Apple convention, single-
     // threaded use in practice. See input.rs for the same justification.
+    // SAFETY: the wrapped CGEventSource is a CF object, usable from any thread (see the note
+    // above).
     unsafe impl Send for Inner {}
 
     impl Inner {
@@ -175,6 +177,8 @@ mod macos {
         }
 
         fn poll_shape(&mut self, out: &mut Vec<DisplayUpdate>) {
+            // SAFETY: `read_cursor_bitmap` only calls the resolved SkyLight cursor functions with
+            // buffers it allocates itself (see its own safety notes).
             let bytes_and_hot = unsafe { read_cursor_bitmap() };
             let Some((data, w, h, hot_x, hot_y)) = bytes_and_hot else {
                 return;
