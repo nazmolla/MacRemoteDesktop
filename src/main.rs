@@ -2407,7 +2407,6 @@ fn args_from_config(path: &Path) -> Result<Args> {
         ("GUARD_RL_MAX", "MACRDP_GUARD_RL_MAX"),
         ("GUARD_RL_WINDOW_SECS", "MACRDP_GUARD_RL_WINDOW_SECS"),
         ("GUARD_FAIL_THRESHOLD", "MACRDP_GUARD_FAIL_THRESHOLD"),
-        ("GUARD_FAILFAST_SECS", "MACRDP_GUARD_FAILFAST_SECS"),
         (
             "GUARD_COOLDOWN_BASE_SECS",
             "MACRDP_GUARD_COOLDOWN_BASE_SECS",
