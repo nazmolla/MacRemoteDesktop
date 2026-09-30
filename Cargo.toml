@@ -74,6 +74,9 @@ ironrdp-connector = "0.10"
 ironrdp-tokio = "0.10"
 # For the UDP multitransport loopback test: decode the listener's SYN+ACK reply.
 ironrdp-rdpeudp = { path = "vendor/ironrdp-rdpeudp" }
+# For the garbage-input tests of the URBDRC decoders (src/garbage_input_test.rs);
+# resolved through the git [patch.crates-io] entry below.
+ironrdp-rdpeusb = "0.1"
 
 [build-dependencies]
 # Compile the USB-redirection Obj-C shim (src/usb_redirect/usb_spike.m) on macOS.
