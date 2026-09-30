@@ -223,6 +223,56 @@ impl Drop for UdpMultitransportListener {
     }
 }
 
+/// Smallest datagram accepted as a flow-opening SYN. MS-RDPEUDP requires the
+/// SYN to be padded to the sender's MTU, and the MTU is at least 1132 bytes, so
+/// a real client's SYN is never shorter. Our SYN+ACK is never larger than the
+/// request, which removes the amplification a short SYN would allow.
+const MIN_SYN_LEN: usize = 1132;
+/// Most concurrent UDP peers overall. A session uses at most two flows
+/// (reliable and lossy), plus a stale one briefly around a reconnect.
+const MAX_PEERS: usize = 64;
+/// Most concurrent UDP peers from one IP.
+const MAX_PEERS_PER_IP: usize = 4;
+
+/// Decide whether a datagram from `peer_addr` may open a new RDPEUDP flow.
+///
+/// Rules, in order: it must be a SYN padded to at least [`MIN_SYN_LEN`]; with a
+/// cookie registry, the source IP must belong to an authenticated TCP session
+/// that was offered multitransport; and the peer table must have room. Without a registry (the handshake-only test path) the offer
+/// rule is skipped.
+fn admit_new_flow(
+    data: &[u8],
+    peer_addr: SocketAddr,
+    peers: &HashMap<SocketAddr, Peer>,
+    registry: Option<&CookieRegistry>,
+) -> Result<(), &'static str> {
+    let is_syn =
+        Datagram::peek_fec_flags(data).is_some_and(|f| f.contains(FecFlags::SYN) && !f.contains(FecFlags::ACK));
+    if !is_syn {
+        return Err("not a SYN");
+    }
+    if data.len() < MIN_SYN_LEN {
+        return Err("SYN shorter than the minimum MTU");
+    }
+    if let Some(reg) = registry
+        && !reg.allows_source(peer_addr.ip())
+    {
+        return Err("no multitransport offer for this source");
+    }
+    // A SYN on an established peer replaces it, so don't count that one.
+    let others = peers.keys().filter(|a| **a != peer_addr);
+    let (total, same_ip) = others.fold((0usize, 0usize), |(t, s), a| {
+        (t + 1, s + usize::from(a.ip() == peer_addr.ip()))
+    });
+    if total >= MAX_PEERS {
+        return Err("peer table full");
+    }
+    if same_ip >= MAX_PEERS_PER_IP {
+        return Err("too many peers from this IP");
+    }
+    Ok(())
+}
+
 /// Does this encoded datagram have the v1 SYN flag set (a SYN or SYN+ACK)?
 /// Such handshake packets must be zero-padded to the MTU.
 fn is_syn_family(bytes: &[u8]) -> bool {
@@ -801,6 +851,18 @@ async fn run_recv_loop(
         // for the reliable flow) it stays `Reliable`.
         let use_lossy =
             lossy_delivery && Datagram::peek_fec_flags(data).is_some_and(|f| f.contains(FecFlags::SYN_LOSSY));
+
+        // Admission for a NEW flow (an unknown source, or a SYN replacing an
+        // established peer). Checked before any state is created or any reply
+        // is sent, so an unsolicited datagram costs nothing and cannot be used
+        // for reflection (a SYN+ACK is padded to the MTU; a short spoofed SYN
+        // would otherwise buy ~77x amplification).
+        let opens_flow = !peers.contains_key(&peer_addr)
+            || (is_syn_family(data) && peers.get(&peer_addr).is_some_and(|p| p.sm.is_established()));
+        if opens_flow && let Err(reason) = admit_new_flow(data, peer_addr, &peers, cookie_registry.as_ref()) {
+            trace!(%peer_addr, len, reason, "UDP datagram dropped before admission");
+            continue;
+        }
 
         // (M3c) Port reuse on reconnect: if a *new* RDPEUDP flow opens (a SYN) on
         // the source address of an already-ESTABLISHED peer, the previous

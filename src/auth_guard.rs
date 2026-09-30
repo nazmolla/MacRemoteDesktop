@@ -599,29 +599,19 @@ pub fn audit_fingerprint(
 /// the single-process server path. Constructed via [`AuthGuardHandler::from_env`].
 pub struct AuthGuardHandler {
     core: AuthGuardCore,
-    /// The most recently accepted peer, stashed in `on_accept` so `on_authenticated`
-    /// (whose vendored hook takes no peer) can correlate the auth event. Reliable
-    /// because the single-process accept loop is serial — `on_accept` always runs
-    /// immediately before the connection it belongs to.
-    last_peer: Option<std::net::SocketAddr>,
 }
 
 impl AuthGuardHandler {
     /// Build the boxed handler, or `None` when the guard is disabled (so the
     /// builder gets `None` and the vendored default accept-all path runs).
     pub fn from_env() -> Option<Box<dyn ironrdp_server::ConnectionHandler>> {
-        AuthGuardCore::from_env().map(|core| {
-            Box::new(Self {
-                core,
-                last_peer: None,
-            }) as Box<dyn ironrdp_server::ConnectionHandler>
-        })
+        AuthGuardCore::from_env()
+            .map(|core| Box::new(Self { core }) as Box<dyn ironrdp_server::ConnectionHandler>)
     }
 }
 
 impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
     fn on_accept(&mut self, peer: std::net::SocketAddr) -> bool {
-        self.last_peer = Some(peer);
         match self.core.decide(Instant::now(), peer.ip()) {
             Decision::Accept => {
                 audit_accept(peer.ip(), peer.port());
@@ -634,31 +624,31 @@ impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
         }
     }
 
-    fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
-        // `last_peer` is always set here in single-process operation (on_accept
-        // precedes the connection); guard defensively rather than assume it.
-        if let Some(peer) = self.last_peer {
-            audit_auth(peer.ip(), peer.port(), success, reason);
-        }
+    fn on_authenticated(
+        &mut self,
+        peer: std::net::SocketAddr,
+        success: bool,
+        reason: Option<&str>,
+    ) {
+        audit_auth(peer.ip(), peer.port(), success, reason);
     }
 
     fn on_client_fingerprint(
         &mut self,
+        peer: std::net::SocketAddr,
         client_name: &str,
         rdp_version: u32,
         client_build: u32,
         platform: &str,
     ) {
-        if let Some(peer) = self.last_peer {
-            audit_fingerprint(
-                peer.ip(),
-                peer.port(),
-                client_name,
-                rdp_version,
-                client_build,
-                platform,
-            );
-        }
+        audit_fingerprint(
+            peer.ip(),
+            peer.port(),
+            client_name,
+            rdp_version,
+            client_build,
+            platform,
+        );
     }
 
     fn on_disconnected(
@@ -1044,12 +1034,10 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let mut handler = AuthGuardHandler {
                 core: AuthGuardCore::with_config(test_cfg()),
-                last_peer: None,
             };
-            // on_accept stashes the peer for on_authenticated to correlate.
             assert!(handler.on_accept(peer));
-            handler.on_authenticated(true, None);
-            handler.on_authenticated(false, Some("logon denied"));
+            handler.on_authenticated(peer, true, None);
+            handler.on_authenticated(peer, false, Some("logon denied"));
         });
 
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
@@ -1077,12 +1065,17 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let mut handler = AuthGuardHandler {
                 core: AuthGuardCore::with_config(test_cfg()),
-                last_peer: None,
             };
             assert!(handler.on_accept(peer));
             // A hostile client name with a control char (log-injection attempt)
             // must come out stripped.
-            handler.on_client_fingerprint("GENMACWIN\nevil", 0x80011, 26100, "WINDOWS/WINDOWS_NT");
+            handler.on_client_fingerprint(
+                peer,
+                "GENMACWIN\nevil",
+                0x80011,
+                26100,
+                "WINDOWS/WINDOWS_NT",
+            );
         });
 
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
@@ -1105,15 +1098,32 @@ mod tests {
         );
     }
 
+    /// Concurrent handshakes: the audit record names the peer the server
+    /// reports, not whichever connection was accepted last.
     #[test]
-    fn on_authenticated_without_accept_does_not_panic() {
+    fn auth_events_carry_the_reported_peer_not_the_last_accepted() {
         use ironrdp_server::ConnectionHandler;
-        let mut handler = AuthGuardHandler {
-            core: AuthGuardCore::with_config(test_cfg()),
-            last_peer: None,
-        };
-        // No preceding on_accept → last_peer is None; must be a graceful no-op.
-        handler.on_authenticated(true, None);
-        handler.on_authenticated(false, Some("x"));
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let first = std::net::SocketAddr::from((Ipv4Addr::new(198, 51, 100, 1), 40000));
+        let second = std::net::SocketAddr::from((Ipv4Addr::new(198, 51, 100, 2), 40001));
+        tracing::subscriber::with_default(subscriber, || {
+            let mut handler = AuthGuardHandler {
+                core: AuthGuardCore::with_config(test_cfg()),
+            };
+            assert!(handler.on_accept(first));
+            assert!(handler.on_accept(second));
+            handler.on_authenticated(first, false, Some("logon denied"));
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out
+            .lines()
+            .find(|l| l.contains("event=\"auth\""))
+            .expect("auth event");
+        assert!(line.contains("src_ip=198.51.100.1"), "{line}");
     }
 }

@@ -169,30 +169,37 @@ impl ConnectionHandler for ActivityHandler {
             })
     }
 
-    fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
+    fn on_handshake_failed(&mut self, peer: SocketAddr, failure: ironrdp_server::HandshakeFailure) {
+        if let Some(h) = self.inner.as_mut() {
+            h.on_handshake_failed(peer, failure);
+        }
+    }
+
+    fn on_authenticated(&mut self, peer: SocketAddr, success: bool, reason: Option<&str>) {
         if success {
             ConnectionActivity::mark(&self.activity.last_auth_ms, self.activity.now_ms());
         }
         if let Some(h) = self.inner.as_mut() {
-            h.on_authenticated(success, reason);
+            h.on_authenticated(peer, success, reason);
         }
     }
 
     fn on_client_fingerprint(
         &mut self,
+        peer: SocketAddr,
         client_name: &str,
         rdp_version: u32,
         client_build: u32,
         platform: &str,
     ) {
         if let Some(h) = self.inner.as_mut() {
-            h.on_client_fingerprint(client_name, rdp_version, client_build, platform);
+            h.on_client_fingerprint(peer, client_name, rdp_version, client_build, platform);
         }
     }
 
-    fn on_client_display(&mut self, info: &ironrdp_acceptor::ClientDisplayInfo) {
+    fn on_client_display(&mut self, peer: SocketAddr, info: &ironrdp_acceptor::ClientDisplayInfo) {
         if let Some(h) = self.inner.as_mut() {
-            h.on_client_display(info);
+            h.on_client_display(peer, info);
         }
     }
 }
@@ -285,13 +292,13 @@ mod tests {
 
         let mut rejecting = ActivityHandler::wrap(Some(Box::new(Rejecting)), activity.clone());
         assert!(!rejecting.on_accept(peer), "the inner verdict is preserved");
-        rejecting.on_authenticated(false, Some("bad password"));
+        rejecting.on_authenticated(peer, false, Some("bad password"));
         assert_eq!(activity.last_accept_ms.load(Ordering::SeqCst), 0);
         assert_eq!(activity.last_auth_ms.load(Ordering::SeqCst), 0);
 
         let mut open = ActivityHandler::wrap(None, activity.clone());
         assert!(open.on_accept(peer), "no inner handler accepts all");
-        open.on_authenticated(true, None);
+        open.on_authenticated(peer, true, None);
         assert_ne!(activity.last_accept_ms.load(Ordering::SeqCst), 0);
         assert_ne!(activity.last_auth_ms.load(Ordering::SeqCst), 0);
         assert_eq!(

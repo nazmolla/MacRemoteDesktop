@@ -91,7 +91,7 @@ mod tests {
         // flips the tunnel-bound flag the offer path keeps (M5c) and returns the
         // connection's inbound sink (M5c step 3b).
         let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel();
-        let flag = reg.register(cookie, in_tx);
+        let flag = reg.register(cookie, in_tx, None);
         assert!(!flag.load(Ordering::Relaxed), "flag starts unset");
         assert!(
             reg.take(&cookie).is_some(),
@@ -108,7 +108,7 @@ mod tests {
 
         // Explicit removal (teardown / eviction) also clears it.
         let (in_tx2, _in_rx2) = tokio::sync::mpsc::unbounded_channel();
-        reg.register(other, in_tx2);
+        reg.register(other, in_tx2, None);
         reg.remove(&other);
         assert!(reg.take(&other).is_none(), "removed cookie must not bind");
     }
@@ -125,7 +125,7 @@ mod tests {
         let reg = CookieRegistry::new();
         let cookie = [0x42u8; 16];
         let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel();
-        let server_flag = reg.register(cookie, in_tx);
+        let server_flag = reg.register(cookie, in_tx, None);
         let (_sink, listener_flag) = reg.take(&cookie).expect("cookie binds");
         assert!(server_flag.load(Ordering::Relaxed), "bound after take");
         // The listener's copy IS the server's flag: a death-flip is observed
@@ -326,7 +326,10 @@ mod tests {
         let server_addr = listener.local_addr();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        client.send_to(&client_syn, server_addr).await.unwrap();
+        client
+            .send_to(&padded_syn(&client_syn), server_addr)
+            .await
+            .unwrap();
 
         let mut buf = vec![0u8; 2048];
         let len = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
@@ -355,5 +358,94 @@ mod tests {
             "server SYN+ACK omits the cookie hash"
         );
         assert_eq!(dg.syn.expect("SYNDATA").upstream_mtu, 1232);
+    }
+
+    /// The captured SYN fixtures keep only the meaningful prefix; on the wire a
+    /// client pads its SYN with zeros to its MTU (1232 here), as MS-RDPEUDP
+    /// requires.
+    fn padded_syn(prefix: &[u8]) -> Vec<u8> {
+        let mut syn = prefix.to_vec();
+        syn.resize(1232, 0);
+        syn
+    }
+
+    #[rustfmt::skip]
+    const CLIENT_SYN_PREFIX: [u8; 84] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x40, 0x18, 0x01, 0x64, 0x7a, 0x02, 0xbc, 0x04, 0xd0,
+        0x04, 0xd0, 0x43, 0x33, 0x3c, 0x63, 0xee, 0x77, 0x40, 0x6e, 0x97, 0xdf, 0x80, 0x0c,
+        0xa1, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0xcb, 0x86, 0x4c, 0x5b,
+        0x54, 0x3a, 0xdc, 0x7a, 0x7a, 0x36, 0x7b, 0xb8, 0x11, 0x20, 0x71, 0x7c, 0x28, 0x6d,
+        0x09, 0x3d, 0x3f, 0x3a, 0xd8, 0x80, 0x2c, 0x59, 0x4f, 0x4f, 0x21, 0x99, 0x86, 0x94,
+    ];
+
+    /// Send `datagram` to a fresh listener and report whether any reply came
+    /// back within half a second.
+    async fn listener_replies(datagram: &[u8], registry: Option<CookieRegistry>) -> bool {
+        use ironrdp_server::{ListenerConfig, UdpMultitransportListener};
+        use std::time::Duration;
+        use tokio::net::UdpSocket;
+
+        let listener = UdpMultitransportListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            ListenerConfig::default(),
+            None,
+            registry,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("bind listener");
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(datagram, listener.local_addr())
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 2048];
+        tokio::time::timeout(Duration::from_millis(500), client.recv(&mut buf))
+            .await
+            .is_ok()
+    }
+
+    /// A SYN shorter than the minimum MTU is dropped without a reply: answering
+    /// it with an MTU-padded SYN+ACK would let a spoofed source reflect ~77x
+    /// the traffic at a victim.
+    #[tokio::test]
+    async fn listener_ignores_a_short_syn() {
+        assert!(!listener_replies(&CLIENT_SYN_PREFIX, None).await);
+    }
+
+    /// With a cookie registry, only a source that was offered multitransport
+    /// over an authenticated TCP session gets a handshake.
+    #[tokio::test]
+    async fn listener_only_answers_sources_holding_an_offer() {
+        let syn = padded_syn(&CLIENT_SYN_PREFIX);
+
+        let empty = CookieRegistry::new();
+        assert!(
+            !listener_replies(&syn, Some(empty)).await,
+            "no offer, no reply"
+        );
+
+        let other = CookieRegistry::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        other.register([1; 16], tx, Some("192.0.2.9".parse().unwrap()));
+        assert!(
+            !listener_replies(&syn, Some(other)).await,
+            "offer for another IP"
+        );
+
+        let ours = CookieRegistry::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ours.register([2; 16], tx, Some("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(
+            listener_replies(&syn, Some(ours.clone())).await,
+            "offer for this IP"
+        );
+
+        // The authorization ends with the session (the offer is removed).
+        ours.remove(&[2; 16]);
+        assert!(!listener_replies(&syn, Some(ours)).await, "offer withdrawn");
     }
 }

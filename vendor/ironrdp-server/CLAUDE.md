@@ -1932,3 +1932,41 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     non-reactivation connection immediately after `on_client_fingerprint`, delivering
     acceptor divergence (5). Numbered "-fork" to avoid colliding with upstream macrdp's
     own pending (24)/(25) claims (see TODO.md).
+
+(25-fork) One bounded, authenticated entry path for every connection (MacRemoteDesktop
+    fork, 2026-09-30; from the codebase review, findings S1, S2, S3, S7). Replaces the
+    accept-loop half of (23). Before: the first connection was served straight away with
+    no handshake deadline, later ones were negotiated one at a time (accepts paused
+    meanwhile), and the handshake sequence existed twice (`run_connection` and
+    `negotiate_candidate`, synced by hand). Measured: one silent TCP connection held a real
+    user off for ~30 s.
+    Now (`src/handshake.rs` + `server.rs`):
+    - `HandshakePool` runs every handshake concurrently on the accept loop's task, under
+      `HandshakeLimits` (5 s to the X.224 request, 30 s total, 32 in flight, 4 per source;
+      a source is an IPv4 address or an IPv6 /64, see `source_key`). Over capacity the
+      socket is closed at once. Setter: `RdpServer::set_handshake_limits`.
+    - One generic `negotiate<S>` (X.224, TLS, CredSSP) serves both `run()` and
+      `run_connection`, so the duplication (23) had to keep in sync is gone.
+    - Channels are attached, and the multitransport offer is made, only in
+      `serve_negotiated`, i.e. after authentication. The channel factories never run for
+      an unauthenticated peer.
+    - Preemption, eviction notice, `recently_evicted` and `EVICTION_GRACE` are unchanged
+      from (23). `CANDIDATE_NEGOTIATION_TIMEOUT` and `CANDIDATE_HANDOFF_GRACE` are gone:
+      the pool's deadlines cover them, and in-flight handshakes simply stay in the pool
+      when a session ends.
+    - `ConnectionHandler`: `on_authenticated`, `on_client_fingerprint` and
+      `on_client_display` now take the peer address (several handshakes can be in flight,
+      so "the last accepted peer" is no longer meaningful); new `on_handshake_failed(peer,
+      HandshakeFailure)` for timeouts, TLS and protocol failures and capacity refusals.
+    - Credentials live in a shared `CredentialsHandle` read at the start of each handshake
+      (`RdpServer::credentials_handle`), so the application can rotate or revoke them while
+      a session is live.
+    - UDP admission (divergence 12): `CookieRegistry::register` records the authenticated
+      TCP peer's IP, and the listener starts an RDPEUDP flow only for a SYN of at least 1132
+      bytes (the MS-RDPEUDP minimum MTU; clients pad the SYN to their MTU) from an IP that
+      holds a live offer, with at most 64 peers and 4 per IP. Before, any 16-byte datagram
+      got a 1232-byte SYN+ACK (77x reflection) and created peer state.
+    Covered by `src/conn_test.rs` (`silent_peers_do_not_delay_a_real_client`,
+    `a_stalled_handshake_is_closed_after_its_deadline`, `handshakes_are_capped_per_source`,
+    plus the existing preemption tests) and `src/multitransport.rs`
+    (`listener_ignores_a_short_syn`, `listener_only_answers_sources_holding_an_offer`).

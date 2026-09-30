@@ -28,7 +28,7 @@ Every commit must pass the first three checks.
 
 - **Admission.** Every accepted TCP connection passes `on_accept` (rate limit and lockout), then the bounce-back check, then capacity limits:
   - at most 32 handshakes in flight,
-  - at most 2 per source (IPv4 address, or IPv6 /64).
+  - at most 4 per source (IPv4 address, or IPv6 /64). Four rather than two because mstsc opens a second, abandoned connection on each attempt, and several clients can share one NAT address.
 
   Over capacity, the socket is closed at once and reported as `HandshakeFailure::Capacity`.
 - **Deadlines.** Each handshake runs under two deadlines:
@@ -41,7 +41,7 @@ Every commit must pass the first three checks.
   - with a live session, it preempts (existing eviction logic, unchanged);
   - handshakes still in flight when a session ends stay in the pool and are served next. This replaces `CANDIDATE_HANDOFF_GRACE`.
 - **One generic sequence.** `negotiate<S: AsyncRead + AsyncWrite>` is the only X.224, TLS and CredSSP sequence. `run_connection` (used by the duplex tests) calls the same function, so the "keep the two in sync by hand" duplication goes away.
-- **Post-auth setup.** Channel attachment stays before `accept_begin`, because the acceptor needs the channel list for MCS. The multitransport offer and cookie registration move after authentication, into `serve_negotiated`, where the authenticated peer IP is known. The lossy audio DVC is attached from context values for every handshake, since only the winner reaches MCS.
+- **Post-auth setup.** Channel attachment, the multitransport offer and cookie registration all move after authentication, into `serve_negotiated`, where the authenticated peer IP is known. The acceptor only reads the channel list at the MCS exchange, which comes after CredSSP, so this is in time. As a result the channel factories never run for a peer that has not authenticated. (The first draft kept channel attachment before `accept_begin`; checking the acceptor showed that was not needed.)
 - **Link RTT.** It is sampled per accepted socket and carried in the negotiated connection, not written to shared state at accept.
 
 **Handler contract** (`ConnectionHandler`, breaking change, owned code):
@@ -60,7 +60,7 @@ These carry the peer explicitly. The audit log no longer needs the `last_peer` g
 - `CookieRegistry::register(cookie, inbound, peer_ip)` records the authenticated TCP peer's IP.
 - A SYN from a source with no peer state is admitted only if:
   1. the datagram is at least 1132 bytes, the minimum MTU in MS-RDPEUDP. Real clients pad the SYN to their MTU, so this rule removes the amplification.
-  2. the registry holds an unconsumed offer for that IP (IPv4-mapped addresses normalised).
+  2. the IP belongs to an authenticated TCP session that was offered multitransport (IPv4-mapped addresses normalised). The binding lasts until that session ends, not until the cookie is consumed, because one session opens up to two UDP flows (reliable and lossy).
   3. the peer table has room: at most 64 peers, and at most 4 per IP.
 - **The listener stays usable without a registry.** When constructed with no registry (the handshake-only test path), rule 2 is skipped.
 

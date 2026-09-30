@@ -25,6 +25,7 @@ pub mod audio_dvc;
 pub mod dtls;
 pub mod listener;
 
+use core::net::IpAddr;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -99,16 +100,6 @@ pub fn encode_initiate_request(
     Ok(encode_vec(&X224(mcs_pdu))?)
 }
 
-/// A shared set of multitransport security cookies the server has issued and not
-/// yet consumed/torn down. The per-connection offer path
-/// ([`RdpServer`](crate::RdpServer)) registers the cookie it puts in its
-/// Initiate Multitransport Request; the process-global UDP
-/// [`listener`](crate::multitransport::listener) checks an inbound tunnel
-/// `RDP_TUNNEL_CREATEREQUEST`'s echoed cookie against it before accepting the
-/// tunnel — **binding the UDP flow to a real, current TCP session** so a forged
-/// or replayed cookie can't open a tunnel. Cookies are one-time: the listener
-/// removes a cookie when it accepts the tunnel, and the offer path evicts the
-/// previous connection's (unconsumed) cookie before registering a new one.
 /// Per-cookie registry entry: the tunnel-bound flag plus the owning connection's
 /// inbound-tunnel-data sink.
 struct CookieEntry {
@@ -123,9 +114,29 @@ struct CookieEntry {
     inbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 }
 
+/// A shared set of multitransport security cookies the server has issued and not
+/// yet consumed/torn down. The per-connection offer path
+/// ([`RdpServer`](crate::RdpServer)) registers the cookie it puts in its
+/// Initiate Multitransport Request; the process-global UDP
+/// [`listener`](crate::multitransport::listener) checks an inbound tunnel
+/// `RDP_TUNNEL_CREATEREQUEST`'s echoed cookie against it before accepting the
+/// tunnel — **binding the UDP flow to a real, current TCP session** so a forged
+/// or replayed cookie can't open a tunnel. Cookies are one-time: the listener
+/// removes a cookie when it accepts the tunnel, and the offer path evicts the
+/// previous connection's (unconsumed) cookie before registering a new one.
+///
+/// Each offer also records the IP of the TCP peer it was issued to, which the
+/// listener uses to refuse UDP handshakes from any other source before it
+/// spends anything on them (see [`CookieRegistry::allows_source`]).
 #[derive(Clone, Default)]
 pub struct CookieRegistry {
     entries: Arc<Mutex<HashMap<[u8; 16], CookieEntry>>>,
+    /// IP of the authenticated TCP peer each offer was made to (IPv4-mapped
+    /// addresses folded to IPv4). The UDP listener only starts a handshake for
+    /// a source listed here. Unlike `entries`, a binding is NOT consumed when
+    /// the tunnel binds, because one session opens up to two flows (reliable
+    /// and lossy); it lasts until the offer is removed at session end.
+    sources: Arc<Mutex<HashMap<[u8; 16], IpAddr>>>,
     /// Multitransport offer suppression deadline (tunnel-death cooldown).
     /// Set by the UDP listener when a BOUND tunnel goes inbound-silent past
     /// the death threshold — evidence the client's UDP path is broken (an
@@ -154,25 +165,57 @@ impl CookieRegistry {
     /// when it binds the matching tunnel, and the offer-issuing
     /// [`RdpServer`](crate::RdpServer) reads it to know the UDP multitransport
     /// connection is up (the cue to send the Soft-Sync request).
-    pub fn register(&self, cookie: [u8; 16], inbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) -> Arc<AtomicBool> {
+    ///
+    /// `peer_ip` is the authenticated TCP peer's address; only that source may
+    /// open the UDP tunnel. `None` (peer unknown) registers a cookie no UDP
+    /// source can use.
+    pub fn register(
+        &self,
+        cookie: [u8; 16],
+        inbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        peer_ip: Option<IpAddr>,
+    ) -> Arc<AtomicBool> {
         let bound = Arc::new(AtomicBool::new(false));
-        if let Ok(mut map) = self.entries.lock() {
-            map.insert(
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
                 cookie,
                 CookieEntry {
                     bound: Arc::clone(&bound),
                     inbound,
                 },
             );
+        if let Some(ip) = peer_ip {
+            self.sources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(cookie, normalize_ip(ip));
         }
         bound
     }
 
+    /// Whether `ip` belongs to a session with a live multitransport offer, i.e.
+    /// is allowed to start a UDP handshake with the listener.
+    pub fn allows_source(&self, ip: IpAddr) -> bool {
+        let ip = normalize_ip(ip);
+        self.sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .any(|s| *s == ip)
+    }
+
     /// Drop a cookie (evicted on teardown / TCP fallback).
     pub fn remove(&self, cookie: &[u8; 16]) {
-        if let Ok(mut map) = self.entries.lock() {
-            map.remove(cookie);
-        }
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(cookie);
+        self.sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(cookie);
     }
 
     /// Atomically check-and-consume a cookie: on a match, removes it, **sets its
@@ -181,10 +224,11 @@ impl CookieRegistry {
     /// `None` for an unknown cookie. One-time use — a retransmitted/replayed
     /// CREATEREQUEST with the same cookie won't bind a second tunnel.
     pub fn take(&self, cookie: &[u8; 16]) -> Option<(tokio::sync::mpsc::UnboundedSender<Vec<u8>>, Arc<AtomicBool>)> {
-        let removed = match self.entries.lock() {
-            Ok(mut map) => map.remove(cookie),
-            Err(_) => None,
-        };
+        let removed = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(cookie);
         let entry = removed?;
         entry.bound.store(true, Ordering::Relaxed);
         // The listener keeps the flag alongside the peer so tunnel DEATH can
@@ -212,6 +256,15 @@ impl CookieRegistry {
             Ok(until) => until.is_some_and(|t| Instant::now() < t),
             Err(_) => false,
         }
+    }
+}
+
+/// Fold an IPv4-mapped IPv6 address to IPv4, so a dual-stack listener sees
+/// the same key for TCP and UDP from one client.
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
     }
 }
 
