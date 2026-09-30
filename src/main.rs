@@ -39,9 +39,10 @@ mod lock_activity;
 mod logging;
 mod multitransport;
 mod negotiator;
+#[allow(dead_code)]
+mod planar;
 mod rdpdr;
 mod reaper;
-#[allow(dead_code)]
 mod refine;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
