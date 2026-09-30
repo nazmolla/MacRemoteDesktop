@@ -224,7 +224,66 @@ impl RegionDebt {
 /// Cap before collapsing a frame's regions into their bounding box.
 const MAX_AVC_REGIONS: usize = 16;
 
+/// Reused planes for AVC444: full YUV444, then the main and auxiliary I420
+/// views (MS-RDPEGFX §3.3.8.3.2 v1 layout, see `crate::avc444`).
+#[derive(Default)]
+struct Avc444Buffers {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+    main: [Vec<u8>; 3],
+    aux: [Vec<u8>; 3],
+}
+
+impl Avc444Buffers {
+    /// Convert `bgra` (`width×height`) and split it; the encode height is
+    /// `height` rounded up to even (last row replicated).
+    fn fill(&mut self, bgra: &[u8], stride: usize, width: usize, height: usize) {
+        let he = height + (height & 1);
+        let (cw, ch) = (width / 2, he / 2);
+        let ah = crate::avc444::padded_aux_height(he);
+        for p in [&mut self.y, &mut self.u, &mut self.v] {
+            p.resize(width * he, 0);
+        }
+        crate::avc444::bgra_to_yuv444_full_bt709_into(
+            bgra,
+            stride,
+            width,
+            height,
+            &mut self.y,
+            &mut self.u,
+            &mut self.v,
+            width,
+        );
+        if he != height {
+            for p in [&mut self.y, &mut self.u, &mut self.v] {
+                p.copy_within(width * (height - 1)..width * height, width * height);
+            }
+        }
+        let sizes = [(width * he), (cw * ch), (cw * ch)];
+        let aux_sizes = [(width * ah), (cw * ah / 2), (cw * ah / 2)];
+        for (p, n) in self.main.iter_mut().zip(sizes) {
+            p.resize(n, 0);
+        }
+        for (p, n) in self.aux.iter_mut().zip(aux_sizes) {
+            p.resize(n, 0);
+        }
+        let [my, mu, mv] = &mut self.main;
+        let [ay, au, av] = &mut self.aux;
+        crate::avc444::split_yuv444_to_yuv420_v1(
+            &self.y, &self.u, &self.v, width, width, width, my, mu, mv, width, cw, cw, ay, au, av,
+            width, cw, cw, width, he,
+        );
+    }
+}
+
 struct ConnectionContext {
+    /// Client negotiated AVC444 (spec §8.2 codec ladder): frames are encoded as
+    /// a main + auxiliary H.264 pair and shipped with `send_avc444_frame`.
+    avc444: bool,
+    /// Encoder for the AVC444 auxiliary (chroma-detail) view.
+    aux_encoder: Option<Encoder>,
+    avc444_buf: Avc444Buffers,
     /// Regions for frames submitted but not yet shipped, keyed by encoder PTS.
     /// `None` = whole surface.
     region_queue: std::collections::VecDeque<(i64, Option<Vec<crate::refine::Rect>>)>,
@@ -2100,6 +2159,9 @@ impl Gfx {
                 if let Err(e) = encoder.set_bitrate(bps) {
                     trace!(error = ?e, bps, "adaptive set_bitrate failed");
                 }
+                if let Some(aux) = ctx.aux_encoder.as_ref() {
+                    let _ = aux.set_bitrate(bps);
+                }
             }
             if let Some(frames) = adaptive.keyframe_frames {
                 if let Err(e) = encoder.set_keyframe_interval(frames) {
@@ -2107,7 +2169,17 @@ impl Gfx {
                 }
             }
             let pts = encoder.next_pts();
-            encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            match ctx.aux_encoder.as_mut() {
+                Some(aux) if ctx.avc444 => {
+                    let (w, h) = (usize::from(ctx.dims.0), usize::from(ctx.dims.1));
+                    ctx.avc444_buf.fill(bgra, stride, w, h);
+                    let [my, mu, mv] = &ctx.avc444_buf.main;
+                    let [ay, au, av] = &ctx.avc444_buf.aux;
+                    encoder.encode_yuv420(my, mu, mv, force_keyframe)?;
+                    aux.encode_yuv420(ay, au, av, force_keyframe)?;
+                }
+                _ => encoder.encode_bgra(bgra, stride, force_keyframe)?,
+            }
             let debt = ctx.region_debt.take();
             let resolved = if force_keyframe { None } else { debt };
             ctx.last_regions = resolved.clone();
@@ -2373,15 +2445,43 @@ impl Gfx {
     /// capture tick. Bumps `shipped` per frame so the capture thread's
     /// drop-to-latest throttle can bound the pipeline depth. Exits when the
     /// channel closes (encoder dropped on connection teardown).
-    fn ship_loop(&self, rx: std::sync::mpsc::Receiver<EncodedFrame>, shipped: Arc<AtomicU64>) {
+    fn ship_loop(
+        &self,
+        rx: std::sync::mpsc::Receiver<EncodedFrame>,
+        aux_rx: Option<std::sync::mpsc::Receiver<EncodedFrame>>,
+        shipped: Arc<AtomicU64>,
+    ) {
+        let mut aux_ahead: Option<EncodedFrame> = None;
         while let Ok(frame) = rx.recv() {
             // Sweep up any others VT delivered alongside it (keeps order).
             let mut frames = vec![frame];
             while let Ok(f) = rx.try_recv() {
                 frames.push(f);
             }
+            // Pair each main frame with the auxiliary frame of the same PTS; a
+            // missing one (VT drop) ships the main view alone as AVC420.
+            let aux: Vec<Option<EncodedFrame>> = match aux_rx.as_ref() {
+                None => vec![None; frames.len()],
+                Some(arx) => frames
+                    .iter()
+                    .map(|f| loop {
+                        let next = aux_ahead
+                            .take()
+                            .or_else(|| arx.recv_timeout(Duration::from_millis(250)).ok());
+                        match next {
+                            Some(a) if a.pts < f.pts => continue,
+                            Some(a) if a.pts == f.pts => break Some(a),
+                            Some(a) => {
+                                aux_ahead = Some(a);
+                                break None;
+                            }
+                            None => break None,
+                        }
+                    })
+                    .collect(),
+            };
             let n = frames.len() as u64;
-            if let Err(e) = self.ship_frames(&frames) {
+            if let Err(e) = self.ship_frames(&frames, &aux) {
                 warn!(error = ?e, "EGFX ship_frames failed");
             }
             shipped.fetch_add(n, Ordering::Relaxed);
@@ -2465,6 +2565,24 @@ impl Gfx {
                 .take_receiver()
                 .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
             ctx.encoder = Some(encoder);
+            let aux_rx = if ctx.avc444 {
+                let he = height + (height & 1);
+                let mut aux = Encoder::new(
+                    width,
+                    crate::avc444::padded_aux_height(usize::from(he)) as u16,
+                    self.fps,
+                    ctx.adaptive_target_bps,
+                    self.keyframe_secs,
+                )?;
+                let aux_rx = aux
+                    .take_receiver()
+                    .ok_or_else(|| anyhow!("EGFX: aux encoder receiver already taken"))?;
+                ctx.aux_encoder = Some(aux);
+                Some(aux_rx)
+            } else {
+                ctx.aux_encoder = None;
+                None
+            };
             ctx.region_queue.clear();
             ctx.region_debt = RegionDebt::Full;
             // Fresh throttle counters for this connection.
@@ -2474,7 +2592,7 @@ impl Gfx {
             let shipped = ctx.shipped.clone();
             std::thread::Builder::new()
                 .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped))
+                .spawn(move || gfx.ship_loop(rx, aux_rx, shipped))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
             info!("EGFX VideoToolbox encoder initialized + ship thread started");
         }
@@ -2734,6 +2852,7 @@ impl Gfx {
             // `submit_bgra` run `setup_locked` (which also rebuilds the
             // encoder and resets the throttle counters).
             ctx.encoder = None;
+            ctx.aux_encoder = None;
             ctx.region_queue.clear();
             ctx.last_regions = None;
             ctx.region_debt = RegionDebt::Full;
@@ -2849,7 +2968,7 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(&self, frames: &[EncodedFrame]) -> Result<()> {
+    fn ship_frames(&self, frames: &[EncodedFrame], aux: &[Option<EncodedFrame>]) -> Result<()> {
         let (dvc_messages, egfx_channel_id) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
@@ -2947,7 +3066,7 @@ impl Gfx {
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
-            for (f, rects) in frames.iter().zip(frame_regions.iter()) {
+            for ((f, rects), aux_frame) in frames.iter().zip(frame_regions.iter()).zip(aux) {
                 // A keyframe always repaints the whole surface.
                 let regions = if f.is_keyframe {
                     avc_regions(None, width, height)
@@ -2966,7 +3085,21 @@ impl Gfx {
                 // the surface stays blank.
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
-                let sent = server.send_avc420_frame(surface_id, &payload, &regions, ts_ms);
+                let avc444 = aux_frame.is_some() && server.supports_avc444();
+                let sent = match aux_frame {
+                    Some(a) if avc444 => {
+                        let aux_payload = self.frame_payload(a);
+                        server.send_avc444_frame(
+                            surface_id,
+                            &payload,
+                            &regions,
+                            Some(&aux_payload),
+                            Some(&regions),
+                            ts_ms,
+                        )
+                    }
+                    _ => server.send_avc420_frame(surface_id, &payload, &regions, ts_ms),
+                };
                 // Record the newest shipped frame id for the UDP frame-ack-lag
                 // backpressure gate (`submit_bgra`), and stamp the ship time
                 // into the RTT ring so `on_frame_ack` can time this frame's
@@ -2986,6 +3119,7 @@ impl Gfx {
                         "EGFX shipped keyframe (IDR)"
                     ),
                     Some(frame_id) => trace!(
+                        avc444,
                         frame_id,
                         keyframe = false,
                         payload_bytes = payload.len(),
@@ -3116,6 +3250,9 @@ impl GfxServerFactory for Gfx {
             self.bitrate_bps
         };
         *self.ctx.lock().unwrap() = Some(ConnectionContext {
+            avc444: false,
+            aux_encoder: None,
+            avc444_buf: Avc444Buffers::default(),
             region_queue: std::collections::VecDeque::new(),
             last_regions: None,
             region_debt: RegionDebt::Full,
@@ -3236,8 +3373,12 @@ impl GraphicsPipelineHandler for GfxHandler {
             caps = ?typed,
             "EGFX: client advertised capabilities"
         );
+        let avc444 = crate::negotiator::video::caps_from_egfx(&typed).avc444
+            && std::env::var("MACRDP_AVC444").as_deref() != Ok("0");
+        info!(target: "macrdp::negotiator", avc444, "video: AVC444 {}", if avc444 { "on (client advertises it)" } else { "off" });
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.client_supports_avc = supports_avc;
+            ctx.avc444 = avc444;
         }
     }
 
@@ -3447,6 +3588,7 @@ impl GraphicsPipelineHandler for GfxHandler {
             );
             ctx.is_ready = false;
             ctx.encoder = None;
+            ctx.aux_encoder = None;
             ctx.region_queue.clear();
             ctx.last_regions = None;
             ctx.region_debt = RegionDebt::Full;
