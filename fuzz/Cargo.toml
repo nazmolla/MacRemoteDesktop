@@ -1,0 +1,126 @@
+# Coverage-guided fuzz targets for the decoders that read client-controlled
+# bytes. Not part of the macrdp build or workspace; run with cargo-fuzz on a
+# nightly toolchain (see README.md). The [patch] sections mirror the root
+# Cargo.toml so these targets exercise exactly the code macrdp ships.
+[package]
+name = "macrdp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ironrdp-core = { version = "0.2", features = ["alloc"] }
+ironrdp-pdu = "0.9"
+ironrdp-dvc = "0.8"
+ironrdp-rdpdr = "0.7"
+ironrdp-rdpeusb = "0.1"
+ironrdp-rdpeudp = { path = "../vendor/ironrdp-rdpeudp" }
+
+[patch.crates-io]
+ironrdp-server = { path = "../vendor/ironrdp-server" }
+# ironrdp-acceptor is vendored (same upstream rev as the git pins below) for
+# the honor-client-desktop-size divergence — serve the resolution the client
+# requests. See vendor/ironrdp-acceptor/CLAUDE.md.
+ironrdp-acceptor = { path = "../vendor/ironrdp-acceptor" }
+# ironrdp-rdpdr is vendored (same upstream rev) for the server-direction RDPDR
+# encode/decode halves the client-oriented upstream crate lacks. See
+# vendor/ironrdp-rdpdr/CLAUDE.md.
+ironrdp-rdpdr = { path = "../vendor/ironrdp-rdpdr" }
+# ironrdp-dvc is vendored (same upstream rev) for server-side MS-RDPEDYC Soft-Sync
+# support — moving dynamic virtual channels (EGFX) onto the UDP multitransport
+# tunnel. Upstream is client-oriented and errors on the server-inbound
+# SoftSyncResponse. See vendor/ironrdp-dvc/CLAUDE.md.
+ironrdp-dvc = { path = "../vendor/ironrdp-dvc" }
+# ironrdp-rdpeusb: FORK RETIRED at the a5d1c682 pin bump — all four vendored
+# divergences merged upstream (div1 #1418 SupportedUsbVer newtype + USB_32, div2
+# #1513 usb_device match, div3 #1420 UsbConfigDesc.trailing, div4 #1321 completion
+# guards). Upstream is publish=false (git-workspace crate), so it stays a git-pin
+# rather than a crates.io version. vendor/ironrdp-rdpeusb/ was DELETED at the bump.
+ironrdp-rdpeusb = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+# ironrdp-str isn't depended on directly by macrdp, but the git
+# ironrdp-rdpeusb names it as a crates.io dep (it's a git-workspace crate, never
+# published); pin it to the same git rev so it resolves + unifies with the copy
+# the other ironrdp crates pull transitively. (Same shape as ironrdp-error above.)
+ironrdp-str              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+# ironrdp-error isn't depended on directly by macrdp, but the vendored
+# ironrdp-rdpdr names it as a crates.io dep; pin it to the same git rev as the
+# rest so it unifies with the copy the other ironrdp crates pull transitively.
+ironrdp-error            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-egfx             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-svc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+
+# The git-pinned ironrdp crates above (egfx, displaycontrol, echo, …) depend on
+# ironrdp-dvc as a path dep WITHIN the git workspace, so the [patch.crates-io]
+# redirect above doesn't reach them — without this they'd pull the git
+# ironrdp-dvc while vendored ironrdp-server pulls the vendored one, giving two
+# incompatible versions (trait mismatch). Patch the git source too so every
+# consumer resolves to the single vendored copy.
+[patch."https://github.com/Devolutions/IronRDP.git"]
+ironrdp-dvc = { path = "../vendor/ironrdp-dvc" }
+
+[[bin]]
+name = "rdpeudp_datagram"
+path = "fuzz_targets/rdpeudp_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdpemt_tunnel"
+path = "fuzz_targets/rdpemt_tunnel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "drdynvc_client"
+path = "fuzz_targets/drdynvc_client.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdpdr"
+path = "fuzz_targets/rdpdr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smartcard_returns"
+path = "fuzz_targets/smartcard_returns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "urbdrc_client"
+path = "fuzz_targets/urbdrc_client.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x224_connection_request"
+path = "fuzz_targets/x224_connection_request.rs"
+test = false
+doc = false
+bench = false
