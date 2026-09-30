@@ -392,6 +392,22 @@ impl<'a> MakeWriter<'a> for RotatingWriter {
     }
 }
 
+/// Installs a global subscriber that enables every event, once per test
+/// process, for tests that capture events with a scoped subscriber.
+///
+/// Callsite interest is cached process-wide. When a callsite is first hit on
+/// a thread with no subscriber, tracing caches "never" for it and a scoped
+/// subscriber on another thread can miss the event. That dropped captured
+/// audit events in about one run in 40. With a global subscriber that always
+/// says yes, no callsite is ever cached as "never", so each dispatch is asked.
+#[cfg(test)]
+pub(crate) fn catch_all_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +564,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry()
             .with(main_layer)
             .with(audit_layer);
+        crate::logging::catch_all_for_tests();
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: "macrdp::audit", event = "accept", src_ip = "203.0.113.5");
             tracing::info!("an operational info line");
