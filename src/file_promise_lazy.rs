@@ -49,6 +49,7 @@
 
 #![cfg(target_os = "macos")]
 
+use crate::sync_ext::LockExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,8 +141,7 @@ declare_class!(
         fn presentedItemURL(&self) -> Option<Retained<NSURL>> {
             let id = self.ivars().id;
             registry()
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .get(&id)
                 .map(|s| s.url.clone())
         }
@@ -155,8 +155,7 @@ declare_class!(
             // reader block we get will be invoked with the queue already
             // gone, but returning Some path is correct.
             registry()
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .get(&id)
                 .map(|s| s.queue.clone())
                 .unwrap_or_else(|| unsafe { NSOperationQueue::mainQueue() })
@@ -168,7 +167,7 @@ declare_class!(
             reader: *mut Block<dyn Fn(*mut Block<dyn Fn()>)>,
         ) {
             let id = self.ivars().id;
-            let state = match registry().lock().unwrap().get(&id).cloned() {
+            let state = match registry().lock_or_recover().get(&id).cloned() {
                 Some(s) => s,
                 None => {
                     // Entry gone; still call back so Finder isn't stuck.
@@ -183,7 +182,7 @@ declare_class!(
             // queue thread — Apple's coordination model expects us to be
             // able to block arbitrarily long here, while showing native
             // "Preparing to paste" progress UI).
-            let mut done = state.downloaded.lock().unwrap();
+            let mut done = state.downloaded.lock_or_recover();
             if !*done {
                 debug!(id, path = ?state.dst, "lazy presenter: downloading on read");
                 let res = state.rt.block_on(crate::file_promise::fetch_one_file(
@@ -219,7 +218,7 @@ declare_class!(
                         // doesn't try to re-fetch into the now-missing
                         // file (it'd hit the "Entry gone" path and
                         // immediately return reader(nil)).
-                        registry().lock().unwrap().remove(&id);
+                        registry().lock_or_recover().remove(&id);
                     }
                 }
             }
@@ -284,7 +283,7 @@ pub fn spawn_lazy_paste(
             return false;
         }
     };
-    *current_temp_dir.lock().unwrap() = Some(dir.clone());
+    *current_temp_dir.lock_or_recover() = Some(dir.clone());
 
     // Plan every entry's on-disk destination up front, applying the same
     // path-traversal rejection rules as the eager path. If any entry's
@@ -379,7 +378,7 @@ pub fn spawn_lazy_paste(
             rt: rt_handle.clone(),
             downloaded: Mutex::new(false),
         };
-        registry().lock().unwrap().insert(id, Arc::new(state));
+        registry().lock_or_recover().insert(id, Arc::new(state));
 
         let presenter: Retained<LazyPresenter> =
             unsafe { msg_send_id![LazyPresenter::class(), new] };
@@ -404,7 +403,7 @@ pub fn spawn_lazy_paste(
                     ProtocolObject::from_ref(&*presenter.0);
                 NSFileCoordinator::addFilePresenter(proto);
             }
-            live_presenters().lock().unwrap().insert(id, presenter);
+            live_presenters().lock_or_recover().insert(id, presenter);
         }
 
         publish_to_pasteboard(&top_level_urls, &self_cc);
@@ -419,18 +418,18 @@ pub fn spawn_lazy_paste(
 }
 
 fn cleanup_previous(current_temp_dir: &Arc<Mutex<Option<PathBuf>>>) {
-    if let Some(old) = current_temp_dir.lock().unwrap().take() {
+    if let Some(old) = current_temp_dir.lock_or_recover().take() {
         let _ = std::fs::remove_dir_all(&old);
     }
     // Drain LIVE_PRESENTERS and removeFilePresenter: each on the runloop
     // thread. Drop the REGISTRY entries here so any in-flight read sees
     // "entry gone" and exits cleanly.
     let drained: Vec<(u64, SendRetained<LazyPresenter>)> = {
-        let mut g = live_presenters().lock().unwrap();
+        let mut g = live_presenters().lock_or_recover();
         g.drain().collect()
     };
     {
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock_or_recover();
         for (id, _) in &drained {
             reg.remove(id);
         }

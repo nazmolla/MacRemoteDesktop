@@ -4,6 +4,7 @@
 //! get a static-rectangle stub so the protocol layer still builds and can be
 //! exercised on Linux CI.
 
+use crate::sync_ext::LockExt;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -663,7 +664,7 @@ impl CaptureDisplay {
         let Some(vd) = self.virtual_display.clone() else {
             return (width, height);
         };
-        let mut vd = vd.lock().expect("virtual display mutex poisoned");
+        let mut vd = vd.lock_or_recover();
         let plan = self.client_advert.as_ref().map(|advert| {
             crate::negotiator::display::plan_display(crate::negotiator::display::ClientMonitor {
                 width_px: u32::from(width),
@@ -763,7 +764,7 @@ impl CaptureDisplay {
                     //    No-op for --detach-primary (slot is None; that mode
                     //    disables the panel, not gamma).
                     if let Some(cap) = self.captured_primary.as_ref() {
-                        if let Some(g) = cap.lock().expect("captured_primary poisoned").as_ref() {
+                        if let Some(g) = cap.lock_or_recover().as_ref() {
                             let failed = g.reassert_blanking();
                             tracing::info!(
                                 failed,
@@ -775,7 +776,7 @@ impl CaptureDisplay {
                     // the panels' new frames. Cheap and idempotent (SHOW
                     // reconciles rather than stacking).
                     if let Some(sh) = self.shielded_primary.as_ref() {
-                        if let Some(g) = sh.lock().expect("shielded_primary poisoned").as_ref() {
+                        if let Some(g) = sh.lock_or_recover().as_ref() {
                             let failed = g.reassert_blanking();
                             tracing::info!(failed, "re-fitted shield windows after re-mode");
                         }
@@ -795,16 +796,12 @@ impl CaptureDisplay {
                         // the re-assert has to run AFTER each sweep, here.
                         let reblank = || {
                             if let Some(cap) = captured_primary.as_ref() {
-                                if let Some(g) =
-                                    cap.lock().expect("captured_primary poisoned").as_ref()
-                                {
+                                if let Some(g) = cap.lock_or_recover().as_ref() {
                                     g.reassert_blanking();
                                 }
                             }
                             if let Some(sh) = shielded_primary.as_ref() {
-                                if let Some(g) =
-                                    sh.lock().expect("shielded_primary poisoned").as_ref()
-                                {
+                                if let Some(g) = sh.lock_or_recover().as_ref() {
                                     g.reassert_blanking();
                                 }
                             }

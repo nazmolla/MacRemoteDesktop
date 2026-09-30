@@ -23,6 +23,7 @@
 //! client gets the server's own size. (Pure-fn coverage of the adopt decision
 //! lives in `capture.rs::adopt_client_size`; this proves the wire path.)
 
+use crate::sync_ext::LockExt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -1294,7 +1295,7 @@ struct RecordClientDisplay {
 
 impl ConnectionHandler for RecordClientDisplay {
     fn on_client_display(&mut self, _peer: SocketAddr, info: &ironrdp_acceptor::ClientDisplayInfo) {
-        *self.seen.lock().unwrap() = Some(info.clone());
+        *self.seen.lock_or_recover() = Some(info.clone());
     }
 }
 
@@ -1337,8 +1338,7 @@ async fn client_display_info_reaches_the_connection_handler() -> anyhow::Result<
         .await?;
 
     let got = seen
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .clone()
         .expect("on_client_display called");
     assert_eq!(got.desktop_scale_factor, Some(150));

@@ -55,6 +55,7 @@
 //! macOS; the standalone `--usb-spike` path still presents the hardcoded synthetic
 //! device through the same async completion machinery.
 
+use crate::sync_ext::LockExt;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -130,12 +131,12 @@ static PRESENTED_DEVICES: LazyLock<Mutex<HashSet<String>>> =
 /// Claim the presenting slot for hardware-identity `key`. Returns `true` if this
 /// call won it (present the device), `false` if another announce already holds it.
 fn claim_device(key: &str) -> bool {
-    PRESENTED_DEVICES.lock().unwrap().insert(key.to_owned())
+    PRESENTED_DEVICES.lock_or_recover().insert(key.to_owned())
 }
 
 /// Release the presenting slot for `key` (its controller went away).
 fn release_device(key: &str) {
-    PRESENTED_DEVICES.lock().unwrap().remove(key);
+    PRESENTED_DEVICES.lock_or_recover().remove(key);
 }
 
 /// Presenting-side driver for one redirected USB device, called (with a

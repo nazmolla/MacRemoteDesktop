@@ -715,6 +715,7 @@ impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_ext::LockExt;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn test_cfg() -> GuardConfig {
@@ -1102,7 +1103,7 @@ mod tests {
 
     impl std::io::Write for SharedBuf {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            self.0.lock_or_recover().extend_from_slice(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -1137,7 +1138,7 @@ mod tests {
             handler.on_authenticated(peer, false, Some("logon denied"));
         });
 
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let out = String::from_utf8(buf.0.lock_or_recover().clone()).unwrap();
         // Success event, correlated to the accepted peer.
         assert!(out.contains("event=\"auth\""), "no auth event:\n{out}");
         assert!(out.contains("outcome=\"success\""), "{out}");
@@ -1175,7 +1176,7 @@ mod tests {
             );
         });
 
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let out = String::from_utf8(buf.0.lock_or_recover().clone()).unwrap();
         assert!(
             out.contains("event=\"fingerprint\""),
             "no fingerprint event:\n{out}"
@@ -1216,7 +1217,7 @@ mod tests {
             assert!(handler.on_accept(second));
             handler.on_authenticated(first, false, Some("logon denied"));
         });
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let out = String::from_utf8(buf.0.lock_or_recover().clone()).unwrap();
         let line = out
             .lines()
             .find(|l| l.contains("event=\"auth\""))

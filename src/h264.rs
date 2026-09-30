@@ -48,6 +48,7 @@
 
 #![cfg(target_os = "macos")]
 
+use crate::sync_ext::LockExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1701,7 +1702,7 @@ impl Gfx {
         if !on_reliable_udp {
             return; // not on the reliable UDP tunnel → nothing to switch
         }
-        let mut guard = self.ctx.lock().unwrap();
+        let mut guard = self.ctx.lock_or_recover();
         let Some(ctx) = guard.as_mut() else {
             return;
         };
@@ -1759,7 +1760,7 @@ impl Gfx {
         // lock-order invariant). The decision extracts what the action needs here.
         let mut blank_recovery: Option<(BlankAction, GfxServerHandle, u16, u16, u32)> = None;
         let force_keyframe = {
-            let mut guard = self.ctx.lock().unwrap();
+            let mut guard = self.ctx.lock_or_recover();
             let Some(ctx) = guard.as_mut() else {
                 return Ok(false); // no active connection
             };
@@ -2143,7 +2144,7 @@ impl Gfx {
         // Submit to VideoToolbox (async). The ship thread delivers + ships the
         // output; we just count the submission for the drop-to-latest throttle.
         {
-            let mut guard = self.ctx.lock().unwrap();
+            let mut guard = self.ctx.lock_or_recover();
             let Some(ctx) = guard.as_mut() else {
                 return Ok(true);
             };
@@ -2496,7 +2497,7 @@ impl Gfx {
         let (width, height) = self.desktop_size.get();
         if ctx.surface_id.is_none() {
             ctx.dims = (width, height);
-            let mut server = ctx.server_handle.lock().unwrap();
+            let mut server = ctx.server_handle.lock_or_recover();
             server.set_output_dimensions(width, height);
             // Emit RESET_GRAPHICS with an explicit single-monitor layout
             // covering the full desktop, BEFORE create_surface. The auto-reset
@@ -2635,7 +2636,7 @@ impl Gfx {
         height: u16,
     ) -> Result<()> {
         let (dvc_messages, egfx_channel_id, new_sid) = {
-            let mut server = server_handle.lock().unwrap();
+            let mut server = server_handle.lock_or_recover();
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX blank remap: channel_id not assigned"))?;
@@ -2656,8 +2657,7 @@ impl Gfx {
                     .map_err(|e| anyhow!("EGFX blank remap: encode_dvc_messages failed: {e}"))?;
             let sender = self
                 .sender
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .clone()
                 .ok_or_else(|| anyhow!("EGFX blank remap: server-event sender not set"))?;
             sender
@@ -2668,7 +2668,7 @@ impl Gfx {
         }
         // Publish the fresh surface to the connection — unless a reconnect
         // swapped the context out from under the remap.
-        let mut guard = self.ctx.lock().unwrap();
+        let mut guard = self.ctx.lock_or_recover();
         match guard.as_mut() {
             Some(ctx) if Arc::ptr_eq(&ctx.server_handle, server_handle) => {
                 ctx.surface_id = Some(new_sid);
@@ -2718,8 +2718,7 @@ impl Gfx {
     /// ticking while this is true).
     pub(crate) fn refine_pending(&self) -> bool {
         self.ctx
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .as_ref()
             .is_some_and(|ctx| ctx.refine.has_pending())
     }
@@ -2734,7 +2733,7 @@ impl Gfx {
     pub(crate) fn refine_tick(&self, bgra: &[u8], stride: usize, piggyback: bool) -> Result<()> {
         let now = Instant::now();
         let (surface_id, server_handle, epoch, ready, tiles) = {
-            let mut guard = self.ctx.lock().unwrap();
+            let mut guard = self.ctx.lock_or_recover();
             let Some(ctx) = guard.as_mut() else {
                 return Ok(());
             };
@@ -2799,7 +2798,7 @@ impl Gfx {
         };
         let ts_ms = u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
         let sent = {
-            let mut server = server_handle.lock().unwrap();
+            let mut server = server_handle.lock_or_recover();
             match server.channel_id() {
                 Some(channel) if server.send_mixed_frame(surface_id, tiles, ts_ms).is_some() => {
                     Some((server.drain_output(), channel))
@@ -2808,7 +2807,7 @@ impl Gfx {
             }
         };
         let Some((dvc_messages, egfx_channel_id)) = sent else {
-            if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
                 Self::refine_failed(ctx, &ready, now);
             }
             return Ok(());
@@ -2821,8 +2820,7 @@ impl Gfx {
                 .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
         let sender = self
             .sender
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .clone()
             .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
         sender
@@ -2844,7 +2842,7 @@ impl Gfx {
     }
 
     pub(crate) fn reset_for_live_resize(&self) {
-        let mut guard = self.ctx.lock().unwrap();
+        let mut guard = self.ctx.lock_or_recover();
         if let Some(ctx) = guard.as_mut() {
             // Order matters only in that both must be cleared before the
             // post-reactivation submit: encoder drop tears down the old VT
@@ -2952,8 +2950,7 @@ impl Gfx {
     fn perform_blank_drop(&self) -> Result<()> {
         let sender = self
             .sender
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .clone()
             .ok_or_else(|| anyhow!("EGFX blank drop: server-event sender not set"))?;
         warn!(
@@ -2992,7 +2989,7 @@ impl Gfx {
                 ship_times,
                 frame_regions,
             ) = {
-                let mut guard = self.ctx.lock().unwrap();
+                let mut guard = self.ctx.lock_or_recover();
                 let ctx = guard
                     .as_mut()
                     .ok_or_else(|| anyhow!("EGFX: ctx vanished mid-submit"))?;
@@ -3061,7 +3058,7 @@ impl Gfx {
             };
 
             // Phase 2: lock `server_handle` ALONE (ctx already released).
-            let mut server = server_handle.lock().unwrap();
+            let mut server = server_handle.lock_or_recover();
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
@@ -3106,7 +3103,7 @@ impl Gfx {
                 // round trip for the queue-delay congestion signal.
                 if let Some(frame_id) = sent {
                     last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
-                    ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
+                    ship_times.lock_or_recover()[frame_id as usize % RTT_RING] =
                         (u64::from(frame_id), Instant::now());
                 }
                 match sent {
@@ -3146,8 +3143,7 @@ impl Gfx {
                 .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
         let sender = self
             .sender
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .clone()
             .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
         sender
@@ -3197,7 +3193,7 @@ impl core::fmt::Debug for Gfx {
 
 impl ServerEventSender for Gfx {
     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
-        *self.sender.lock().unwrap() = Some(sender);
+        *self.sender.lock_or_recover() = Some(sender);
     }
 }
 
@@ -3249,7 +3245,7 @@ impl GfxServerFactory for Gfx {
         } else {
             self.bitrate_bps
         };
-        *self.ctx.lock().unwrap() = Some(ConnectionContext {
+        *self.ctx.lock_or_recover() = Some(ConnectionContext {
             avc444: false,
             aux_encoder: None,
             avc444_buf: Avc444Buffers::default(),
@@ -3376,14 +3372,14 @@ impl GraphicsPipelineHandler for GfxHandler {
         let avc444 = crate::negotiator::video::caps_from_egfx(&typed).avc444
             && std::env::var("MACRDP_AVC444").as_deref() != Ok("0");
         info!(target: "macrdp::negotiator", avc444, "video: AVC444 {}", if avc444 { "on (client advertises it)" } else { "off" });
-        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+        if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
             ctx.client_supports_avc = supports_avc;
             ctx.avc444 = avc444;
         }
     }
 
     fn on_ready(&mut self, negotiated: &CapabilitySet) {
-        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+        if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
             // Only drive the H.264 path if the client advertised AVC420 decode
             // support. Otherwise leave is_ready false → submit_bgra returns
             // Ok(false) → capture.rs uses legacy BitmapUpdate. Shipping AVC420
@@ -3421,7 +3417,7 @@ impl GraphicsPipelineHandler for GfxHandler {
         // Feed ack-driven IDR recovery (EGFX-on-lossy): record liveness, and note
         // whether the client suspended acks (queueDepth == SUSPEND_FRAME_
         // ACKNOWLEDGEMENT 0xFFFFFFFF) — with acks off, loss can't be inferred.
-        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+        if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
             ctx.last_ack_at = Instant::now();
             ctx.acks_suspended = queue_depth == 0xFFFF_FFFF;
             // Record decode progress for the UDP frame-ack-lag backpressure gate.
@@ -3437,7 +3433,7 @@ impl GraphicsPipelineHandler for GfxHandler {
                 // Ack-RTT sample for the adaptive controller's queue-delay
                 // signal: time since this exact frame left send_avc420_frame.
                 let (slot_id, shipped_at) =
-                    ctx.ship_times.lock().unwrap()[frame_id as usize % RTT_RING];
+                    ctx.ship_times.lock_or_recover()[frame_id as usize % RTT_RING];
                 let sample_ms = if slot_id == u64::from(frame_id) {
                     // Exact match: the frame's true ship→ack round trip.
                     Some(shipped_at.elapsed().as_secs_f64() * 1000.0)
@@ -3508,7 +3504,7 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// (like `on_frame_ack`), so it only touches ctx — never `server_handle`.
     fn on_qoe_metrics(&mut self, metrics: QoeMetrics) {
         trace!(?metrics, "EGFX on_qoe_metrics");
-        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+        if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
             let was = ctx.qoe;
             ctx.qoe.record(metrics.time_diff_dr);
             if metrics.time_diff_dr > 0 {
@@ -3578,7 +3574,7 @@ impl GraphicsPipelineHandler for GfxHandler {
         // We can only log our own per-connection view here: the
         // `GraphicsPipelineServer` mutex is held while this callback runs, so we
         // must not lock `server_handle`.
-        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+        if let Some(ctx) = self.ctx.lock_or_recover().as_mut() {
             debug!(
                 surface_id = ?ctx.surface_id,
                 dims = ?ctx.dims,

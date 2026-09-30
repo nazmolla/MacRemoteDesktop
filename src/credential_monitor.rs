@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 use crate::auth::Verdict;
+use crate::sync_ext::RwLockExt;
 
 /// How often the current password is re-checked with PAM.
 pub const RECHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -234,10 +235,7 @@ impl Wiring {
             password: password.to_owned(),
             domain: None,
         };
-        *self
-            .credentials
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(creds);
+        *self.credentials.write_or_recover() = Some(creds);
     }
 
     fn apply(&self, action: &Action) {
@@ -245,10 +243,7 @@ impl Wiring {
             Action::Nothing | Action::Validate(_) => {}
             Action::Revoke => {
                 self.install(&unguessable_password());
-                *self
-                    .secret
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                *self.secret.write_or_recover() = None;
                 tracing::error!(
                     user = %self.username,
                     "the account password was rejected by the system (changed, or the account \
@@ -258,10 +253,7 @@ impl Wiring {
             }
             Action::Install(password) => {
                 self.install(password);
-                *self
-                    .secret
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(password.clone());
+                *self.secret.write_or_recover() = Some(password.clone());
                 tracing::info!(user = %self.username, "new password from the Keychain accepted for RDP logins");
             }
         }
@@ -452,18 +444,17 @@ mod tests {
         wiring.install("old");
         wiring.apply(&Action::Revoke);
         let now = creds
-            .read()
-            .unwrap()
+            .read_or_recover()
             .clone()
             .expect("credentials still set");
         assert_ne!(now.password, "old");
         assert_eq!(now.password.len(), 64);
-        assert!(secret.read().unwrap().is_none());
+        assert!(secret.read_or_recover().is_none());
 
         wiring.apply(&Action::Install(pw("new")));
-        assert_eq!(creds.read().unwrap().as_ref().unwrap().password, "new");
+        assert_eq!(creds.read_or_recover().as_ref().unwrap().password, "new");
         assert_eq!(
-            secret.read().unwrap().as_deref().map(String::as_str),
+            secret.read_or_recover().as_deref().map(String::as_str),
             Some("new")
         );
     }

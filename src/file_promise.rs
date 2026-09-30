@@ -24,6 +24,7 @@
 
 #![cfg(target_os = "macos")]
 
+use crate::sync_ext::LockExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
@@ -110,7 +111,7 @@ impl DownloadRouter {
             sid = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         }
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(sid, tx);
+        self.pending.lock_or_recover().insert(sid, tx);
         (sid, rx)
     }
 
@@ -119,7 +120,7 @@ impl DownloadRouter {
     /// silently if no one's waiting (e.g. paste was cancelled).
     pub fn deliver(&self, response: FileContentsResponse<'static>) {
         let stream_id = response.stream_id();
-        if let Some(tx) = self.pending.lock().unwrap().remove(&stream_id) {
+        if let Some(tx) = self.pending.lock_or_recover().remove(&stream_id) {
             let _ = tx.send(response);
         } else {
             debug!(stream_id, "no awaiter for FileContentsResponse; dropping");
@@ -160,7 +161,7 @@ pub fn spawn_remote_paste(
     rt_handle.spawn(async move {
         // Wipe any previous temp dir before starting the new download so
         // /tmp doesn't accumulate stale paste data across copies.
-        if let Some(old) = current_temp_dir.lock().unwrap().take() {
+        if let Some(old) = current_temp_dir.lock_or_recover().take() {
             let _ = std::fs::remove_dir_all(&old);
         }
         let dir = match make_temp_dir() {
@@ -170,7 +171,7 @@ pub fn spawn_remote_paste(
                 return;
             }
         };
-        *current_temp_dir.lock().unwrap() = Some(dir.clone());
+        *current_temp_dir.lock_or_recover() = Some(dir.clone());
 
         // Compute every entry's full destination path up front. Path-
         // safety check rejects anything that escapes the temp root via
@@ -611,7 +612,7 @@ async fn fetch_range(
 }
 
 fn push_request(sender: &EventSender, req: FileContentsRequest) -> Result<(), String> {
-    let guard = sender.lock().unwrap();
+    let guard = sender.lock_or_recover();
     let s = guard
         .as_ref()
         .ok_or_else(|| "event sender unavailable (server shutting down?)".to_string())?;

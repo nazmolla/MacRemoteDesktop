@@ -395,6 +395,7 @@ impl<'a> MakeWriter<'a> for RotatingWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_ext::LockExt;
 
     fn unique_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -523,7 +524,7 @@ mod tests {
         }
         impl Write for BufW {
             fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
+                self.0.lock_or_recover().extend_from_slice(b);
                 Ok(b.len())
             }
             fn flush(&mut self) -> io::Result<()> {
@@ -552,8 +553,8 @@ mod tests {
             tracing::info!("an operational info line");
         });
 
-        let audit = String::from_utf8(audit_buf.0.lock().unwrap().clone()).unwrap();
-        let main = String::from_utf8(main_buf.0.lock().unwrap().clone()).unwrap();
+        let audit = String::from_utf8(audit_buf.0.lock_or_recover().clone()).unwrap();
+        let main = String::from_utf8(main_buf.0.lock_or_recover().clone()).unwrap();
         // Reached the audit sink as JSON despite the `warn` operational filter.
         assert!(
             audit.contains("\"event\":\"accept\"") && audit.contains("203.0.113.5"),
