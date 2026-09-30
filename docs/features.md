@@ -1,5 +1,7 @@
 # Features / status — what works today
 
+**Negotiated sessions (fork).** No feature flags are needed: the server picks display size and scale per client (1× at 100%, pixel-exact Retina at 200%, Retina downscaled at 125–175%), sRGB virtual displays, Ctrl→Cmd for non-Apple clients, the codec (AVC444 when the client advertises it, else AVC420, else bitmaps), dirty-region H.264 updates, and lossless ClearCodec refinement of regions idle for 200 ms. Each decision is logged under `macrdp::negotiator`. Measured: chroma-edge ΔE00 31.9 (AVC420) → 0.18 (AVC444); refined tiles are bit-exact (`docs/research/phase2a-verification.md`). Hidden overrides: `MACRDP_NEGOTIATE=0`, `MACRDP_AVC444=0`.
+
 Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - Connect over TLS to the Mac on port 3390 with a local Mac username/password.
 - See the primary display at native resolution with incremental damage-region updates.
