@@ -54,7 +54,7 @@ Notes:
 - **Loopback is exempt** from the auth guard, and audit events fire for real (non-loopback)
   peers — i.e. the stream is meaningful only when `--bind` exposes the server off-loopback.
 
-## Schema (v1)
+## Schema (v2)
 
 One JSON object per line. `schema_version` pins the contract — it bumps only on a **breaking**
 field change (rename/removal/semantic shift), never for additive fields, so detection/parse
@@ -65,14 +65,14 @@ Fields common to the events (all carry these except where the `src_port` row not
 | field | type | notes |
 |---|---|---|
 | `timestamp` | string | RFC3339 UTC |
-| `level` | string | `INFO` (accept/disconnect, auth success) or `WARN` (reject, auth failure) |
+| `level` | string | `INFO` (accept/disconnect, auth success) or `WARN` (reject, auth failure, handshake_failed) |
 | `target` | string | always `macrdp::audit` |
-| `schema_version` | int | `1` |
+| `schema_version` | int | `2` |
 | `macrdp_version` | string | e.g. `0.8.32` |
 | `host` | string | server hostname (a collector usually adds its own too) |
-| `event` | string | `accept` \| `reject` \| `auth` \| `fingerprint` \| `disconnect` |
+| `event` | string | `accept` \| `reject` \| `auth` \| `handshake_failed` \| `fingerprint` \| `disconnect` |
 | `src_ip` | string | peer IP — correlation key |
-| `src_port` | int | peer source port — correlation key (present on `accept`/`auth`/`disconnect`; **absent on `reject`**, which is a per-IP decision) |
+| `src_port` | int | peer source port — correlation key (present on `accept`/`auth`/`handshake_failed`/`fingerprint`/`disconnect`; **absent on `reject`**, which is a per-IP decision) |
 
 Event-specific:
 
@@ -82,16 +82,20 @@ Event-specific:
 | `reject` | `reason` (`rate_limit` \| `lockout`), and `window_attempts` **or** `retry_after_secs` |
 | `auth` | `outcome` (`success` \| `did_not_complete`), and `reason` (only on `did_not_complete`) |
 | `fingerprint` | `client_name`, `rdp_version`, `client_build`, `platform` (which RDP client connected — informational, not a trust signal) |
-| `disconnect` | `duration_ms`, `outcome` (`success` \| `failure`) |
+| `handshake_failed` | `reason` (`timeout` \| `tls` \| `protocol` \| `capacity`): the connection ended before authenticating, for a reason other than rejected credentials |
+| `disconnect` | `duration_ms`, `outcome` (`clean` \| `error`); emitted only for a session that logged in |
 
 The `auth` event is the explicit CredSSP/NLA login verdict, emitted once when the exchange
 resolves: `success` = the client's credentials validated; `did_not_complete` = auth did not
 finish (dominated by a wrong password, but also a client abort or a rare mid-exchange transport
 error — the `reason`, a short sspi error description, disambiguates and never contains
 credential material; it is control-char-stripped and length-bounded, so it is always a safe
-single-line token — no log-injection risk in either sink). It's strictly better than inferring the verdict from `disconnect`'s
-duration heuristic. **v1 caveats:** it carries no client-*attempted* username (macrdp authenticates a
+single-line token — no log-injection risk in either sink). **Caveat:** it carries no client-*attempted* username (macrdp authenticates a
 static credential — surfacing the attempted user is a possible future additive field).
+
+**Changes from v1:** `handshake_failed` is new; `disconnect` is now emitted only for a session
+that logged in, and its `outcome` is `clean` or `error` instead of the old heuristic `success` or
+`failure`.
 
 **Correlation:** an `accept`, its `auth`, and its matching `disconnect` share the
 `(src_ip, src_port)` tuple. (Ephemeral ports can be reused over time; a monotonic
@@ -100,11 +104,11 @@ per-connection id is a possible future additive field.)
 ### Example lines
 
 ```json
-{"timestamp":"2026-07-10T18:22:04.117Z","level":"INFO","target":"macrdp::audit","schema_version":1,"macrdp_version":"0.8.32","host":"mac-studio","event":"accept","src_ip":"203.0.113.5","src_port":54132}
-{"timestamp":"2026-07-10T18:22:04.402Z","level":"INFO","target":"macrdp::audit","schema_version":1,"macrdp_version":"0.8.32","host":"mac-studio","event":"auth","src_ip":"203.0.113.5","src_port":54132,"outcome":"success"}
-{"timestamp":"2026-07-10T18:22:04.451Z","level":"INFO","target":"macrdp::audit","schema_version":1,"macrdp_version":"0.8.32","host":"mac-studio","event":"fingerprint","src_ip":"203.0.113.5","src_port":54132,"client_name":"GENMACWIN","rdp_version":"0x80011","client_build":26100,"platform":"WINDOWS/WINDOWS_NT"}
-{"timestamp":"2026-07-10T18:22:09.882Z","level":"WARN","target":"macrdp::audit","schema_version":1,"macrdp_version":"0.8.32","host":"mac-studio","event":"reject","reason":"lockout","src_ip":"203.0.113.9","retry_after_secs":240}
-{"timestamp":"2026-07-10T18:25:41.030Z","level":"INFO","target":"macrdp::audit","schema_version":1,"macrdp_version":"0.8.32","host":"mac-studio","event":"disconnect","src_ip":"203.0.113.5","src_port":54132,"duration_ms":216913,"outcome":"success"}
+{"timestamp":"2026-07-10T18:22:04.117Z","level":"INFO","target":"macrdp::audit","schema_version":2,"macrdp_version":"0.8.32","host":"mac-studio","event":"accept","src_ip":"203.0.113.5","src_port":54132}
+{"timestamp":"2026-07-10T18:22:04.402Z","level":"INFO","target":"macrdp::audit","schema_version":2,"macrdp_version":"0.8.32","host":"mac-studio","event":"auth","src_ip":"203.0.113.5","src_port":54132,"outcome":"success"}
+{"timestamp":"2026-07-10T18:22:04.451Z","level":"INFO","target":"macrdp::audit","schema_version":2,"macrdp_version":"0.8.32","host":"mac-studio","event":"fingerprint","src_ip":"203.0.113.5","src_port":54132,"client_name":"GENMACWIN","rdp_version":"0x80011","client_build":26100,"platform":"WINDOWS/WINDOWS_NT"}
+{"timestamp":"2026-07-10T18:22:09.882Z","level":"WARN","target":"macrdp::audit","schema_version":2,"macrdp_version":"0.8.32","host":"mac-studio","event":"reject","reason":"lockout","src_ip":"203.0.113.9","retry_after_secs":240}
+{"timestamp":"2026-07-10T18:25:41.030Z","level":"INFO","target":"macrdp::audit","schema_version":2,"macrdp_version":"0.8.32","host":"mac-studio","event":"disconnect","src_ip":"203.0.113.5","src_port":54132,"duration_ms":216913,"outcome":"clean"}
 ```
 
 ## Forwarding with a collector
