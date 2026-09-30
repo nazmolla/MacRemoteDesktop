@@ -1118,7 +1118,7 @@ mod macos {
     /// (lock visibility wins); `MACRDP_SHIELD_KEEP_PHYSICAL_MAIN=0` restores the
     /// old vd-as-main behaviour for A/B comparison.
     pub fn shield_keeps_physical_main() -> bool {
-        match std::env::var("MACRDP_SHIELD_KEEP_PHYSICAL_MAIN") {
+        match crate::tunables::var("MACRDP_SHIELD_KEEP_PHYSICAL_MAIN") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false") && !v.is_empty(),
             Err(_) => true,
         }

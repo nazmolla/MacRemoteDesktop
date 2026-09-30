@@ -59,10 +59,10 @@ use std::time::{Duration, Instant};
 const MAX_TRACKED_IPS: usize = 50_000;
 
 /// Interpret an on/off env toggle by *value*, not mere presence. `true` unless
-/// set to a falsey spelling. Mirrors `crate::multitransport::env_truthy`; kept
+/// set to a falsey spelling. Mirrors `crate::tunables::truthy`; kept
 /// local so this module stays self-contained and platform-independent.
 fn env_on(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
+    match crate::tunables::var(name) {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "no" | "off"
@@ -74,7 +74,7 @@ fn env_on(name: &str, default: bool) -> bool {
 /// Parse a `u64` env var, falling back to `default` on unset/garbage. `0` is a
 /// legal value (it disables the corresponding lever), so it is NOT filtered out.
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
+    crate::tunables::var(name)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(default)
@@ -84,7 +84,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// variable gives `default`; garbage or an out-of-range value is rejected with a
 /// warning and also gives `default`, rather than being silently truncated.
 fn env_count<T: TryFrom<u64> + Copy + std::fmt::Display>(name: &str, default: T) -> T {
-    let Ok(raw) = std::env::var(name) else {
+    let Ok(raw) = crate::tunables::var(name) else {
         return default;
     };
     let raw = raw.trim();
@@ -1196,32 +1196,25 @@ mod tests {
         );
     }
 
-    /// Concurrent handshakes: the audit record names the peer the server
-    /// reports, not whichever connection was accepted last.
+    /// Concurrent handshakes: a verdict is charged to the peer the server
+    /// reports, not to whichever connection was accepted last. Checked through
+    /// the lockout counter rather than captured log output, which a scoped
+    /// tracing subscriber can miss when other test threads swap subscribers.
     #[test]
-    fn auth_events_carry_the_reported_peer_not_the_last_accepted() {
+    fn verdicts_are_charged_to_the_reported_peer_not_the_last_accepted() {
         use ironrdp_server::ConnectionHandler;
-
-        let buf = SharedBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
         let first = std::net::SocketAddr::from((Ipv4Addr::new(198, 51, 100, 1), 40000));
         let second = std::net::SocketAddr::from((Ipv4Addr::new(198, 51, 100, 2), 40001));
-        tracing::subscriber::with_default(subscriber, || {
-            let mut handler = AuthGuardHandler {
-                core: AuthGuardCore::with_config(test_cfg()),
-            };
-            assert!(handler.on_accept(first));
-            assert!(handler.on_accept(second));
+        let mut handler = AuthGuardHandler {
+            core: AuthGuardCore::with_config(test_cfg()),
+        };
+        for k in 0..5u16 {
+            // `second` is always the most recent accept when `first` fails.
+            assert!(handler.on_accept(std::net::SocketAddr::new(first.ip(), 41000 + k)));
+            assert!(handler.on_accept(std::net::SocketAddr::new(second.ip(), 42000 + k)));
             handler.on_authenticated(first, false, Some("logon denied"));
-        });
-        let out = String::from_utf8(buf.0.lock_or_recover().clone()).unwrap();
-        let line = out
-            .lines()
-            .find(|l| l.contains("event=\"auth\""))
-            .expect("auth event");
-        assert!(line.contains("src_ip=198.51.100.1"), "{line}");
+        }
+        assert!(!handler.on_accept(first), "the failing peer is locked out");
+        assert!(handler.on_accept(second), "the other peer is not");
     }
 }

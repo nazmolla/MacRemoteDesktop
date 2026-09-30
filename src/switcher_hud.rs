@@ -53,7 +53,7 @@ pub fn set_display_id(id: u32) {
 }
 
 fn port() -> u16 {
-    std::env::var("MACRDP_HUD_PORT")
+    crate::tunables::var("MACRDP_HUD_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PORT)

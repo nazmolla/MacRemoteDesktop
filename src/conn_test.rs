@@ -571,7 +571,7 @@ async fn server_survives_many_reconnects() -> anyhow::Result<()> {
     use anyhow::Context as _;
     init_tracing();
 
-    let n: usize = std::env::var("MACRDP_SOAK_RECONNECTS")
+    let n: usize = crate::tunables::var("MACRDP_SOAK_RECONNECTS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(25);

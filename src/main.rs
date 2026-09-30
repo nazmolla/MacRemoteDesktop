@@ -57,6 +57,7 @@ mod shield;
 mod stats;
 mod switcher_hud;
 mod sync_ext;
+mod tunables;
 mod usb_redirect;
 mod videotoolbox;
 mod virtual_display;
@@ -814,7 +815,7 @@ fn prevent_sleep() {
 /// up the repo tree from `target/<profile>/macrdp`).
 #[cfg(target_os = "macos")]
 fn locate_hud_helper() -> Option<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os("MACRDP_HUD_HELPER") {
+    if let Some(p) = crate::tunables::var_os("MACRDP_HUD_HELPER") {
         let p = std::path::PathBuf::from(p);
         if p.is_file() {
             return Some(p);
@@ -841,7 +842,7 @@ fn locate_hud_helper() -> Option<std::path::PathBuf> {
 /// copy (`../Resources/macrdpshield`), else the dev build.
 #[cfg(target_os = "macos")]
 fn locate_shield_helper() -> Option<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os("MACRDP_SHIELD_HELPER") {
+    if let Some(p) = crate::tunables::var_os("MACRDP_SHIELD_HELPER") {
         let p = std::path::PathBuf::from(p);
         if p.is_file() {
             return Some(p);
@@ -878,7 +879,7 @@ fn spawn_shield_helper() -> Result<std::process::Child> {
     })?;
     let mut cmd = std::process::Command::new(&path);
     cmd.env("MACRDP_SHIELD_PARENT", std::process::id().to_string());
-    if let Some(port) = std::env::var_os("MACRDP_SHIELD_PORT") {
+    if let Some(port) = crate::tunables::var_os("MACRDP_SHIELD_PORT") {
         cmd.env("MACRDP_SHIELD_PORT", port);
     }
     // stderr is INHERITED, not nulled (the HUD helper nulls all three). Every
@@ -914,7 +915,7 @@ fn spawn_hud_helper() -> Option<std::process::Child> {
     };
     let mut cmd = std::process::Command::new(&path);
     cmd.env("MACRDP_HUD_PARENT", std::process::id().to_string());
-    if let Some(port) = std::env::var_os("MACRDP_HUD_PORT") {
+    if let Some(port) = crate::tunables::var_os("MACRDP_HUD_PORT") {
         cmd.env("MACRDP_HUD_PORT", port);
     }
     cmd.stdin(std::process::Stdio::null())
@@ -1239,7 +1240,7 @@ fn parse_lock_on_disconnect_delay_ms(env_override: Option<&str>) -> u64 {
 
 fn lock_on_disconnect_delay_ms() -> u64 {
     parse_lock_on_disconnect_delay_ms(
-        std::env::var("MACRDP_LOCK_ON_DISCONNECT_DELAY_MS")
+        crate::tunables::var("MACRDP_LOCK_ON_DISCONNECT_DELAY_MS")
             .ok()
             .as_deref(),
     )
@@ -1970,7 +1971,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         if virtual_display::take_detach_reenable_failed() {
                             if detach_restart_on_stuck(
                                 std::io::stdout().is_terminal(),
-                                std::env::var("MACRDP_DETACH_RESTART_ON_STUCK")
+                                crate::tunables::var("MACRDP_DETACH_RESTART_ON_STUCK")
                                     .ok()
                                     .as_deref(),
                             ) {
@@ -2608,7 +2609,7 @@ async fn async_main() -> Result<()> {
     if let Some(cfg_path) = args.config.clone() {
         args = args_from_config(&cfg_path)?;
     }
-    let negotiation_reasons = if std::env::var("MACRDP_NEGOTIATE").as_deref() == Ok("0") {
+    let negotiation_reasons = if crate::tunables::var("MACRDP_NEGOTIATE").as_deref() == Ok("0") {
         vec!["negotiation disabled (MACRDP_NEGOTIATE=0): flags only".to_owned()]
     } else {
         let host = negotiator::session::HostCaps {
@@ -2653,12 +2654,14 @@ async fn async_main() -> Result<()> {
     // AUDIT_FILE wins; otherwise MACRDP_AUDIT_JSON=1 enables it at the default
     // `<log-dir-or-~/Library/Logs>/macrdp-audit.log`. Off (None) by default, so the
     // logging setup is byte-identical unless an operator opts in.
-    let audit_json_env = std::env::var("MACRDP_AUDIT_JSON").ok().is_some_and(|v| {
-        !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "no" | "off"
-        )
-    });
+    let audit_json_env = crate::tunables::var("MACRDP_AUDIT_JSON")
+        .ok()
+        .is_some_and(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        });
     let audit_file: Option<PathBuf> = args.audit_file.clone().or_else(|| {
         if audit_json_env {
             let dir = args
@@ -2672,6 +2675,9 @@ async fn async_main() -> Result<()> {
         }
     });
     logging::init(filter, args.log_dir.as_deref(), audit_file.as_deref());
+    // Snapshot every MACRDP_* tunable now that config.env has been bridged into
+    // the environment, and log the ones that are set.
+    tunables::load();
     for reason in &negotiation_reasons {
         tracing::info!(target: "macrdp::negotiator", "{reason}");
     }
@@ -2694,7 +2700,7 @@ async fn async_main() -> Result<()> {
     // MACRDP_HEALTHCHECK=0/1 overrides; see src/health.rs.
     if health::should_arm(
         std::io::stdout().is_terminal(),
-        std::env::var("MACRDP_HEALTHCHECK").ok().as_deref(),
+        crate::tunables::var("MACRDP_HEALTHCHECK").ok().as_deref(),
     ) {
         health::spawn(
             tokio::runtime::Handle::current(),
@@ -3546,7 +3552,7 @@ async fn async_main() -> Result<()> {
     // session, NLA re-auths every connection), so a fixed per-process value is
     // fine — it only enables the client's auto-reconnect loop.
     let auto_reconnect = !matches!(
-        std::env::var("MACRDP_AUTO_RECONNECT").as_deref(),
+        crate::tunables::var("MACRDP_AUTO_RECONNECT").as_deref(),
         Ok("0") | Ok("false") | Ok("FALSE")
     );
     if auto_reconnect {
@@ -3576,26 +3582,18 @@ async fn async_main() -> Result<()> {
     // the session over TCP.
     //
     // `--enable-lossy-audio` is the one-switch promotion of the verified lossy-audio
-    // path: it bridges the three expert env gates the vendored listener + provider
-    // read (offer the lossy UdpFecL transport, use lossy deliver-on-arrival delivery,
-    // and 1+1 duplicate sends), and implies the UDP listener below. The macrdp-side
-    // `MACRDP_UDP_LOSSY_AUDIO` gate is OR'd directly at the registration site. Setting
-    // env here (single-threaded, before the listener task spawns + before any
-    // connection reads the provider) is the minimal bridge — no vendored signature
-    // change. The env gates still work standalone as a fallback.
-    if args.enable_lossy_audio {
-        std::env::set_var("MACRDP_UDP_OFFER_FECL", "1");
-        std::env::set_var("MACRDP_UDP_LOSSY_DELIVERY", "1");
-        std::env::set_var("MACRDP_UDP_LOSSY_AUDIO_DUP", "1");
-        if !args.enable_aac || !args.enable_h264 {
-            warn!(
-                enable_aac = args.enable_aac,
-                enable_h264 = args.enable_h264,
-                "--enable-lossy-audio needs --enable-aac (MS-RDPEA requires AAC for the lossy DVC) \
-                 AND --enable-h264 (the lossy-audio Soft-Sync rides the EGFX dispatch path); without \
-                 both, audio stays on TCP"
-            );
-        }
+    // path: it switches on the lossy UdpFecL offer, lossy deliver-on-arrival delivery
+    // and 1+1 duplicate sends (passed to the provider and the listener config below),
+    // and implies the UDP listener. The matching MACRDP_UDP_* tunables still work
+    // alone for experiments.
+    if args.enable_lossy_audio && (!args.enable_aac || !args.enable_h264) {
+        warn!(
+            enable_aac = args.enable_aac,
+            enable_h264 = args.enable_h264,
+            "--enable-lossy-audio needs --enable-aac (MS-RDPEA requires AAC for the lossy DVC) \
+             AND --enable-h264 (the lossy-audio Soft-Sync rides the EGFX dispatch path); without \
+             both, audio stays on TCP"
+        );
     }
     let _udp_listener = if args.enable_udp_multitransport || args.enable_lossy_audio {
         // The server ISN isn't client-validated; seed it from the clock to avoid a
@@ -3604,9 +3602,24 @@ async fn async_main() -> Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
+        let listener_defaults = ironrdp_server::ListenerConfig::default();
         let cfg = ironrdp_server::ListenerConfig {
             server_isn_seed: isn_seed,
-            ..Default::default()
+            // --enable-lossy-audio implies lossy delivery and 1+1 duplication;
+            // each can also be switched on alone for experiments.
+            lossy_delivery: args.enable_lossy_audio
+                || tunables::truthy("MACRDP_UDP_LOSSY_DELIVERY"),
+            lossy_duplicate: args.enable_lossy_audio
+                || tunables::truthy("MACRDP_UDP_LOSSY_AUDIO_DUP"),
+            tunnel_dead_secs: tunables::parsed(
+                "MACRDP_UDP_TUNNEL_DEAD_SECS",
+                listener_defaults.tunnel_dead_secs,
+            ),
+            offer_cooldown_secs: tunables::parsed(
+                "MACRDP_UDP_MT_COOLDOWN_SECS",
+                listener_defaults.offer_cooldown_secs,
+            ),
+            ..listener_defaults
         };
         // M5a: a shared cookie registry binds an inbound UDP tunnel to a real TCP
         // session. The server registers each issued cookie here; the listener
@@ -3642,11 +3655,10 @@ async fn async_main() -> Result<()> {
         .await
         {
             Ok(listener) => {
-                // EGFX migration is controlled by --udp-migrate-egfx; the legacy
-                // MACRDP_UDP_MIGRATE_EGFX env var still works as a fallback (the
-                // lossy-isolation test MACRDP_UDP_MIGRATE_EGFX_LOSSY relies on it).
+                // EGFX migration is controlled by --udp-migrate-egfx, or the
+                // MACRDP_UDP_MIGRATE_EGFX tunable.
                 let migrate_egfx =
-                    args.udp_migrate_egfx || multitransport::env_truthy("MACRDP_UDP_MIGRATE_EGFX");
+                    args.udp_migrate_egfx || tunables::truthy("MACRDP_UDP_MIGRATE_EGFX");
                 info!(
                     addr = %args.bind,
                     migrate_egfx,
@@ -3654,9 +3666,18 @@ async fn async_main() -> Result<()> {
                      when --udp-migrate-egfx is set (otherwise EGFX stays on TCP); \
                      input/audio/clipboard always ride TCP"
                 );
-                server
-                    .set_multitransport_provider(Some(Box::new(multitransport::MacMultitransport)));
+                server.set_multitransport_provider(Some(Box::new(
+                    multitransport::MacMultitransport {
+                        offer_lossy: args.enable_lossy_audio
+                            || tunables::truthy("MACRDP_UDP_OFFER_FECL"),
+                    },
+                )));
                 server.set_migrate_egfx(migrate_egfx);
+                server.set_migrate_egfx_lossy(tunables::truthy("MACRDP_UDP_MIGRATE_EGFX_LOSSY"));
+                server.set_multitransport_offer_max_rtt_ms(tunables::parsed(
+                    "MACRDP_UDP_OFFER_MAX_RTT_MS",
+                    80,
+                ));
                 server.set_multitransport_cookie_registry(Some(cookie_registry));
                 server.set_multitransport_tunnel_sender(Some(tunnel_sender));
                 // Ack-driven IDR recovery (EGFX-on-lossy): hand the server the same
@@ -3677,7 +3698,7 @@ async fn async_main() -> Result<()> {
                 // MS-RDPEA Appendix A note <2>). Advertises the SAME format list the
                 // static RDPSND path encodes; the lossy 1+1 transport is enabled by the
                 // env bridge above. Verified on mstsc smooth at 5/10/15% loss.
-                if (args.enable_lossy_audio || multitransport::env_truthy("MACRDP_UDP_LOSSY_AUDIO"))
+                if (args.enable_lossy_audio || tunables::truthy("MACRDP_UDP_LOSSY_AUDIO"))
                     && args.enable_aac
                 {
                     let formats = audio::server_audio_formats(args.enable_aac, args.aac_bitrate);

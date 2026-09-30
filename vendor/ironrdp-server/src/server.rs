@@ -398,57 +398,6 @@ impl DisplayControlHandler for DisplayControlBackend {
 #[cfg(feature = "multitransport")]
 const EGFX_DVC_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
 
-/// (M5c) EXPERIMENTAL: whether to actually migrate the EGFX channel onto the UDP
-/// tunnel (vs. the proven safe spike that sends an empty Soft-Sync and keeps EGFX
-/// on TCP). Gated on the `MACRDP_UDP_MIGRATE_EGFX` env var so the default build
-/// behaves exactly as the verified M5c step-1+2. Read once and cached.
-#[cfg(feature = "multitransport")]
-fn migrate_egfx_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| crate::multitransport::env_truthy("MACRDP_UDP_MIGRATE_EGFX"))
-}
-
-/// (vendored, extends divergences 12+15) Link-RTT gate for the multitransport
-/// offer: a connection whose kernel-measured TCP RTT at accept is at or above
-/// `MACRDP_UDP_OFFER_MAX_RTT_MS` (ms; default 80; 0 disables the gate) is not
-/// offered UDP at all — it runs plain TCP from the first byte. On overlay
-/// links (VPN/ZeroTier/mobile) the UDP tunnel is prone to wedging, and the
-/// reactive tunnel-death detection only bounds the damage (up to ~30 s of dead
-/// tunnel + possibly one client-side session reset per wedge); withholding the
-/// offer avoids the predictably bad case entirely, so the lossy-audio /
-/// EGFX-over-UDP switches are safe to leave enabled on a roaming client —
-/// LAN/WiFi sessions get UDP, distant sessions silently stay pure TCP. The
-/// residual case (a link that degrades after connect) stays covered by the
-/// tunnel-death detection. Threshold read once and cached; the RTT is
-/// per-connection (divergence 15 cell).
-#[cfg(feature = "multitransport")]
-fn multitransport_offer_max_rtt_ms() -> u32 {
-    use std::sync::OnceLock;
-    static V: OnceLock<u32> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("MACRDP_UDP_OFFER_MAX_RTT_MS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .unwrap_or(80)
-    })
-}
-
-/// (P2.4b diagnostic) EXPERIMENTAL: migrate EGFX onto the LOSSY (UdpFecL/DTLS)
-/// tunnel instead of the reliable (UdpFecR/rustls) one. This is an *isolation
-/// test* for the DTLS `RDP_TUNNEL_DATA` egress path (`ship_outbound`'s DTLS
-/// branch): EGFX-over-tunnel is already proven on the reliable tunnel, so if it
-/// also renders over DTLS the framing is correct and any lossy-audio failure is
-/// purely the MS-RDPEA channel model — not our tunnel data path. Requires
-/// `MACRDP_UDP_MIGRATE_EGFX` + `MACRDP_UDP_OFFER_FECL` (so a lossy tunnel exists).
-/// Read once and cached.
-#[cfg(feature = "multitransport")]
-fn migrate_egfx_lossy() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| crate::multitransport::env_truthy("MACRDP_UDP_MIGRATE_EGFX_LOSSY"))
-}
-
 /// (vendored, divergence 15) Read the kernel's smoothed TCP RTT for an accepted
 /// connection, in milliseconds, via `getsockopt(TCP_CONNECTION_INFO)` (macOS).
 /// The kernel seeds srtt from the SYN/SYN-ACK exchange, so a meaningful value is
@@ -656,10 +605,21 @@ pub struct RdpServer {
     egfx_on_udp: bool,
     /// Whether to migrate the EGFX DVC onto the reliable UDP tunnel (vs. the empty
     /// safe spike that keeps EGFX on TCP). Set by the application from the
-    /// `--udp-migrate-egfx` flag; OR'd with the legacy `MACRDP_UDP_MIGRATE_EGFX`
-    /// env var (kept so the `..._LOSSY` isolation test still works). Default false.
+    /// `--udp-migrate-egfx` flag (or the `MACRDP_UDP_MIGRATE_EGFX` tunable).
+    /// Default false.
     #[cfg(feature = "multitransport")]
     migrate_egfx: bool,
+    /// (P2.4b diagnostic, experimental) Migrate EGFX onto the LOSSY
+    /// (UdpFecL/DTLS) tunnel instead of the reliable one, to isolate the DTLS
+    /// tunnel-data path. Needs `migrate_egfx` and a lossy offer. Default false.
+    #[cfg(feature = "multitransport")]
+    migrate_egfx_lossy: bool,
+    /// (divergences 12+15) A connection whose accept-time TCP RTT is at or above
+    /// this (ms) is not offered UDP at all: on overlay links the tunnel
+    /// predictably wedges, so the session runs plain TCP from the first byte.
+    /// 0 disables the gate. Default 80.
+    #[cfg(feature = "multitransport")]
+    multitransport_offer_max_rtt_ms: u32,
     /// Shared flag the macrdp-side EGFX/H.264 pipeline reads for ack-driven IDR
     /// recovery: set true once EGFX has been migrated onto the **lossy** tunnel
     /// (`MACRDP_UDP_MIGRATE_EGFX_LOSSY`), where a dropped frame is real loss the
@@ -1215,6 +1175,10 @@ impl RdpServer {
             #[cfg(feature = "multitransport")]
             migrate_egfx: false,
             #[cfg(feature = "multitransport")]
+            migrate_egfx_lossy: false,
+            #[cfg(feature = "multitransport")]
+            multitransport_offer_max_rtt_ms: 80,
+            #[cfg(feature = "multitransport")]
             multitransport_tunnel_inbound_rx: None,
             #[cfg(feature = "multitransport")]
             multitransport_lossy_audio_formats: None,
@@ -1374,11 +1338,22 @@ impl RdpServer {
 
     /// Enable migrating the EGFX DVC onto the reliable UDP tunnel (the
     /// `--udp-migrate-egfx` flag). When `false` (default) the Soft-Sync sends an
-    /// empty channel list and EGFX stays on TCP (the proven safe spike). OR'd with
-    /// the legacy `MACRDP_UDP_MIGRATE_EGFX` env var at the Soft-Sync site.
+    /// empty channel list and EGFX stays on TCP (the proven safe spike).
     #[cfg(feature = "multitransport")]
     pub fn set_migrate_egfx(&mut self, on: bool) {
         self.migrate_egfx = on;
+    }
+
+    /// See the `migrate_egfx_lossy` field.
+    #[cfg(feature = "multitransport")]
+    pub fn set_migrate_egfx_lossy(&mut self, on: bool) {
+        self.migrate_egfx_lossy = on;
+    }
+
+    /// See the `multitransport_offer_max_rtt_ms` field. 0 disables the gate.
+    #[cfg(feature = "multitransport")]
+    pub fn set_multitransport_offer_max_rtt_ms(&mut self, ms: u32) {
+        self.multitransport_offer_max_rtt_ms = ms;
     }
 
     /// (P2.4b) Supply the audio format list for the lossy-UDP `AUDIO_PLAYBACK_LOSSY_DVC`
@@ -1554,7 +1529,7 @@ impl RdpServer {
         // overlay-class link where the tunnel predictably wedges.
         #[cfg(feature = "multitransport")]
         let mt_rtt_gated = {
-            let max = multitransport_offer_max_rtt_ms();
+            let max = self.multitransport_offer_max_rtt_ms;
             let rtt = self.link_rtt_ms.as_ref().map_or(0, |c| c.load(Ordering::Relaxed));
             let gated = max > 0 && rtt >= max && self.multitransport.is_some();
             if gated && !mt_suppressed {
@@ -2931,7 +2906,7 @@ impl RdpServer {
         // moves it onto the UDP tunnel, and flip `egfx_on_udp` so subsequent frames
         // route over UDP. Default (off) is the proven safe spike — an empty channel
         // list, EGFX stays on TCP.
-        let channel_ids = if self.migrate_egfx || migrate_egfx_enabled() {
+        let channel_ids = if self.migrate_egfx {
             match self
                 .get_svc_processor::<dvc::DrdynvcServer>()
                 .and_then(|d| d.get_channel_id_by_name(EGFX_DVC_CHANNEL_NAME))
@@ -2960,7 +2935,7 @@ impl RdpServer {
         // EGFX normally migrates onto the RELIABLE tunnel. The P2.4b isolation test
         // (`MACRDP_UDP_MIGRATE_EGFX_LOSSY`) instead targets the LOSSY/DTLS tunnel to
         // exercise the DTLS `RDP_TUNNEL_DATA` egress path with a proven payload.
-        let egfx_tunnel_type = if migrate_egfx_lossy() {
+        let egfx_tunnel_type = if self.migrate_egfx_lossy {
             dvc::pdu::TUNNELTYPE_UDPFECL
         } else {
             dvc::pdu::TUNNELTYPE_UDPFECR

@@ -248,7 +248,7 @@ fn install_panic_hook() {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
+    crate::tunables::var(key)
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&v| v > 0)
@@ -257,7 +257,7 @@ fn env_u64(key: &str, default: u64) -> u64 {
 
 fn env_usize(key: &str, default: usize) -> usize {
     // 0 is a legal value here (no archives kept), so don't filter it out.
-    std::env::var(key)
+    crate::tunables::var(key)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(default)

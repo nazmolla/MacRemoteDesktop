@@ -17,23 +17,6 @@
 use ironrdp_pdu::rdp::multitransport::RequestedProtocol;
 use ironrdp_server::MultitransportProvider;
 
-/// Interpret an experimental on/off environment toggle by *value*, not mere
-/// presence. `true` only for a truthy value; unset, empty, and the common falsey
-/// spellings (`0`/`false`/`no`/`off`, case-insensitive, trimmed) are `false`. A
-/// bare `.is_some()` check treated `FLAG=0` as "on", which silently contaminated
-/// the lossy-audio soak A/B (`MACRDP_UDP_LOSSY_AUDIO=0` still offered the lossy
-/// DVC) — so the experimental UDP toggles route through here. Mirrors the vendored
-/// `ironrdp_server::multitransport::env_truthy`.
-pub fn env_truthy(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "no" | "off"
-        ),
-        Err(_) => false,
-    }
-}
-
 /// M1 provider: offer reliable UDP multitransport. Reliable (`UdpFecR`) rides
 /// the connection's existing rustls TLS, so no DTLS / new crypto dependency is
 /// needed. Lossy (`UdpFecL`, which needs DTLS) is a later milestone.
@@ -46,13 +29,15 @@ pub fn env_truthy(name: &str) -> bool {
 /// implemented; the listener only *observes* whether the client starts a DTLS
 /// handshake. Default (env unset) is unchanged Phase-1 reliable behavior. See
 /// `docs/rdp-udp-multitransport-feasibility.md` → "P2.0 — Go/No-Go spike".
-pub struct MacMultitransport;
+pub struct MacMultitransport {
+    /// Offer the lossy `UdpFecL` transport instead of reliable (P2.0 spike;
+    /// `--enable-lossy-audio` or `MACRDP_UDP_OFFER_FECL`).
+    pub offer_lossy: bool,
+}
 
 impl MultitransportProvider for MacMultitransport {
     fn requested_protocol(&self) -> RequestedProtocol {
-        // P2.0 spike toggle: offer lossy instead of reliable. Read per call (the
-        // provider is process-wide; this is cheap and avoids extra plumbing).
-        if env_truthy("MACRDP_UDP_OFFER_FECL") {
+        if self.offer_lossy {
             RequestedProtocol::UdpFecL
         } else {
             RequestedProtocol::UdpFecR
