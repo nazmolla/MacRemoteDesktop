@@ -148,18 +148,7 @@ pub(crate) async fn run() -> Result<()> {
     // watcher can drop the display RAII guards before process::exit and
     // actually restore the user's setup. Populated later if the
     // corresponding flag is set.
-    let primary_override: std::sync::Arc<
-        std::sync::Mutex<Option<virtual_display::PrimaryOverride>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let detached_primary: std::sync::Arc<
-        std::sync::Mutex<Option<virtual_display::DetachedPrimary>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let captured_primary: std::sync::Arc<
-        std::sync::Mutex<Option<virtual_display::CapturedPrimary>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let shielded_primary: std::sync::Arc<
-        std::sync::Mutex<Option<virtual_display::ShieldedPrimary>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let headless = HeadlessSlots::default();
 
     // Install signal handling before anything touches ScreenCaptureKit. Once an
     // SCK capture stream is live, macOS framework threads can leave the process
@@ -171,24 +160,15 @@ pub(crate) async fn run() -> Result<()> {
     // dropped here first so the user's layout is restored before exit.
     // Without this, Ctrl-C would leave the virtual display promoted or
     // the built-in panel disabled until logout.
-    let cleanup_primary = primary_override.clone();
-    let cleanup_detach = detached_primary.clone();
-    let cleanup_capture = captured_primary.clone();
-    let cleanup_shield = shielded_primary.clone();
+    let cleanup = headless.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("shutdown signal received — exiting");
-        // Taking each guard out of its slot drops it right here, in this
-        // order; their Drop impls do the restoring on macOS (the non-macOS
-        // stubs are empty).
-        let _ = cleanup_detach.lock_or_recover().take(); // re-enables the built-in display
-        let _ = cleanup_capture.lock_or_recover().take(); // releases captured displays
-        let _ = cleanup_shield.lock_or_recover().take(); // lowers the shield windows
-        let _ = cleanup_primary.lock_or_recover().take(); // restores display arrangement
-                                                          // Lazy paste leaves NSFilePresenters registered + a temp dir on
-                                                          // disk + URLs on NSPasteboard. Process::exit skips Drop on the
-                                                          // cliprdr backend, so flush that state explicitly. No-op if
-                                                          // MacCliprdr was never constructed.
+        cleanup.release_all();
+        // Lazy paste leaves NSFilePresenters registered + a temp dir on
+        // disk + URLs on NSPasteboard. Process::exit skips Drop on the
+        // cliprdr backend, so flush that state explicitly. No-op if
+        // MacCliprdr was never constructed.
         #[cfg(target_os = "macos")]
         file_promise_lazy::shutdown_cleanup();
         // RDPDR NFS volumes are unmounted on disconnect by Surface::Drop, but
@@ -238,30 +218,7 @@ pub(crate) async fn run() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let physical_main_id: u32 = 0;
 
-    let virtual_display: Option<Arc<std::sync::Mutex<virtual_display::VirtualDisplay>>> =
-        if args.virtual_display {
-            let w = args
-                .width
-                .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
-            let h = args
-                .height
-                .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
-            // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
-            // metadata here (capture cadence is governed by --fps); pass a
-            // safe value so CGVirtualDisplay doesn't reject the mode.
-            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
-                .context("attaching virtual display")?;
-            info!(
-                display_id = vd.display_id(),
-                origin = ?vd.origin_pts(),
-                size = ?vd.size_pts(),
-                "virtual display attached — the RDP session uses this surface; \
-                 your primary panel is untouched"
-            );
-            Some(Arc::new(std::sync::Mutex::new(vd)))
-        } else {
-            None
-        };
+    let virtual_display = create_virtual_display(&args)?;
 
     // --detach-primary / --capture-primary are lazy: the headless
     // mechanism is only engaged once a client actually connects. A
@@ -291,85 +248,19 @@ pub(crate) async fn run() -> Result<()> {
     if args.auto_unlock && args.skip_auth {
         warn!("--auto-unlock has no effect under --skip-auth; ignoring");
     }
-    if args.detach_primary {
-        let vd_id = virtual_display
-            .as_ref()
-            .expect("checked above when --detach-primary")
-            .lock_or_recover()
-            .display_id();
-        spawn_primary_overlay_watcher(
-            "detach",
-            vd_id,
-            session_tracker.clone(),
-            detached_primary.clone(),
-            virtual_display::DetachedPrimary::install,
-            args.restore_windows_on_disconnect,
+    engage_headless_mode(
+        &args,
+        virtual_display.as_ref(),
+        &headless,
+        WatcherOptions {
+            tracker: session_tracker.clone(),
+            restore_windows: args.restore_windows_on_disconnect,
             physical_main_id,
-            lock_activity.clone(),
-            Arc::clone(&secret),
+            lock_on_disconnect: lock_activity.clone(),
+            secret: Arc::clone(&secret),
             auto_unlock,
-        );
-    } else if args.capture_primary {
-        let vd_id = virtual_display
-            .as_ref()
-            .expect("checked above when --capture-primary")
-            .lock_or_recover()
-            .display_id();
-        spawn_primary_overlay_watcher(
-            "capture",
-            vd_id,
-            session_tracker.clone(),
-            captured_primary.clone(),
-            virtual_display::CapturedPrimary::install,
-            args.restore_windows_on_disconnect,
-            physical_main_id,
-            lock_activity.clone(),
-            Arc::clone(&secret),
-            auto_unlock,
-        );
-    } else if args.shield_primary {
-        let vd_id = virtual_display
-            .as_ref()
-            .expect("checked above when --shield-primary")
-            .lock_or_recover()
-            .display_id();
-        spawn_primary_overlay_watcher(
-            "shield",
-            vd_id,
-            session_tracker.clone(),
-            shielded_primary.clone(),
-            virtual_display::ShieldedPrimary::install,
-            args.restore_windows_on_disconnect,
-            physical_main_id,
-            lock_activity.clone(),
-            Arc::clone(&secret),
-            auto_unlock,
-        );
-    } else if args.make_primary {
-        let vd_id = virtual_display
-            .as_ref()
-            .expect("checked above when --make-primary")
-            .lock_or_recover()
-            .display_id();
-        match virtual_display::PrimaryOverride::install(vd_id)
-            .context("promoting virtual display to primary")?
-        {
-            Some(ovr) => {
-                info!(
-                    "virtual display promoted to primary — menu bar and new \
-                     windows move there. Original layout restored on exit \
-                     (or at next logout)."
-                );
-                *primary_override.lock_or_recover() = Some(ovr);
-            }
-            None => {
-                info!(
-                    "virtual display is already the system primary (macOS \
-                     auto-placed it at origin) — no override needed"
-                );
-            }
-        }
-    }
+        },
+    )?;
 
     let TlsMaterial {
         acceptor: tls,
@@ -379,82 +270,8 @@ pub(crate) async fn run() -> Result<()> {
         key_der: udp_key_der,
     } = tls::load_material(&args)?;
 
-    // Resolve desktop dimensions + geometry. Three paths:
-    //   - virtual display: width/height are already enforced as required
-    //     above; geometry comes from the vdisplay's CGDisplayBounds.
-    //   - primary panel, no --width/--height override: query SCK for
-    //     native size and use CGDisplay::main() for the point-space bounds.
-    //   - primary panel with override: use the override + main geometry.
-    let (width, height, capture_display_id, screen_size_pts) = if let Some(vd) = &virtual_display {
-        let vd = vd.lock_or_recover();
-        // Both required earlier, so the unwraps can't fire.
-        let w = args
-            .width
-            .expect("checked above when --virtual-display set");
-        let h = args
-            .height
-            .expect("checked above when --virtual-display set");
-        // Re-query CGDisplayBounds rather than trusting the cached
-        // values from VirtualDisplay creation: if --make-primary
-        // moved the display to (0, 0), the cached size is fine but
-        // we want a fresh read for parity with the input handler.
-        #[cfg(target_os = "macos")]
-        let size = {
-            let b = core_graphics::display::CGDisplay::new(vd.display_id()).bounds();
-            (b.size.width, b.size.height)
-        };
-        #[cfg(not(target_os = "macos"))]
-        let size = vd.size_pts();
-        info!(
-            width = w,
-            height = h,
-            display_id = vd.display_id(),
-            "desktop size (virtual display)"
-        );
-        (w, h, Some(vd.display_id()), size)
-    } else {
-        let detected = primary_display_size().await?;
-        let mut w = args
-            .width
-            .or(detected.map(|(w, _)| w))
-            .unwrap_or(FALLBACK_WIDTH);
-        let mut h = args
-            .height
-            .or(detected.map(|(_, h)| h))
-            .unwrap_or(FALLBACK_HEIGHT);
-        // --hidpi: capture at the display's backing (Retina) pixel resolution
-        // instead of logical points, unless the user pinned an explicit
-        // --width/--height (in which case they've chosen the size themselves).
-        #[cfg(target_os = "macos")]
-        if args.hidpi && args.width.is_none() && args.height.is_none() {
-            if let Some((bw, bh)) = primary_backing_size() {
-                info!(
-                    points_w = w,
-                    points_h = h,
-                    backing_w = bw,
-                    backing_h = bh,
-                    "--hidpi: capturing at backing pixel resolution"
-                );
-                w = bw;
-                h = bh;
-            } else {
-                warn!("--hidpi: could not read backing pixel size; staying at logical points");
-            }
-        }
-        if let Some((dw, dh)) = detected {
-            info!(
-                width = w,
-                height = h,
-                detected_w = dw,
-                detected_h = dh,
-                "desktop size"
-            );
-        } else {
-            info!(width = w, height = h, "desktop size (no display detected)");
-        }
-        let (_origin, size) = primary_screen_geometry();
-        (w, h, None, size)
-    };
+    let (width, height, capture_display_id, screen_size_pts) =
+        resolve_desktop(&args, virtual_display.as_ref()).await?;
 
     // Frame rate: explicit --fps wins; otherwise 60 for H.264 (mstsc holds a
     // ~2-frame presentation buffer, so 60fps keeps typing latency low) or 15 for
@@ -657,14 +474,14 @@ pub(crate) async fn run() -> Result<()> {
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
         // resets gamma → the panel un-blanks). Only for --capture-primary.
         captured_primary: if args.capture_primary {
-            Some(captured_primary.clone())
+            Some(headless.captured.clone())
         } else {
             None
         },
         // Shared so a live re-mode can re-fit the shield windows to the panels'
         // new frames. Only for --shield-primary.
         shielded_primary: if args.shield_primary {
-            Some(shielded_primary.clone())
+            Some(headless.shielded.clone())
         } else {
             None
         },
