@@ -1,14 +1,23 @@
-//! Lossless RDP6 Planar encoding of one surface region, for EGFX
-//! `send_planar_frame` refinement (spec §8.3, Phase 2a Task 2).
+//! Lossless ClearCodec encoding of one surface region, for EGFX refinement
+//! tiles sent with `send_mixed_frame` (spec §8.3, Phase 2a Task 2). ClearCodec
+//! rather than Planar because ironrdp-egfx's `send_planar_frame` always targets
+//! (0,0); ClearCodec tiles carry their destination rectangle.
 
 use anyhow::{bail, Result};
-use ironrdp_graphics::rdp6::{BgrAChannels, BitmapStreamEncoder};
+use ironrdp_graphics::clearcodec::ClearCodecEncoder;
 
 use crate::refine::Rect;
 
-/// Encode `rect` of a tightly strided BGRA framebuffer (`stride` bytes/row,
-/// `height` rows) as an RLE-compressed Planar bitmap stream.
-pub fn encode_region(bgra: &[u8], stride: usize, height: u32, rect: Rect) -> Result<Vec<u8>> {
+/// Encode `rect` of a BGRA framebuffer (`stride` bytes/row, `height` rows) as a
+/// ClearCodec bitmap stream. `enc` is per connection (its glyph cache mirrors
+/// the client's).
+pub fn encode_region(
+    enc: &mut ClearCodecEncoder,
+    bgra: &[u8],
+    stride: usize,
+    height: u32,
+    rect: Rect,
+) -> Result<Vec<u8>> {
     let width_px = (stride / 4) as u32;
     if rect.w == 0 || rect.h == 0 || rect.x + rect.w > width_px || rect.y + rect.h > height {
         bail!("planar region {rect:?} outside {width_px}×{height} surface");
@@ -19,26 +28,22 @@ pub fn encode_region(bgra: &[u8], stride: usize, height: u32, rect: Rect) -> Res
         let start = row * stride + rect.x as usize * 4;
         pixels.extend_from_slice(&bgra[start..start + w * 4]);
     }
-    // Worst case (RLE off, no gain): header + 3 planes of w*h, plus slack.
-    let mut out = vec![0u8; w * h * 4 + 64];
-    let n = BitmapStreamEncoder::new(w, h)
-        .encode_bitmap::<BgrAChannels>(&pixels, &mut out, true)
-        .map_err(|e| anyhow::anyhow!("planar encode failed: {e:?}"))?;
-    out.truncate(n);
-    Ok(out)
+    Ok(enc.encode(&pixels, rect.w as u16, rect.h as u16))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironrdp_graphics::rdp6::BitmapStreamDecoder;
+    use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 
+    /// Decoded BGRA → RGB triples, so the assertions stay codec-agnostic.
     fn decode(data: &[u8], w: usize, h: usize) -> Vec<u8> {
-        let mut rgb = Vec::new();
-        BitmapStreamDecoder::default()
-            .decode_bitmap_stream_to_rgb24(data, &mut rgb, w, h)
+        let bgra = ClearCodecDecoder::new()
+            .decode(data, w as u16, h as u16)
             .expect("decode");
-        rgb
+        bgra.chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0]])
+            .collect()
     }
 
     fn assert_exact(bgra: &[u8], stride: usize, r: Rect, rgb: &[u8]) {
@@ -64,7 +69,14 @@ mod tests {
             w: 200,
             h: 150,
         };
-        let enc = encode_region(&p.bgra, p.width * 4, p.height as u32, r).unwrap();
+        let enc = encode_region(
+            &mut ClearCodecEncoder::new(),
+            &p.bgra,
+            p.width * 4,
+            p.height as u32,
+            r,
+        )
+        .unwrap();
         assert_exact(&p.bgra, p.width * 4, r, &decode(&enc, 200, 150));
         let e = p.edge;
         let r = Rect {
@@ -73,7 +85,14 @@ mod tests {
             w: 64,
             h: 16,
         };
-        let enc = encode_region(&p.bgra, p.width * 4, p.height as u32, r).unwrap();
+        let enc = encode_region(
+            &mut ClearCodecEncoder::new(),
+            &p.bgra,
+            p.width * 4,
+            p.height as u32,
+            r,
+        )
+        .unwrap();
         assert_exact(&p.bgra, p.width * 4, r, &decode(&enc, 64, 16));
     }
 
@@ -87,7 +106,7 @@ mod tests {
             w: 13,
             h: 7,
         };
-        let enc = encode_region(&bgra, w * 4, h as u32, r).unwrap();
+        let enc = encode_region(&mut ClearCodecEncoder::new(), &bgra, w * 4, h as u32, r).unwrap();
         assert_exact(&bgra, w * 4, r, &decode(&enc, 13, 7));
     }
 
@@ -95,6 +114,7 @@ mod tests {
     fn rect_outside_surface_is_an_error() {
         let bgra = vec![0u8; 16 * 16 * 4];
         assert!(encode_region(
+            &mut ClearCodecEncoder::new(),
             &bgra,
             64,
             16,
@@ -107,6 +127,7 @@ mod tests {
         )
         .is_err());
         assert!(encode_region(
+            &mut ClearCodecEncoder::new(),
             &bgra,
             64,
             16,
