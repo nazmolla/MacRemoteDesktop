@@ -166,7 +166,28 @@ impl WireFormat {
 
 /// Per-connection state, shared between the `Gfx` factory/handle (capture
 /// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
+/// Which part of the client surface a submitted frame updates (MS-RDPEGFX
+/// AVC420 region rects). Areas outside the regions keep what the client has —
+/// which is what lets lossless refinement survive later frames (spec §8.3).
+#[derive(Debug, Clone)]
+pub(crate) enum FrameRegions {
+    /// Whole surface.
+    Full,
+    /// Only these rectangles changed.
+    Rects(Vec<crate::refine::Rect>),
+    /// Same pixels as the previous submit (flush frames): reuse its regions.
+    SameAsLast,
+}
+
+/// Cap before collapsing a frame's regions into their bounding box.
+const MAX_AVC_REGIONS: usize = 16;
+
 struct ConnectionContext {
+    /// Regions for frames submitted but not yet shipped, keyed by encoder PTS.
+    /// `None` = whole surface.
+    region_queue: std::collections::VecDeque<(i64, Option<Vec<crate::refine::Rect>>)>,
+    /// Regions of the last submitted frame (for `FrameRegions::SameAsLast`).
+    last_regions: Option<Vec<crate::refine::Rect>>,
     server_handle: GfxServerHandle,
     encoder: Option<Encoder>,
     surface_id: Option<u16>,
@@ -1606,6 +1627,17 @@ impl Gfx {
     /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
     pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
+        self.submit_bgra_regions(bgra, stride, request_keyframe, FrameRegions::Full)
+    }
+
+    /// [`Self::submit_bgra`] with the surface regions this frame updates.
+    pub(crate) fn submit_bgra_regions(
+        &self,
+        bgra: &[u8],
+        stride: usize,
+        request_keyframe: bool,
+        regions: FrameRegions,
+    ) -> Result<bool> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
         // pulls each encoded frame off VT's output channel and ships it the
@@ -2014,7 +2046,22 @@ impl Gfx {
                     trace!(error = ?e, frames, "adaptive set_keyframe_interval failed");
                 }
             }
+            let pts = encoder.next_pts();
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            let resolved = if force_keyframe {
+                None
+            } else {
+                match regions {
+                    FrameRegions::Full => None,
+                    FrameRegions::Rects(r) => Some(r),
+                    FrameRegions::SameAsLast => ctx.last_regions.clone(),
+                }
+            };
+            ctx.last_regions = resolved.clone();
+            ctx.region_queue.push_back((pts, resolved));
+            while ctx.region_queue.len() > 128 {
+                ctx.region_queue.pop_front();
+            }
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
         Ok(true)
@@ -2629,7 +2676,16 @@ impl Gfx {
             // few seconds" stall, far more likely once acks ride the UDP tunnel).
             // Cloning the `server_handle` Arc and releasing `ctx` first keeps the
             // lock order consistent (server_handle is never nested under ctx).
-            let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times) = {
+            let (
+                surface_id,
+                width,
+                height,
+                epoch,
+                server_handle,
+                last_shipped,
+                ship_times,
+                frame_regions,
+            ) = {
                 let mut guard = self.ctx.lock().unwrap();
                 let ctx = guard
                     .as_mut()
@@ -2653,6 +2709,25 @@ impl Gfx {
                     ctx.server_handle.clone(),
                     ctx.last_shipped_frame_id.clone(),
                     ctx.ship_times.clone(),
+                    {
+                        // Pop each frame's queued regions (drop entries for frames
+                        // the encoder skipped).
+                        let q = &mut ctx.region_queue;
+                        frames
+                            .iter()
+                            .map(|f| {
+                                while q.front().is_some_and(|(pts, _)| *pts < f.pts) {
+                                    q.pop_front();
+                                }
+                                match q.front() {
+                                    Some((pts, _)) if *pts == f.pts => {
+                                        q.pop_front().and_then(|(_, r)| r)
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    },
                 )
             };
 
@@ -2662,17 +2737,12 @@ impl Gfx {
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
-            for f in frames {
-                // Region = full actual frame, inclusive bounds. QP 22 /
-                // quality 100 are first-light defaults; tuned in M3. Rebuilt
-                // per frame because `Avc420Region` isn't `Copy`.
-                let region = Avc420Region {
-                    left: 0,
-                    top: 0,
-                    right: width.saturating_sub(1),
-                    bottom: height.saturating_sub(1),
-                    quantization_parameter: 22,
-                    quality: 100,
+            for (f, rects) in frames.iter().zip(frame_regions.iter()) {
+                // A keyframe always repaints the whole surface.
+                let regions = if f.is_keyframe {
+                    avc_regions(None, width, height)
+                } else {
+                    avc_regions(rects.as_deref(), width, height)
                 };
                 let payload = self.frame_payload(f);
                 let ts_ms =
@@ -2686,7 +2756,7 @@ impl Gfx {
                 // the surface stays blank.
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
-                let sent = server.send_avc420_frame(surface_id, &payload, &[region], ts_ms);
+                let sent = server.send_avc420_frame(surface_id, &payload, &regions, ts_ms);
                 // Record the newest shipped frame id for the UDP frame-ack-lag
                 // backpressure gate (`submit_bgra`), and stamp the ship time
                 // into the RTT ring so `on_frame_ack` can time this frame's
@@ -2836,6 +2906,8 @@ impl GfxServerFactory for Gfx {
             self.bitrate_bps
         };
         *self.ctx.lock().unwrap() = Some(ConnectionContext {
+            region_queue: std::collections::VecDeque::new(),
+            last_regions: None,
             server_handle: handle.clone(),
             encoder: None,
             surface_id: None,
@@ -4737,5 +4809,96 @@ mod tests {
         assert_eq!(&out[11..14], pps.as_slice());
         assert_eq!(&out[14..18], &[0, 0, 0, 1]);
         assert_eq!(&out[18..20], &[0x65, 0x88]);
+    }
+}
+
+/// AVC420 regions for one shipped frame: the queued dirty rects (clipped,
+/// inclusive edges), the bounding box beyond [`MAX_AVC_REGIONS`], or the whole
+/// surface when `rects` is `None`/empty.
+fn avc_regions(
+    rects: Option<&[crate::refine::Rect]>,
+    width: u16,
+    height: u16,
+) -> Vec<Avc420Region> {
+    let region = |l: u32, t: u32, r: u32, b: u32| Avc420Region {
+        left: l as u16,
+        top: t as u16,
+        right: r as u16,
+        bottom: b as u16,
+        quantization_parameter: 22,
+        quality: 100,
+    };
+    let (w, h) = (u32::from(width), u32::from(height));
+    let full = || vec![region(0, 0, w.saturating_sub(1), h.saturating_sub(1))];
+    let Some(rects) = rects.filter(|r| !r.is_empty()) else {
+        return full();
+    };
+    let clipped: Vec<(u32, u32, u32, u32)> = rects
+        .iter()
+        .filter(|r| r.w > 0 && r.h > 0 && r.x < w && r.y < h)
+        .map(|r| (r.x, r.y, (r.x + r.w).min(w) - 1, (r.y + r.h).min(h) - 1))
+        .collect();
+    if clipped.is_empty() {
+        return full();
+    }
+    if clipped.len() > MAX_AVC_REGIONS {
+        let l = clipped.iter().map(|c| c.0).min().unwrap_or(0);
+        let t = clipped.iter().map(|c| c.1).min().unwrap_or(0);
+        let r = clipped.iter().map(|c| c.2).max().unwrap_or(0);
+        let b = clipped.iter().map(|c| c.3).max().unwrap_or(0);
+        return vec![region(l, t, r, b)];
+    }
+    clipped
+        .into_iter()
+        .map(|(l, t, r, b)| region(l, t, r, b))
+        .collect()
+}
+
+#[cfg(test)]
+mod avc_region_tests {
+    use super::avc_regions;
+    use crate::refine::Rect;
+
+    #[test]
+    fn none_or_empty_means_whole_surface() {
+        for rs in [None, Some(&[][..])] {
+            let v = avc_regions(rs, 1714, 1287);
+            assert_eq!((v.len(), v[0].right, v[0].bottom), (1, 1713, 1286));
+        }
+    }
+
+    #[test]
+    fn rects_are_clipped_with_inclusive_edges() {
+        let v = avc_regions(
+            Some(&[Rect {
+                x: 1700,
+                y: 10,
+                w: 100,
+                h: 5,
+            }]),
+            1714,
+            1287,
+        );
+        assert_eq!(
+            (v[0].left, v[0].top, v[0].right, v[0].bottom),
+            (1700, 10, 1713, 14)
+        );
+    }
+
+    #[test]
+    fn many_rects_collapse_to_bounding_box() {
+        let rs: Vec<Rect> = (0..20)
+            .map(|i| Rect {
+                x: i * 10,
+                y: i,
+                w: 5,
+                h: 5,
+            })
+            .collect();
+        let v = avc_regions(Some(&rs), 1920, 1080);
+        assert_eq!(
+            (v.len(), v[0].left, v[0].top, v[0].right, v[0].bottom),
+            (1, 0, 0, 194, 23)
+        );
     }
 }

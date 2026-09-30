@@ -1534,10 +1534,11 @@ mod macos {
                                 self.flush_remaining -= 1;
                                 if let Some(gfx) = self.gfx.as_ref() {
                                     if !self.last_frame.is_empty() {
-                                        if let Err(e) = gfx.submit_bgra(
+                                        if let Err(e) = gfx.submit_bgra_regions(
                                             &self.last_frame,
                                             self.last_stride,
                                             false,
+                                            crate::h264::FrameRegions::SameAsLast,
                                         ) {
                                             tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                                         }
@@ -1674,7 +1675,38 @@ mod macos {
                     } else {
                         false
                     };
-                    match gfx.submit_bgra(src, stride_bytes, big_change || resume_keyframe) {
+                    // Only the changed rects repaint the client surface, so
+                    // lossless refinement elsewhere survives (spec §8.3).
+                    let regions = if !self.seeded || self.force_full_frame {
+                        crate::h264::FrameRegions::Full
+                    } else {
+                        match sample.dirty_rects() {
+                            Some(list) => crate::h264::FrameRegions::Rects(
+                                list.iter()
+                                    .filter_map(|r| {
+                                        let (o, s) = (r.origin(), r.size());
+                                        let x = o.x.max(0.0).floor() as u32;
+                                        let y = o.y.max(0.0).floor() as u32;
+                                        let w = (o.x + s.width).max(0.0).ceil() as u32;
+                                        let h = (o.y + s.height).max(0.0).ceil() as u32;
+                                        (w > x && h > y).then(|| crate::refine::Rect {
+                                            x,
+                                            y,
+                                            w: w - x,
+                                            h: h - y,
+                                        })
+                                    })
+                                    .collect(),
+                            ),
+                            None => crate::h264::FrameRegions::Full,
+                        }
+                    };
+                    match gfx.submit_bgra_regions(
+                        src,
+                        stride_bytes,
+                        big_change || resume_keyframe,
+                        regions,
+                    ) {
                         Ok(true) => {
                             self.seeded = true;
                             // First-EGFX-frame milestone: arms the suppress
