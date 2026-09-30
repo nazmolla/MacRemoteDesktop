@@ -2607,7 +2607,11 @@ async fn async_main() -> Result<()> {
             .len(),
             virtual_display_available: virtual_display::virtual_display_available(),
         };
-        apply_negotiated_defaults(&mut args, &host, locate_shield_helper().is_some())
+        #[cfg(target_os = "macos")]
+        let shield_helper_available = locate_shield_helper().is_some();
+        #[cfg(not(target_os = "macos"))]
+        let shield_helper_available = false;
+        apply_negotiated_defaults(&mut args, &host, shield_helper_available)
     };
 
     // Research spike (Phase-1b USB-redirection go/no-go): run the UserHCI probe
