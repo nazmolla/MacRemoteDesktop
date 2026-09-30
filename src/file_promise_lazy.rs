@@ -53,7 +53,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use block2::Block;
 use objc2::rc::{Allocated, Retained};
@@ -583,14 +582,12 @@ pub fn cleanup_on_disconnect(
 }
 
 fn make_temp_dir() -> std::io::Result<PathBuf> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir =
-        std::env::temp_dir().join(format!("macrdp-lazy-paste-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    // `macrdp-lazy-paste-<pid>-<random>`, always freshly created (0700); see
+    // file_promise.rs.
+    crate::private_dir::create_unique(
+        &std::env::temp_dir(),
+        &format!("macrdp-lazy-paste-{}-", std::process::id()),
+    )
 }
 
 /// Reap lazy-paste temp dirs (`$TMPDIR/macrdp-lazy-paste-<pid>-<nanos>`) left by
