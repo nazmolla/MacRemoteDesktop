@@ -41,6 +41,8 @@ mod multitransport;
 mod negotiator;
 mod rdpdr;
 mod reaper;
+#[allow(dead_code)]
+mod refine;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
 mod shield;
