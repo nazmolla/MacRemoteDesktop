@@ -2227,9 +2227,13 @@ impl Gfx {
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
+            // Per-region updates are opt-in: with them on, Windows clients' Desktop
+            // Window Manager memory climbed until the client crashed (2026-10-01).
+            // Off, every frame carries one full-surface region, as upstream did.
+            let per_region = crate::tunables::truthy("MACRDP_AVC_REGIONS");
             for ((f, rects), aux_frame) in frames.iter().zip(frame_regions.iter()).zip(aux) {
                 // A keyframe always repaints the whole surface.
-                let regions = if f.is_keyframe {
+                let regions = if f.is_keyframe || !per_region {
                     avc_regions(None, width, height)
                 } else {
                     avc_regions(rects.as_deref(), width, height)
