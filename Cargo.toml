@@ -144,7 +144,9 @@ ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git",
 ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-egfx             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+# ironrdp-egfx is vendored (same upstream rev) to write AVC420 region rectangles
+# exclusive on the wire, as MS-RDPEGFX RECT16 requires. See vendor/ironrdp-egfx/CLAUDE.md.
+ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
 ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
@@ -159,6 +161,7 @@ ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git",
 # consumer resolves to the single vendored copy.
 [patch."https://github.com/Devolutions/IronRDP.git"]
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
+ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
 
 [lints.clippy]
 # New in rustc 1.98: suggests rewriting fixed-size `chunks_exact` loops as `as_chunks`.

@@ -493,15 +493,17 @@ fn adopt_client_size(
     current: (u16, u16),
     client: DesktopSize,
 ) -> Option<DesktopSize> {
-    if auto_size
-        && (client.width, client.height) != current
-        && (200..=8192).contains(&client.width)
-        && (200..=8192).contains(&client.height)
+    if !auto_size || !(200..=8192).contains(&client.width) || !(200..=8192).contains(&client.height)
     {
-        Some(client)
-    } else {
-        None
+        return None;
     }
+    // H.264 4:2:0 codes the picture in 2-pixel units, so an odd width or height
+    // can't be represented exactly; serve the even size one pixel smaller.
+    let even = DesktopSize {
+        width: client.width & !1,
+        height: client.height & !1,
+    };
+    ((even.width, even.height) != current).then_some(even)
 }
 
 #[async_trait::async_trait]
@@ -1988,6 +1990,23 @@ mod tests {
                 height: 1080
             })
         );
+    }
+
+    #[test]
+    fn adopt_client_size_rounds_odd_sizes_down_to_even() {
+        let odd = DesktopSize {
+            width: 865,
+            height: 1335,
+        };
+        assert_eq!(
+            adopt_client_size(true, (1920, 1080), odd),
+            Some(DesktopSize {
+                width: 864,
+                height: 1334
+            })
+        );
+        // Once served at the even size, the client's odd echo is not a change.
+        assert_eq!(adopt_client_size(true, (864, 1334), odd), None);
     }
 
     #[test]
