@@ -2528,9 +2528,18 @@ impl GraphicsPipelineHandler for GfxHandler {
             caps = ?typed,
             "EGFX: client advertised capabilities"
         );
-        let avc444 = crate::negotiator::video::caps_from_egfx(&typed).avc444
-            && crate::tunables::var("MACRDP_AVC444").as_deref() != Ok("0");
-        info!(target: "macrdp::negotiator", avc444, "video: AVC444 {}", if avc444 { "on (client advertises it)" } else { "off" });
+        // AVC444 is opt-in: its main/auxiliary split does not match what real
+        // decoders reconstruct (FreeRDP shows colour noise, 2026-10-01), so it
+        // stays off until it is verified against a real client decoder.
+        let client_avc444 = crate::negotiator::video::caps_from_egfx(&typed).avc444;
+        let avc444 = client_avc444 && crate::tunables::truthy("MACRDP_AVC444");
+        info!(
+            target: "macrdp::negotiator",
+            avc444,
+            client_avc444,
+            "video: AVC444 {}",
+            if avc444 { "on (client advertises it)" } else { "off (AVC420; MACRDP_AVC444=1 opts in)" }
+        );
         if let Some(ctx) = lock_ctx(&self.ctx).as_mut() {
             ctx.client_supports_avc = supports_avc;
             ctx.avc444 = avc444;
