@@ -201,7 +201,10 @@ mod macos {
             reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
         )]
         pub fn new_planned(plan: &crate::negotiator::display::DisplayPlan) -> Result<Self> {
-            let mut vd = Self::new(plan.points_w, plan.points_h, 60)?;
+            // Created at 1× at the client's pixel size, so it is right even if the
+            // Retina step falls back. Not at the plan's point size: macOS will not
+            // switch to Retina at the point size of the current 1× mode.
+            let mut vd = Self::new(plan.capture_w, plan.capture_h, 60)?;
             vd.apply_plan(plan)?;
             Ok(vd)
         }
@@ -213,9 +216,17 @@ mod macos {
             &mut self,
             plan: &crate::negotiator::display::DisplayPlan,
         ) -> Result<super::AppliedMode> {
-            let first = self
-                ._handle
-                .apply_points_mode(plan.points_w, plan.points_h, plan.hidpi);
+            // Retina is opt-in until it is reliable: a Retina request that macOS
+            // lands on its 1× twin can leave the display stuck at that size, so
+            // by default a high-DPI client gets 1× at its exact pixel size.
+            let first = if plan.hidpi && !crate::tunables::truthy("MACRDP_RETINA_VD") {
+                Err(anyhow!(
+                    "Retina virtual display modes are off (MACRDP_RETINA_VD)"
+                ))
+            } else {
+                self._handle
+                    .apply_points_mode(plan.points_w, plan.points_h, plan.hidpi)
+            };
             let (mode, fell_back) = match first {
                 Ok(m) => (m, false),
                 Err(e) if plan.hidpi => {
@@ -1833,6 +1844,16 @@ mod stub {
     }
 }
 
+/// On-device tests: each creates a real virtual display. WindowServer brings only
+/// one virtual display online per process, so run each test in its own process,
+/// a few seconds apart (never in parallel — display churn overloads the machine):
+///
+/// ```text
+/// for t in display_colorspace_is_srgb one_x_plan_is_one_to_one retina_plan_gets_2x_backing \
+///          select_mode_verifies_and_falls_back resizes_keep_working_after_a_fallback; do
+///   cargo test --bin macrdp virtual_display::planned_tests::$t -- --ignored --exact; sleep 3
+/// done
+/// ```
 #[cfg(all(test, target_os = "macos"))]
 mod planned_tests {
     use super::VirtualDisplay;
@@ -1883,11 +1904,18 @@ mod planned_tests {
     }
 
     #[test]
-    #[ignore = "needs WindowServer; run: cargo test -- --ignored planned_tests --test-threads=1"]
+    #[ignore = "needs WindowServer"]
     fn retina_plan_gets_2x_backing() {
-        let vd = VirtualDisplay::new_planned(&plan(2560, 1440, 200)).expect("create");
-        assert_eq!(vd.size_pts(), (1280.0, 720.0));
-        assert_eq!(vd.backing_pixels(), (2560, 1440));
+        // Whether macOS picks Retina also depends on the claimed panel size
+        // (600×338 mm): 1920×1080 pt is Retina there, 1280×720 pt falls back to 1×.
+        // With MACRDP_RETINA_VD unset (the default) the client gets 1× at its pixels.
+        let vd = VirtualDisplay::new_planned(&plan(3840, 2160, 200)).expect("create");
+        assert_eq!(vd.backing_pixels(), (3840, 2160));
+        if crate::tunables::truthy("MACRDP_RETINA_VD") {
+            assert_eq!(vd.size_pts(), (1920.0, 1080.0));
+        } else {
+            assert_eq!(vd.size_pts(), (3840.0, 2160.0));
+        }
     }
 
     #[test]
@@ -1916,6 +1944,43 @@ mod planned_tests {
             );
         }
         assert_eq!(vd.backing_pixels(), (applied.pixels_w, applied.pixels_h));
+    }
+
+    /// A realistic resize sequence on one display, about one change a second.
+    /// Every step must land at the client's pixel size — Retina, or the 1×
+    /// fallback when macOS won't default to Retina (it won't right after 1× at the
+    /// same point size: 1920×1080 → 3840×2160@2×) — and a Retina size after a
+    /// fallback must still come up Retina, i.e. the display never gets pinned.
+    #[test]
+    #[ignore = "needs WindowServer"]
+    fn resizes_keep_working_after_a_fallback() {
+        let mut vd = VirtualDisplay::new_planned(&plan(3440, 1440, 100)).expect("create");
+        let (mut fell_back, mut retina_after_fallback) = (false, false);
+        for (w, h, s) in [
+            (1920, 1080, 100),
+            (3840, 2160, 200),
+            (3428, 2576, 200), // 4:3 Retina: macOS may default to 1×
+            (2560, 1440, 100),
+            (5120, 2880, 200),
+            (3440, 1440, 100),
+        ] {
+            let p = plan(w, h, s);
+            let applied = vd
+                .apply_plan(&p)
+                .unwrap_or_else(|e| panic!("{w}x{h}@{s}%: {e:#}"));
+            assert_eq!((applied.pixels_w, applied.pixels_h), (w, h), "{w}x{h}@{s}%");
+            assert_eq!(vd.backing_pixels(), (w, h));
+            eprintln!(
+                "{w}x{h}@{s}%: fell_back_to_one_x={}",
+                applied.fell_back_to_one_x
+            );
+            retina_after_fallback |= fell_back && s == 200 && !applied.fell_back_to_one_x;
+            fell_back |= applied.fell_back_to_one_x;
+        }
+        assert!(
+            !fell_back || retina_after_fallback || !crate::tunables::truthy("MACRDP_RETINA_VD"),
+            "no Retina mode came up after a fallback: the display is pinned"
+        );
     }
 
     #[test]

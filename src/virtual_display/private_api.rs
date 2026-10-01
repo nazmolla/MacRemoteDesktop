@@ -171,39 +171,22 @@ impl Handle {
         self.display_id
     }
 
-    /// Re-apply settings with a single new mode — the live-resize primitive.
-    /// Same `applySettings:` call that registered the display in `create`;
-    /// calling it again on the live instance switches the active mode (the
-    /// WindowServer relays out windows like a physical monitor changing
-    /// resolution). The new mode must fit the descriptor's max dimensions
-    /// (8192×8192, set in `create`).
-    pub(super) fn apply_mode(&self, width: u32, height: u32, refresh_hz: u32) -> Result<()> {
-        apply_single_mode(self.raw, width, height, refresh_hz)?;
-        select_mode(self.display_id, width, height, false).map(|_| ())
+    /// Live-resize to a 1× mode (`width × height` points = pixels).
+    pub(super) fn apply_mode(&self, width: u32, height: u32, _refresh_hz: u32) -> Result<()> {
+        apply_unpinned(self.raw, self.display_id, width, height, false).map(|_| ())
     }
 
-    /// Upstream's proven re-mode: hiDPI=0, the single mode becomes current by
-    /// itself. Used as the fallback when a hiDPI re-mode doesn't publish.
+    /// 1× at the client's pixel size: the fallback when the Retina variant
+    /// is not WindowServer's default for the requested size.
     pub(super) fn apply_mode_one_x_legacy(
         &self,
         width: u32,
         height: u32,
     ) -> Result<(u32, u32, u32, u32)> {
-        apply_single_mode_hidpi(self.raw, width, height, 60, false)?;
-        for _ in 0..60 {
-            if let Some(m) = cg_modes::current(self.display_id) {
-                if (m.0, m.1) == (width, height) {
-                    return Ok(m);
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        Err(anyhow!(
-            "legacy 1× re-mode to {width}×{height} never became active"
-        ))
+        apply_unpinned(self.raw, self.display_id, width, height, false)
     }
 
-    /// Register `points_w × points_h` and select its 1× or Retina variant.
+    /// Register `points_w × points_h` and wait for its 1× or Retina variant.
     /// Returns the active mode as `(points_w, points_h, pixels_w, pixels_h)`.
     pub(super) fn apply_points_mode(
         &self,
@@ -211,9 +194,79 @@ impl Handle {
         points_h: u32,
         hidpi: bool,
     ) -> Result<(u32, u32, u32, u32)> {
-        apply_single_mode(self.raw, points_w, points_h, 60)?;
-        select_mode(self.display_id, points_w, points_h, hidpi)
+        apply_unpinned(self.raw, self.display_id, points_w, points_h, hidpi)
     }
+}
+
+/// Minimum time between two display changes made by this process. Every change
+/// makes WindowServer, ColorSync and every running app re-process the display
+/// configuration; back-to-back changes overload the whole machine (a sustained
+/// burst wedged WindowServer until a hard restart, 2026-09-30). The resize
+/// debounce in `capture.rs` coalesces a drag; this caps the rate regardless.
+const MIN_CHANGE_GAP: std::time::Duration = std::time::Duration::from_millis(1000);
+
+fn wait_for_change_slot() {
+    static LAST_CHANGE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST_CHANGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(t) = *last {
+        let since = t.elapsed();
+        if since < MIN_CHANGE_GAP {
+            std::thread::sleep(MIN_CHANGE_GAP - since);
+        }
+    }
+    *last = Some(std::time::Instant::now());
+}
+
+/// Register a single mode and wait for WindowServer to make it current on its own.
+///
+/// Never selects a mode explicitly: `CGConfigureDisplayWithDisplayMode` on a
+/// virtual display freezes its mode list for the life of the process (later
+/// `applySettings:` publish nothing new), which is what made re-modes stick
+/// (spikes/displayhost, 2026-09-30). With `hiDPI=0` the one registered mode
+/// becomes current by itself. With `hiDPI=1` macOS also publishes a 1× twin and
+/// picks one of the two by an opaque heuristic (4:3 sizes often get 1×); if the
+/// Retina variant does not become current this returns an error and the caller
+/// falls back to 1×, leaving the display unpinned for later re-modes.
+fn apply_unpinned(
+    display: *mut AnyObject,
+    display_id: u32,
+    points_w: u32,
+    points_h: u32,
+    hidpi: bool,
+) -> Result<(u32, u32, u32, u32)> {
+    let scale = if hidpi { 2 } else { 1 };
+    let want = (points_w, points_h, scale * points_w, scale * points_h);
+    if cg_modes::current(display_id) == Some(want) {
+        return Ok(want);
+    }
+    // A 1× mode is retried once: right after a Retina request that landed on its
+    // 1× twin, the next 1× registration can be ignored (observed 2026-10-01).
+    let attempts = if hidpi { 1 } else { 2 };
+    for attempt in 0..attempts {
+        wait_for_change_slot();
+        apply_single_mode_hidpi(display, points_w, points_h, 60, hidpi)?;
+        // The switch is asynchronous; give it up to 3 s.
+        for _ in 0..60 {
+            if cg_modes::current(display_id) == Some(want) {
+                if attempt > 0 {
+                    tracing::info!(
+                        display_id,
+                        points_w,
+                        points_h,
+                        "1× mode landed on the retry"
+                    );
+                }
+                return Ok(want);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    Err(anyhow!(
+        "display {display_id}: {points_w}×{points_h} at {scale}× did not become current (current {:?})",
+        cg_modes::current(display_id)
+    ))
 }
 
 /// Build a one-mode `CGVirtualDisplaySettings` and `applySettings:` it onto
@@ -226,7 +279,7 @@ fn apply_single_mode(
     height: u32,
     refresh_hz: u32,
 ) -> Result<()> {
-    apply_single_mode_hidpi(display, width, height, refresh_hz, true)
+    apply_single_mode_hidpi(display, width, height, refresh_hz, false)
 }
 
 fn apply_single_mode_hidpi(
@@ -236,13 +289,8 @@ fn apply_single_mode_hidpi(
     refresh_hz: u32,
     hidpi: bool,
 ) -> Result<()> {
-    // Drop any app-scoped mode override from a previous `select_mode`; while it
-    // exists the WindowServer ignores new settings for the display.
-    extern "C" {
-        fn CGRestorePermanentDisplayConfiguration();
-    }
-    // SAFETY: CGRestorePermanentDisplayConfiguration takes no arguments.
-    unsafe { CGRestorePermanentDisplayConfiguration() };
+    // Never call CGRestorePermanentDisplayConfiguration here: it resets every
+    // display's configuration and made about 30% of activations fail.
     let settings_class = class_required("CGVirtualDisplaySettings")?;
     let mode_class = class_required("CGVirtualDisplayMode")?;
     let nsarray_class = class_required("NSArray")?;
@@ -269,10 +317,9 @@ fn apply_single_mode_hidpi(
         if settings.is_null() {
             return Err(anyhow!("[CGVirtualDisplaySettings init] returned nil"));
         }
-        // hiDPI=1 makes macOS offer a Retina twin (W×H pt @ 2W×2H px) of every
-        // registered mode; the 1× mode stays selectable. Because the display then
-        // comes up in its largest 1× mode rather than the one registered, every
-        // caller follows this with `select_mode` (docs/research/2026-09-29-hidpi-virtual-display.md).
+        // hiDPI=1 makes macOS offer a Retina twin (W×H pt @ 2W×2H px) of the
+        // registered mode and pick one of the two as default; hiDPI=0 offers only
+        // the registered 1× mode. See `apply_unpinned`.
         let _: () = msg_send![settings, setHiDPI: u32::from(hidpi)];
         let _: () = msg_send![settings, setModes: modes];
 
@@ -400,41 +447,32 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
             raw: display,
             display_id,
         };
-        // With hiDPI=1 the display comes up in its largest 1× mode; pin the one asked for.
-        select_mode(display_id, width, height, false)?;
+        // Registered with hiDPI=0, so the one mode becomes current by itself.
+        let want = (width, height, width, height);
+        for _ in 0..60 {
+            if cg_modes::current(display_id) == Some(want) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         Ok(handle)
     }
 }
 
 mod cg_modes {
-    //! Raw display-mode FFI. `core_graphics` 0.24's `CGDisplayMode::all_display_modes`
-    //! wraps each array element with `from_ptr` (taking ownership of a reference the
-    //! CFArray still owns), so modes are released twice — reproduced here as a SIGSEGV
-    //! on the first enumeration. Everything below balances its own retains.
+    //! Raw display-mode FFI (`core_graphics` 0.24's mode enumeration double-releases
+    //! its elements, a SIGSEGV). Everything below balances its own retains.
     use std::ffi::c_void;
-
-    use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
-    use core_foundation::base::{CFRelease, CFTypeRef};
-    use core_foundation::dictionary::CFDictionaryRef;
 
     pub type ModeRef = *mut c_void;
 
     extern "C" {
-        fn CGDisplayCopyAllDisplayModes(display: u32, options: CFDictionaryRef) -> CFArrayRef;
         fn CGDisplayCopyDisplayMode(display: u32) -> ModeRef;
         fn CGDisplayModeRelease(mode: ModeRef);
         fn CGDisplayModeGetWidth(mode: ModeRef) -> usize;
         fn CGDisplayModeGetHeight(mode: ModeRef) -> usize;
         fn CGDisplayModeGetPixelWidth(mode: ModeRef) -> usize;
         fn CGDisplayModeGetPixelHeight(mode: ModeRef) -> usize;
-        fn CGBeginDisplayConfiguration(config: *mut *mut c_void) -> i32;
-        fn CGConfigureDisplayWithDisplayMode(
-            config: *mut c_void,
-            display: u32,
-            mode: ModeRef,
-            options: CFDictionaryRef,
-        ) -> i32;
-        fn CGCompleteDisplayConfiguration(config: *mut c_void, option: u32) -> i32;
     }
 
     /// `(points_w, points_h, pixels_w, pixels_h)` of a mode.
@@ -462,66 +500,6 @@ mod cg_modes {
             Some(d)
         }
     }
-
-    pub fn list(display: u32, options: CFDictionaryRef) -> Vec<Dims> {
-        // SAFETY: the +1 array is checked for null; each element is borrowed from it (indices below
-        // its count) and read while the array is alive; the array is released once.
-        unsafe {
-            let arr = CGDisplayCopyAllDisplayModes(display, options);
-            if arr.is_null() {
-                return Vec::new();
-            }
-            let v = (0..CFArrayGetCount(arr))
-                .map(|i| dims(CFArrayGetValueAtIndex(arr, i) as ModeRef))
-                .collect();
-            CFRelease(arr as CFTypeRef);
-            v
-        }
-    }
-
-    /// Find a mode with exactly `want` dims and switch to it (session-scoped).
-    /// `Ok(false)` = no such mode offered; `Err(code)` = a CG call failed.
-    pub fn switch_to(display: u32, options: CFDictionaryRef, want: Dims) -> Result<bool, i32> {
-        // SAFETY: the +1 array is checked for null and every mode read from it is borrowed while it
-        // is alive; `cfg` is a valid out-pointer and a configuration that was begun is always
-        // completed; the array is released once at the end.
-        unsafe {
-            let arr = CGDisplayCopyAllDisplayModes(display, options);
-            if arr.is_null() {
-                return Ok(false);
-            }
-            let mut mode: ModeRef = std::ptr::null_mut();
-            for i in 0..CFArrayGetCount(arr) {
-                let m = CFArrayGetValueAtIndex(arr, i) as ModeRef;
-                if dims(m) == want {
-                    mode = m; // borrowed: valid while `arr` is alive
-                    break;
-                }
-            }
-            let result = if mode.is_null() {
-                Ok(false)
-            } else {
-                let mut cfg: *mut c_void = std::ptr::null_mut();
-                let e = CGBeginDisplayConfiguration(&mut cfg);
-                if e != 0 {
-                    Err(e)
-                } else {
-                    let e = CGConfigureDisplayWithDisplayMode(cfg, display, mode, std::ptr::null());
-                    // 0 = kCGConfigureForAppOnly: ForSession pins the mode list so later re-modes never publish new modes (spikes/hidpi/remode.swift).
-                    let c = CGCompleteDisplayConfiguration(cfg, 0);
-                    if e != 0 {
-                        Err(e)
-                    } else if c != 0 {
-                        Err(c)
-                    } else {
-                        Ok(true)
-                    }
-                }
-            };
-            CFRelease(arr as CFTypeRef);
-            result
-        }
-    }
 }
 
 /// Active mode of `display_id` as `(points_w, points_h, pixels_w, pixels_h)`.
@@ -531,73 +509,4 @@ mod cg_modes {
 )]
 pub(super) fn current_mode(display_id: u32) -> Option<(u32, u32, u32, u32)> {
     cg_modes::current(display_id)
-}
-
-/// Select the `points_w × points_h` mode of `display_id`, 1× or Retina (2×
-/// backing), and wait until the WindowServer reports it active. Retina variants
-/// are only listed with `kCGDisplayShowDuplicateLowResolutionModes`. A switch can
-/// report success yet not take effect (observed in the HiDPI spike), so the result
-/// is verified and the configuration retried once before giving up.
-pub(super) fn select_mode(
-    display_id: u32,
-    points_w: u32,
-    points_h: u32,
-    hidpi: bool,
-) -> Result<(u32, u32, u32, u32)> {
-    use core_foundation::boolean::CFBoolean;
-    use core_foundation::dictionary::CFDictionary;
-    use core_graphics::display::kCGDisplayShowDuplicateLowResolutionModes;
-
-    let scale = if hidpi { 2 } else { 1 };
-    let want = (points_w, points_h, scale * points_w, scale * points_h);
-    if cg_modes::current(display_id) == Some(want) {
-        return Ok(want);
-    }
-    let opts = CFDictionary::from_CFType_pairs(&[(
-        // SAFETY: `kCGDisplayShowDuplicateLowResolutionModes` is a static CFString constant, so a
-        // get-rule wrap is balanced.
-        unsafe { CFString::wrap_under_get_rule(kCGDisplayShowDuplicateLowResolutionModes) },
-        CFBoolean::true_value(),
-    )]);
-    for attempt in 0..2 {
-        // A freshly registered (or re-moded) display publishes its mode list
-        // asynchronously; poll up to ~2 s for the wanted mode to appear.
-        let mut offered = false;
-        for _ in 0..40 {
-            match cg_modes::switch_to(display_id, opts.as_concrete_TypeRef(), want) {
-                Ok(true) => {
-                    offered = true;
-                    break;
-                }
-                Ok(false) => std::thread::sleep(std::time::Duration::from_millis(50)),
-                Err(e) => return Err(anyhow!("display mode switch failed: CGError {e}")),
-            }
-        }
-        if !offered {
-            let offered = cg_modes::list(display_id, opts.as_concrete_TypeRef());
-            return Err(anyhow!(
-                "display {display_id} offers no {points_w}×{points_h} mode at {scale}× backing \
-                 (current {:?}; offered {:?})",
-                cg_modes::current(display_id),
-                offered
-            ));
-        }
-        for _ in 0..60 {
-            if cg_modes::current(display_id) == Some(want) {
-                return Ok(want);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        tracing::warn!(
-            display_id,
-            points_w,
-            points_h,
-            hidpi,
-            attempt,
-            "display mode switch reported success but did not take effect — retrying"
-        );
-    }
-    Err(anyhow!(
-        "display {display_id}: {points_w}×{points_h} at {scale}× never became active"
-    ))
 }
