@@ -1223,11 +1223,15 @@ impl Gfx {
             // slower than we capture (a Windows 11 laptop, 2026-10-01) fell 233
             // frames / ~15 s behind, its DWM memory climbed, input stalled and the
             // client crashed. Windows' own RDP servers pace on frame acks the same
-            // way. Gated to acks actually flowing (a suspended-ack client falls
-            // back to the submitted−shipped throttle above) and to having seen ≥1
-            // ack (no cold-start false drop). Dropping before encode keeps the
-            // H.264 reference chain valid.
-            if ctx.egfx_acks_seen && !ctx.acks_suspended {
+            // way. Not applied to a client that suspended acks (it falls back to
+            // the submitted−shipped throttle above). Applied from the first frame:
+            // before any ack `last_acked_frame_id` is 0, so a client that stalls
+            // on its first frames is capped too (that same laptop acked nothing
+            // for 13 s while upstream's "wait for the first ack" exemption let it
+            // be buried). A healthy client acks within milliseconds and never
+            // reaches the threshold. Dropping before encode keeps the H.264
+            // reference chain valid.
+            if !ctx.acks_suspended {
                 let lag = ctx
                     .last_shipped_frame_id
                     .load(Ordering::Relaxed)
