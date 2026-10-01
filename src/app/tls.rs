@@ -5,7 +5,9 @@ use super::*;
 
 pub(super) fn default_cert_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join("Library/Application Support/macrdp"))
+    Ok(PathBuf::from(home)
+        .join("Library/Application Support")
+        .join(crate::brand::NAME))
 }
 
 pub(super) fn load_pem_cert_and_key(

@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [[bin]]
-name = "macrdp"
+name = "portico"
 path = "src/main.rs"
 
 [dependencies]

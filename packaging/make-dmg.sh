@@ -8,7 +8,7 @@
 #
 # Usage:
 #   packaging/make-dmg.sh [App.app ...]
-#     With no args, includes target/macrdp.app and target/macrdpController.app
+#     With no args, includes target/Portico.app and target/PorticoController.app
 #     if present.
 #
 # Env:
@@ -16,8 +16,8 @@
 #                                    "Developer ID Application: …" identity.
 #   NOTARIZE=1 + NOTARY_PROFILE=<p>  notarize + staple the DMG.
 #   OUT_DIR=<dir>                    output dir (default: target/, gitignored).
-#   DMG_NAME=<name.dmg>              output filename (default: macrdp-<version>.dmg).
-#   VOL_NAME=<name>                  mounted volume name (default: "macrdp <version>").
+#   DMG_NAME=<name.dmg>              output filename (default: Portico-<version>.dmg).
+#   VOL_NAME=<name>                  mounted volume name (default: "Portico <version>").
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -30,15 +30,15 @@ VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
 # Collect app bundles: explicit args, else the staged builds under target/.
 apps=("$@")
 if [ ${#apps[@]} -eq 0 ]; then
-    for a in "$REPO_ROOT/target/macrdp.app" "$REPO_ROOT/target/macrdpController.app"; do
+    for a in "$REPO_ROOT/target/Portico.app" "$REPO_ROOT/target/PorticoController.app"; do
         [ -d "$a" ] && apps+=("$a")
     done
 fi
 [ ${#apps[@]} -gt 0 ] || { echo "no .app bundles given or found in target/ — build them first" >&2; exit 1; }
 for a in "${apps[@]}"; do [ -d "$a" ] || { echo "not a bundle: $a" >&2; exit 1; }; done
 
-DMG_NAME="${DMG_NAME:-macrdp-$VERSION.dmg}"
-VOL_NAME="${VOL_NAME:-macrdp $VERSION}"
+DMG_NAME="${DMG_NAME:-Portico-$VERSION.dmg}"
+VOL_NAME="${VOL_NAME:-Portico $VERSION}"
 DMG="$OUT_DIR/$DMG_NAME"
 mkdir -p "$OUT_DIR"
 
@@ -83,10 +83,10 @@ tell application "Finder"
     set icon size of theViewOptions to 96
     $bg_clause
     try
-      set position of item "macrdp.app" of container window to {150, 150}
+      set position of item "Portico.app" of container window to {150, 150}
     end try
     try
-      set position of item "macrdpController.app" of container window to {150, 320}
+      set position of item "PorticoController.app" of container window to {150, 320}
     end try
     set position of item "Applications" of container window to {450, 230}
     update without registering applications

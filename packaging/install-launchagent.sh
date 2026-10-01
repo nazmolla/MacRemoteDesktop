@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install + (re)load the macrdp LaunchAgent for the current user.
+# Install + (re)load the Portico LaunchAgent for the current user.
 #
 # Seeds ~/Library/Application Support/macrdp/config.env from the example on
 # first run, renders the LaunchAgent plist from the template, and bootstraps it.
@@ -13,15 +13,18 @@ PKG_DIR="$REPO_ROOT/packaging"
 APP_DIR="${APP_DIR:-/Applications}"
 # MUST match the BUNDLE_PREFIX used by make-app.sh (and gui/make-tray-app.sh),
 # or the controller targets a different label than the agent installed here.
-BUNDLE_PREFIX="${BUNDLE_PREFIX:-com.clintcan}"
-LABEL="$BUNDLE_PREFIX.macrdp"
+# Product name and lower-case id; keep in step with src/brand.rs and make-app.sh.
+PRODUCT="${PRODUCT:-Portico}"
+PRODUCT_ID="${PRODUCT_ID:-portico}"
+BUNDLE_PREFIX="${BUNDLE_PREFIX:-ca.nazmi}"
+LABEL="$BUNDLE_PREFIX.$PRODUCT_ID"
 UID_NUM="$(id -u)"
 
-APP="$APP_DIR/macrdp.app"
-[ -d "$APP" ] || { echo "macrdp.app not found at $APP — run packaging/make-app.sh first" >&2; exit 1; }
+APP="$APP_DIR/$PRODUCT.app"
+[ -d "$APP" ] || { echo "$PRODUCT.app not found at $APP — run packaging/make-app.sh first" >&2; exit 1; }
 
 # 1. Seed config.env if absent.
-SUPPORT="$HOME/Library/Application Support/macrdp"
+SUPPORT="$HOME/Library/Application Support/$PRODUCT"
 mkdir -p "$SUPPORT" "$HOME/Library/Logs" "$HOME/Library/LaunchAgents"
 CONFIG="$SUPPORT/config.env"
 if [ ! -f "$CONFIG" ]; then
@@ -34,6 +37,7 @@ fi
 # 2. Render the LaunchAgent plist from the template.
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 sed -e "s#__LABEL__#$LABEL#g" -e "s#__APP_DIR__#$APP_DIR#g" -e "s#__HOME__#$HOME#g" \
+    -e "s#__PRODUCT_ID__#$PRODUCT_ID#g" -e "s#__PRODUCT__#$PRODUCT#g" \
     "$PKG_DIR/launchagent.plist.template" > "$PLIST"
 echo "==> wrote $PLIST"
 
@@ -58,6 +62,6 @@ launchctl kickstart -k "gui/$UID_NUM/$LABEL"
 echo
 echo "Loaded $LABEL."
 echo "  status:  launchctl print gui/$UID_NUM/$LABEL | grep -E 'state|pid'"
-echo "  logs:    tail -f ~/Library/Logs/macrdp.log"
+echo "  logs:    tail -f ~/Library/Logs/$PRODUCT_ID.log"
 echo "  apply config change:  launchctl kickstart -k gui/$UID_NUM/$LABEL"
 echo "  stop:    launchctl bootout gui/$UID_NUM/$LABEL"

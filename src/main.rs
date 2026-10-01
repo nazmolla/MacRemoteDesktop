@@ -16,6 +16,7 @@ mod audio;
 mod auth;
 mod auth_guard;
 mod avc444;
+mod brand;
 mod camera;
 mod capture;
 mod clipboard;
