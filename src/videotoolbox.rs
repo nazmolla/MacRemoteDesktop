@@ -36,7 +36,6 @@ use anyhow::{anyhow, bail, Result};
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub is_keyframe: bool,
-    #[allow(dead_code)]
     pub pts: i64,
     /// SPS / PPS NAL units (raw, no length prefix and no start code).
     /// Populated only on keyframes — empty on non-keyframes.

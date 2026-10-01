@@ -104,14 +104,15 @@ struct Avc444Buffers {
 }
 
 impl Avc444Buffers {
-    /// Convert `bgra` (`width×height`) and split it; the encode height is
-    /// `height` rounded up to even (last row replicated).
+    /// Convert `bgra` (`width×height`) and split it into main and auxiliary
+    /// views, both `width × height` rounded up to 16 rows (the last row is
+    /// repeated into the padding; the client only copies the visible area).
     fn fill(&mut self, bgra: &[u8], stride: usize, width: usize, height: usize) {
-        let he = height + (height & 1);
-        let (cw, ch) = (width / 2, he / 2);
-        let ah = crate::avc444::padded_aux_height(he);
+        let h16 = height.next_multiple_of(16);
+        let cw = width / 2;
+        let ah = crate::avc444::padded_aux_height(h16);
         for p in [&mut self.y, &mut self.u, &mut self.v] {
-            p.resize(width * he, 0);
+            p.resize(width * h16, 0);
         }
         crate::avc444::bgra_to_yuv444_full_bt709_into(
             bgra,
@@ -123,13 +124,13 @@ impl Avc444Buffers {
             &mut self.v,
             width,
         );
-        if he != height {
-            for p in [&mut self.y, &mut self.u, &mut self.v] {
-                p.copy_within(width * (height - 1)..width * height, width * height);
-            }
+        for p in [&mut self.y, &mut self.u, &mut self.v] {
+            crate::avc444::pad_plane_edge(p, width, width, height, width, h16);
         }
-        let sizes = [(width * he), (cw * ch), (cw * ch)];
-        let aux_sizes = [(width * ah), (cw * ah / 2), (cw * ah / 2)];
+        let sizes = [width * h16, cw * h16 / 2, cw * h16 / 2];
+        // The split may write past `h16` rows into the auxiliary planes; the
+        // encoder reads only the first `h16` rows.
+        let aux_sizes = [width * ah, cw * ah / 2, cw * ah / 2];
         for (p, n) in self.main.iter_mut().zip(sizes) {
             p.resize(n, 0);
         }
@@ -140,9 +141,33 @@ impl Avc444Buffers {
         let [ay, au, av] = &mut self.aux;
         crate::avc444::split_yuv444_to_yuv420_v1(
             &self.y, &self.u, &self.v, width, width, width, my, mu, mv, width, cw, cw, ay, au, av,
-            width, cw, cw, width, he,
+            width, cw, cw, width, h16,
         );
     }
+}
+
+/// Pair an AVC444 encoder's alternating pictures: each even-PTS main with the
+/// odd-PTS auxiliary that follows it. A main still waiting for its auxiliary
+/// stays in `pending`; a main superseded before its auxiliary arrives is
+/// shipped alone, and a stray auxiliary is dropped.
+fn pair_interleaved(
+    pending: &mut Option<EncodedFrame>,
+    batch: Vec<EncodedFrame>,
+) -> (Vec<EncodedFrame>, Vec<Option<EncodedFrame>>) {
+    let mut mains = Vec::new();
+    let mut aux = Vec::new();
+    for f in batch {
+        if f.pts % 2 == 0 {
+            if let Some(lone) = pending.replace(f) {
+                mains.push(lone);
+                aux.push(None);
+            }
+        } else if pending.as_ref().is_some_and(|m| m.pts + 1 == f.pts) {
+            mains.extend(pending.take());
+            aux.push(Some(f));
+        }
+    }
+    (mains, aux)
 }
 
 // ---- Lock order ----------------------------------------------------------
@@ -208,8 +233,6 @@ struct ConnectionContext {
     /// Client negotiated AVC444 (spec §8.2 codec ladder): frames are encoded as
     /// a main + auxiliary H.264 pair and shipped with `send_avc444_frame`.
     avc444: bool,
-    /// Encoder for the AVC444 auxiliary (chroma-detail) view.
-    aux_encoder: Option<Encoder>,
     avc444_buf: Avc444Buffers,
     /// Regions for frames submitted but not yet shipped, keyed by encoder PTS.
     /// `None` = whole surface.
@@ -1308,9 +1331,6 @@ impl Gfx {
                 if let Err(e) = encoder.set_bitrate(bps) {
                     trace!(error = ?e, bps, "adaptive set_bitrate failed");
                 }
-                if let Some(aux) = ctx.aux_encoder.as_ref() {
-                    let _ = aux.set_bitrate(bps);
-                }
             }
             if let Some(frames) = adaptive.keyframe_frames {
                 if let Err(e) = encoder.set_keyframe_interval(frames) {
@@ -1318,16 +1338,16 @@ impl Gfx {
                 }
             }
             let pts = encoder.next_pts();
-            match ctx.aux_encoder.as_mut() {
-                Some(aux) if ctx.avc444 => {
-                    let (w, h) = (usize::from(ctx.dims.0), usize::from(ctx.dims.1));
-                    ctx.avc444_buf.fill(bgra, stride, w, h);
-                    let [my, mu, mv] = &ctx.avc444_buf.main;
-                    let [ay, au, av] = &ctx.avc444_buf.aux;
-                    encoder.encode_yuv420(my, mu, mv, force_keyframe)?;
-                    aux.encode_yuv420(ay, au, av, force_keyframe)?;
-                }
-                _ => encoder.encode_bgra_from(bgra, stride, force_keyframe, surface)?,
+            if ctx.avc444 {
+                let (w, h) = (usize::from(ctx.dims.0), usize::from(ctx.dims.1));
+                ctx.avc444_buf.fill(bgra, stride, w, h);
+                let [my, mu, mv] = &ctx.avc444_buf.main;
+                let [ay, au, av] = &ctx.avc444_buf.aux;
+                // Main picture (even PTS), then its auxiliary picture (odd PTS).
+                encoder.encode_yuv420(my, mu, mv, force_keyframe)?;
+                encoder.encode_yuv420(ay, au, av, false)?;
+            } else {
+                encoder.encode_bgra_from(bgra, stride, force_keyframe, surface)?;
             }
             let debt = ctx.region_debt.take();
             let resolved = if force_keyframe { None } else { debt };
@@ -1597,38 +1617,27 @@ impl Gfx {
     fn ship_loop(
         &self,
         rx: std::sync::mpsc::Receiver<EncodedFrame>,
-        aux_rx: Option<std::sync::mpsc::Receiver<EncodedFrame>>,
+        interleaved: bool,
         shipped: Arc<AtomicU64>,
     ) {
-        let mut aux_ahead: Option<EncodedFrame> = None;
+        // AVC444: the encoder's pictures alternate main (even PTS) and auxiliary
+        // (odd PTS). A main whose auxiliary never arrives ships alone as AVC420.
+        let mut pending_main: Option<EncodedFrame> = None;
         while let Ok(frame) = rx.recv() {
             // Sweep up any others VT delivered alongside it (keeps order).
-            let mut frames = vec![frame];
+            let mut batch = vec![frame];
             while let Ok(f) = rx.try_recv() {
-                frames.push(f);
+                batch.push(f);
             }
-            // Pair each main frame with the auxiliary frame of the same PTS; a
-            // missing one (VT drop) ships the main view alone as AVC420.
-            let aux: Vec<Option<EncodedFrame>> = match aux_rx.as_ref() {
-                None => vec![None; frames.len()],
-                Some(arx) => frames
-                    .iter()
-                    .map(|f| loop {
-                        let next = aux_ahead
-                            .take()
-                            .or_else(|| arx.recv_timeout(Duration::from_millis(250)).ok());
-                        match next {
-                            Some(a) if a.pts < f.pts => continue,
-                            Some(a) if a.pts == f.pts => break Some(a),
-                            Some(a) => {
-                                aux_ahead = Some(a);
-                                break None;
-                            }
-                            None => break None,
-                        }
-                    })
-                    .collect(),
+            let (frames, aux) = if interleaved {
+                pair_interleaved(&mut pending_main, batch)
+            } else {
+                let n = batch.len();
+                (batch, vec![None; n])
             };
+            if frames.is_empty() {
+                continue;
+            }
             let n = frames.len() as u64;
             if let Err(e) = self.ship_frames(&frames, &aux) {
                 warn!(error = ?e, "EGFX ship_frames failed");
@@ -1724,10 +1733,20 @@ impl Gfx {
             // ceiling: equal to the ceiling unless the RTT seed lowered it
             // (slow link) or the controller already adjusted it (encoder
             // rebuild mid-connection).
+            // AVC444 sends the main and auxiliary views as consecutive pictures
+            // of ONE H.264 stream (the client decodes both with one decoder, so
+            // two independent streams corrupt each other's references), both at
+            // the height rounded up to 16 that the auxiliary packing needs, and
+            // at twice the picture rate.
+            let (enc_h, enc_fps) = if ctx.avc444 {
+                (height.next_multiple_of(16), self.fps * 2)
+            } else {
+                (height, self.fps)
+            };
             let mut encoder = Encoder::new(
                 width,
-                height,
-                self.fps,
+                enc_h,
+                enc_fps,
                 ctx.adaptive_target_bps,
                 self.keyframe_secs,
             )?;
@@ -1739,24 +1758,7 @@ impl Gfx {
                 .take_receiver()
                 .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
             ctx.encoder = Some(encoder);
-            let aux_rx = if ctx.avc444 {
-                let he = height + (height & 1);
-                let mut aux = Encoder::new(
-                    width,
-                    crate::avc444::padded_aux_height(usize::from(he)) as u16,
-                    self.fps,
-                    ctx.adaptive_target_bps,
-                    self.keyframe_secs,
-                )?;
-                let aux_rx = aux
-                    .take_receiver()
-                    .ok_or_else(|| anyhow!("EGFX: aux encoder receiver already taken"))?;
-                ctx.aux_encoder = Some(aux);
-                Some(aux_rx)
-            } else {
-                ctx.aux_encoder = None;
-                None
-            };
+            let interleaved = ctx.avc444;
             ctx.region_queue.clear();
             ctx.region_debt = RegionDebt::Full;
             // Fresh throttle counters for this connection.
@@ -1766,7 +1768,7 @@ impl Gfx {
             let shipped = ctx.shipped.clone();
             std::thread::Builder::new()
                 .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, aux_rx, shipped))
+                .spawn(move || gfx.ship_loop(rx, interleaved, shipped))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
             info!("EGFX VideoToolbox encoder initialized + ship thread started");
         }
@@ -2028,7 +2030,6 @@ impl Gfx {
             // `submit_bgra` run `ensure_surface` and `setup_encoder_locked`
             // (which rebuilds the encoder and resets the throttle counters).
             ctx.encoder = None;
-            ctx.aux_encoder = None;
             ctx.region_queue.clear();
             ctx.last_regions = None;
             ctx.region_debt = RegionDebt::Full;
@@ -2425,7 +2426,6 @@ impl GfxServerFactory for Gfx {
         };
         *lock_ctx(&self.ctx) = Some(ConnectionContext {
             avc444: false,
-            aux_encoder: None,
             avc444_buf: Avc444Buffers::default(),
             region_queue: std::collections::VecDeque::new(),
             last_regions: None,
@@ -2771,7 +2771,6 @@ impl GraphicsPipelineHandler for GfxHandler {
             );
             ctx.is_ready = false;
             ctx.encoder = None;
-            ctx.aux_encoder = None;
             ctx.region_queue.clear();
             ctx.last_regions = None;
             ctx.region_debt = RegionDebt::Full;
