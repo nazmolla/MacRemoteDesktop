@@ -1043,10 +1043,11 @@ mod macos {
         /// `flush_frames` times to push it through within a couple of frame
         /// intervals. Stays 0 (no-op) on the legacy bitmap path.
         flush_remaining: u32,
-        /// Last BGRA frame submitted to EGFX, reused across frames (no per-frame
-        /// realloc) and re-encoded as cheap skip-P-frames during a flush burst.
-        last_frame: Vec<u8>,
-        last_stride: usize,
+        /// Last frame submitted to EGFX, re-encoded as cheap skip-P-frames during
+        /// a flush burst and used for idle refinement. A retained reference to
+        /// the capture buffer, not a copy: copying it cost a full frame (~9 MB at
+        /// 1718×1334) on every submitted frame (2026-10-01 profile).
+        last_frame: Option<screencapturekit::cv::CVPixelBuffer>,
         /// Shared "client minimized" flag — see [`super::CaptureDisplay::display_suppressed`].
         /// `None` disables the gate.
         display_suppressed: Option<Arc<AtomicBool>>,
@@ -1301,8 +1302,7 @@ mod macos {
                 frame_interval,
                 flush_frames,
                 flush_remaining: 0,
-                last_frame: Vec::new(),
-                last_stride: 0,
+                last_frame: None,
                 display_suppressed,
                 was_suppressed: false,
                 suppressed_since: None,
@@ -1549,30 +1549,39 @@ mod macos {
                         Ok(Some(sample)) => sample,
                         Ok(None) => return Ok(None),
                         Err(_) => {
-                            if self.flush_remaining > 0 {
+                            let flush = self.flush_remaining > 0;
+                            if flush {
                                 self.flush_remaining -= 1;
-                                if let Some(gfx) = self.gfx.as_ref() {
-                                    if !self.last_frame.is_empty() {
-                                        if let Err(e) = gfx.submit_bgra_regions(
-                                            &self.last_frame,
-                                            self.last_stride,
-                                            false,
-                                            crate::h264::FrameRegions::SameAsLast,
-                                        ) {
-                                            tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
-                                        }
-                                    }
-                                }
                             }
-                            if self.flush_remaining == 0
-                                && refine_pending
-                                && !self.last_frame.is_empty()
+                            let refine = !flush && refine_pending;
+                            if let (Some(gfx), Some(pb)) =
+                                (self.gfx.as_ref(), self.last_frame.as_ref())
                             {
-                                if let Some(gfx) = self.gfx.as_ref() {
-                                    if let Err(e) =
-                                        gfx.refine_tick(&self.last_frame, self.last_stride, false)
-                                    {
-                                        tracing::warn!(error = ?e, "lossless refinement failed");
+                                if flush || refine {
+                                    match pb.lock(CVPixelBufferLockFlags::READ_ONLY) {
+                                        Ok(g) => {
+                                            let (bgra, stride) = (g.as_slice(), g.bytes_per_row());
+                                            let r = if flush {
+                                                gfx.submit_bgra_regions(
+                                                    bgra,
+                                                    stride,
+                                                    false,
+                                                    crate::h264::FrameRegions::SameAsLast,
+                                                )
+                                                .map(|_| ())
+                                            } else {
+                                                gfx.refine_tick(bgra, stride, false)
+                                            };
+                                            if let Err(e) = r {
+                                                tracing::warn!(error = ?e, flush, "EGFX idle submit failed");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                status = e,
+                                                "locking the last frame failed"
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -1760,9 +1769,7 @@ mod macos {
                             // it enough times to drain mstsc's presentation
                             // buffer. Reuse the buffer to avoid a per-frame
                             // realloc; clear keeps the capacity.
-                            self.last_frame.clear();
-                            self.last_frame.extend_from_slice(src);
-                            self.last_stride = stride_bytes;
+                            self.last_frame = Some(pixel_buffer.clone());
                             self.flush_remaining = self.flush_frames;
                             continue;
                         }
