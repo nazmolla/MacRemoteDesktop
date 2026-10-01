@@ -929,6 +929,7 @@ pub(super) fn args_from_config(path: &Path) -> Result<Args> {
         // for high-DPI clients. Read when the display is created / re-moded.
         ("DISPLAY_HOST", "MACRDP_DISPLAY_HOST"),
         ("RETINA_VD", "MACRDP_RETINA_VD"),
+        ("AVC444", "MACRDP_AVC444"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {
