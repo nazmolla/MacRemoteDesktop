@@ -1391,7 +1391,12 @@ mod ffi {
                         break;
                     }
                     let slice = std::slice::from_raw_parts(ptr_out, size_out);
-                    parameter_sets.push(slice.to_vec());
+                    // Declare "no reordering" in the SPS so decoders output each
+                    // frame at once (see h264/sps.rs); anything else is kept as is.
+                    parameter_sets.push(
+                        crate::h264::sps::declare_no_reordering(slice)
+                            .unwrap_or_else(|| slice.to_vec()),
+                    );
                     index += 1;
                     if count_out > 0 && index >= count_out {
                         break;

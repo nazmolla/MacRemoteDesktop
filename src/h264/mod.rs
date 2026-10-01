@@ -76,6 +76,7 @@ mod annexb;
 mod blank;
 mod congestion;
 mod regions;
+pub(crate) mod sps;
 mod udp_watchdog;
 
 pub(crate) use annexb::avcc_to_annex_b;
