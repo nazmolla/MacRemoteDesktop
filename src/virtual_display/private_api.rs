@@ -205,7 +205,7 @@ impl Handle {
 /// debounce in `capture.rs` coalesces a drag; this caps the rate regardless.
 const MIN_CHANGE_GAP: std::time::Duration = std::time::Duration::from_millis(1000);
 
-fn wait_for_change_slot() {
+pub(super) fn wait_for_change_slot() {
     static LAST_CHANGE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     let mut last = LAST_CHANGE
         .lock()

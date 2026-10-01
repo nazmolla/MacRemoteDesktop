@@ -676,6 +676,12 @@ impl CaptureDisplay {
             return (width, height);
         };
         let mut vd = vd.lock_or_recover();
+        // The first sync of a connection may replace a hosted display (new id);
+        // nothing has addressed it yet. Reactivations never may.
+        let may_replace = self
+            .client_advert
+            .as_ref()
+            .is_some_and(|advert| advert.take_new_connection());
         let plan = self.client_advert.as_ref().map(|advert| {
             crate::negotiator::display::plan_display(crate::negotiator::display::ClientMonitor {
                 width_px: u32::from(width),
@@ -688,7 +694,7 @@ impl CaptureDisplay {
                 if self.applied_plan.as_ref() == Some(p) {
                     return (width, height);
                 }
-                vd.apply_plan(p).map(|applied| {
+                vd.apply_plan_with(p, may_replace).map(|applied| {
                     tracing::info!(
                         target: "macrdp::negotiator",
                         reason = %p.reason,

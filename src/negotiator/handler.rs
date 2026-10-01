@@ -3,7 +3,7 @@
 //! per-connection input choices. Forwards every call to the wrapped handler.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,9 +18,17 @@ pub struct ClientAdvert {
     pub scale_pct: AtomicU32,
     /// 0 = unknown/Other, 1 = Windows, 2 = Apple.
     platform: AtomicU8,
+    /// Set once per connection (never on a reactivation); taken by the first
+    /// display sync, the only point where the display may still be replaced.
+    new_connection: AtomicBool,
 }
 
 impl ClientAdvert {
+    /// True once per connection, for the first caller.
+    pub fn take_new_connection(&self) -> bool {
+        self.new_connection.swap(false, Ordering::AcqRel)
+    }
+
     #[allow(
         dead_code,
         reason = "phase 1 of the negotiated-session plan; wired in by a later phase"
@@ -145,6 +153,7 @@ impl ConnectionHandler for NegotiationHandler {
         self.advert
             .scale_pct
             .store(info.desktop_scale_factor.unwrap_or(0), Ordering::Relaxed);
+        self.advert.new_connection.store(true, Ordering::Release);
 
         // Log display info
         tracing::info!(target: "macrdp::negotiator", width = info.desktop_width, height = info.desktop_height, scale = info.desktop_scale_factor.unwrap_or(0), "display info recorded");

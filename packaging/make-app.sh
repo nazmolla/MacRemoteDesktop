@@ -179,6 +179,26 @@ else
     echo "==> WARNING: macrdpshield not found; --shield-primary will REFUSE to start (unset SKIP_BUILD?)" >&2
 fi
 
+# 2f. Embed the virtual display host helper (MACRDP_DISPLAY_HOST=1): one process
+#     per virtual display, so a display can be replaced between connections
+#     (see src/virtual_display/host.rs). Plain Objective-C, no Xcode project.
+DISPLAY_HOST_BIN="$REPO_ROOT/target/display-host/macrdpdisplay"
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    echo "==> clang (macrdpdisplay)"
+    mkdir -p "$(dirname "$DISPLAY_HOST_BIN")"
+    clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter \
+        -framework Foundation -framework CoreGraphics \
+        -o "$DISPLAY_HOST_BIN" "$REPO_ROOT/display-host/macrdpdisplay.m"
+fi
+if [ -f "$DISPLAY_HOST_BIN" ]; then
+    cp "$DISPLAY_HOST_BIN" "$STAGE/Contents/Resources/macrdpdisplay"
+    chmod +x "$STAGE/Contents/Resources/macrdpdisplay"
+    codesign --force --options runtime $TS -s "$IDENTITY" "$STAGE/Contents/Resources/macrdpdisplay"
+    echo "==> embedded macrdpdisplay (virtual display host)"
+else
+    echo "==> WARNING: macrdpdisplay not found; MACRDP_DISPLAY_HOST=1 will fail (unset SKIP_BUILD?)" >&2
+fi
+
 # 3. Sign the Mach-O executable, then the bundle (which seals Info.plist + the
 #    Resources, including the app icon + the embedded IFD bundle).
 # Embed the provisioning profile (if any) BEFORE the bundle sign so it's sealed in.

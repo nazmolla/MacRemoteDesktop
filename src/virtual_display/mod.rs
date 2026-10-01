@@ -12,6 +12,11 @@
 #[cfg(target_os = "macos")]
 mod private_api;
 
+#[cfg(target_os = "macos")]
+mod host;
+#[cfg(target_os = "macos")]
+mod host_proto;
+
 /// The virtual display mode actually in effect after [`VirtualDisplay::apply_plan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppliedMode {
@@ -176,10 +181,42 @@ mod macos {
         }
     }
 
+    use super::host::HostProcess;
+    use super::host_proto::{HostMode, HostReply};
+
+    /// Start a helper and create its display at `pixels_w × pixels_h`, `scale`×.
+    fn start_host(
+        serial: u32,
+        pixels_w: u32,
+        pixels_h: u32,
+        scale: u32,
+    ) -> Result<(HostProcess, HostMode)> {
+        private_api::wait_for_change_slot();
+        let mut proc = HostProcess::spawn(crate::brand::NAME)?;
+        match proc.command(&format!("create {serial} {pixels_w} {pixels_h} {scale}"))? {
+            HostReply::Ok(m) => Ok((proc, m)),
+            HostReply::NeedsReplace => Err(anyhow!(
+                "fresh display host could not reach {pixels_w}×{pixels_h} at {scale}×"
+            )),
+            HostReply::Err(e) => Err(anyhow!("display host: {e}")),
+        }
+    }
+
+    /// Who owns the CGVirtualDisplay: this process, or a `macrdpdisplay`
+    /// helper (`MACRDP_DISPLAY_HOST=1`) that can be replaced.
+    enum Backend {
+        InProcess(private_api::Handle),
+        Host {
+            /// `None` only while a replacement is being started.
+            proc: Option<super::host::HostProcess>,
+            serial: u32,
+        },
+    }
+
     pub struct VirtualDisplay {
-        // RAII: dropped last so the CG handle is released after we've
+        // RAII: dropped last so the display is removed after we've
         // logged anything we want to log about it.
-        _handle: private_api::Handle,
+        _handle: Backend,
         display_id: u32,
         id_cell: super::DisplayIdCell,
         origin_pts: (f64, f64),
@@ -197,6 +234,9 @@ mod macos {
         /// resolved on this macOS version. Caller should treat that as
         /// "this feature isn't usable here," not a fatal bug.
         pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
+            if crate::tunables::truthy("MACRDP_DISPLAY_HOST") {
+                return Self::new_hosted(width, height);
+            }
             let handle = private_api::create(width, height, refresh_hz, crate::brand::NAME)
                 .context("creating virtual display")?;
 
@@ -216,12 +256,59 @@ mod macos {
             }
 
             Ok(Self {
-                _handle: handle,
+                _handle: Backend::InProcess(handle),
                 display_id: id,
                 id_cell: super::DisplayIdCell::new(Some(id)),
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
             })
+        }
+
+        /// A 1× display at `width × height` owned by a fresh helper process.
+        fn new_hosted(width: u32, height: u32) -> Result<Self> {
+            // One serial for every host this process starts: replacements
+            // reuse the identity (the helper waits for the old one to leave).
+            let serial = std::process::id().wrapping_mul(64).wrapping_add(63);
+            let (proc, mode) = start_host(serial, width, height, 1)?;
+            let mut vd = Self {
+                _handle: Backend::Host {
+                    proc: Some(proc),
+                    serial,
+                },
+                display_id: mode.display_id,
+                id_cell: super::DisplayIdCell::new(Some(mode.display_id)),
+                origin_pts: (0.0, 0.0),
+                size_pts: (0.0, 0.0),
+            };
+            vd.refresh_bounds();
+            Ok(vd)
+        }
+
+        /// Swap the helper for a fresh one at the wanted mode. The display id
+        /// changes, so this is only done before a connection starts using it.
+        fn replace_host(&mut self, pixels_w: u32, pixels_h: u32, scale: u32) -> Result<HostMode> {
+            let Backend::Host { proc, serial } = &mut self._handle else {
+                return Err(anyhow!("only a hosted display can be replaced"));
+            };
+            let serial = *serial;
+            let old_id = self.display_id;
+            // The old helper removes its display (under the machine-wide lock)
+            // before the new one is created.
+            drop(proc.take());
+            let (new_proc, mode) = start_host(serial, pixels_w, pixels_h, scale)?;
+            *proc = Some(new_proc);
+            self.display_id = mode.display_id;
+            self.id_cell.set(mode.display_id);
+            self.refresh_bounds();
+            tracing::info!(
+                old_id,
+                new_id = mode.display_id,
+                pixels_w,
+                pixels_h,
+                scale,
+                "virtual display replaced by a fresh display host"
+            );
+            Ok(mode)
         }
 
         /// Create a display sized and scaled per a negotiated [`DisplayPlan`]
@@ -246,16 +333,33 @@ mod macos {
             &mut self,
             plan: &crate::negotiator::display::DisplayPlan,
         ) -> Result<super::AppliedMode> {
+            self.apply_plan_with(plan, false)
+        }
+
+        /// [`Self::apply_plan`]; with `may_replace`, a hosted display that cannot
+        /// reach the mode is replaced by a fresh host (new display id). Only pass
+        /// it before a connection has started using the display.
+        pub fn apply_plan_with(
+            &mut self,
+            plan: &crate::negotiator::display::DisplayPlan,
+            may_replace: bool,
+        ) -> Result<super::AppliedMode> {
+            let retina_allowed = crate::tunables::truthy("MACRDP_RETINA_VD");
+            if matches!(self._handle, Backend::Host { .. }) {
+                return self.apply_plan_hosted(plan, plan.hidpi && retina_allowed, may_replace);
+            }
+            let Backend::InProcess(handle) = &self._handle else {
+                unreachable!("hosted displays returned above");
+            };
             // Retina is opt-in until it is reliable: a Retina request that macOS
             // lands on its 1× twin can leave the display stuck at that size, so
             // by default a high-DPI client gets 1× at its exact pixel size.
-            let first = if plan.hidpi && !crate::tunables::truthy("MACRDP_RETINA_VD") {
+            let first = if plan.hidpi && !retina_allowed {
                 Err(anyhow!(
                     "Retina virtual display modes are off (MACRDP_RETINA_VD)"
                 ))
             } else {
-                self._handle
-                    .apply_points_mode(plan.points_w, plan.points_h, plan.hidpi)
+                handle.apply_points_mode(plan.points_w, plan.points_h, plan.hidpi)
             };
             let (mode, fell_back) = match first {
                 Ok(m) => (m, false),
@@ -266,8 +370,7 @@ mod macos {
                         points_h = plan.points_h,
                         "Retina mode unavailable — falling back to 1× at client pixels"
                     );
-                    let m = self
-                        ._handle
+                    let m = handle
                         .apply_mode_one_x_legacy(plan.capture_w, plan.capture_h)
                         .context("1× fallback mode")?;
                     (m, true)
@@ -282,6 +385,83 @@ mod macos {
                 pixels_h: mode.3,
                 fell_back_to_one_x: fell_back,
             })
+        }
+
+        fn apply_plan_hosted(
+            &mut self,
+            plan: &crate::negotiator::display::DisplayPlan,
+            retina: bool,
+            may_replace: bool,
+        ) -> Result<super::AppliedMode> {
+            let one_x = (plan.capture_w, plan.capture_h, 1);
+            let want = if retina {
+                (plan.points_w * 2, plan.points_h * 2, 2)
+            } else {
+                one_x
+            };
+            let (mode, fell_back) = match self.host_mode(want, may_replace) {
+                Ok(m) => (m, false),
+                Err(e) if retina => {
+                    tracing::warn!(
+                        error = %e,
+                        points_w = plan.points_w,
+                        points_h = plan.points_h,
+                        "Retina mode unavailable — falling back to 1× at client pixels"
+                    );
+                    let m = self
+                        .host_mode(one_x, may_replace)
+                        .context("1× fallback mode")?;
+                    (m, true)
+                }
+                Err(e) => return Err(e.context("applying virtual display plan")),
+            };
+            Ok(super::AppliedMode {
+                points_w: mode.points_w,
+                points_h: mode.points_h,
+                pixels_w: mode.pixels_w,
+                pixels_h: mode.pixels_h,
+                fell_back_to_one_x: fell_back,
+            })
+        }
+
+        /// Ask the current host for `(pixels_w, pixels_h, scale)`; if it can't,
+        /// and `may_replace`, start a fresh host at that mode.
+        fn host_mode(&mut self, want: (u32, u32, u32), may_replace: bool) -> Result<HostMode> {
+            let (pw, ph, scale) = want;
+            let Backend::Host { proc, .. } = &mut self._handle else {
+                return Err(anyhow!("not a hosted display"));
+            };
+            let attempt = match proc.as_mut().filter(|p| !p.is_broken()) {
+                Some(p) => {
+                    private_api::wait_for_change_slot();
+                    match p.command(&format!("mode {pw} {ph} {scale}")) {
+                        Ok(HostReply::Ok(m)) => Ok(m),
+                        Ok(HostReply::NeedsReplace) => {
+                            Err(anyhow!("display host is pinned to its current mode"))
+                        }
+                        Ok(HostReply::Err(e)) => Err(anyhow!("display host: {e}")),
+                        Err(e) => Err(e),
+                    }
+                }
+                None => Err(anyhow!("no running display host")),
+            };
+            match attempt {
+                Ok(m) => {
+                    self.refresh_bounds();
+                    Ok(m)
+                }
+                Err(e) if may_replace => {
+                    tracing::info!(
+                        reason = %e,
+                        pw,
+                        ph,
+                        scale,
+                        "replacing the display host for this connection"
+                    );
+                    self.replace_host(pw, ph, scale)
+                }
+                Err(e) => Err(e),
+            }
         }
 
         /// The display's framebuffer size in pixels (2× points in Retina modes).
@@ -331,9 +511,15 @@ mod macos {
         /// always 1:1 points-to-pixels (no HiDPI backing — see the
         /// known-quirks note), so the expected bounds equal the mode size.
         pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
-            self._handle
-                .apply_mode(width, height, 60)
-                .context("re-applying virtual display mode")?;
+            match &self._handle {
+                Backend::InProcess(handle) => handle
+                    .apply_mode(width, height, 60)
+                    .context("re-applying virtual display mode")?,
+                Backend::Host { .. } => {
+                    self.host_mode((width, height, 1), false)
+                        .context("re-applying virtual display mode")?;
+                }
+            }
 
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             loop {

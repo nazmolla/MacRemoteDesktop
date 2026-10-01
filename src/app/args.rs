@@ -925,6 +925,10 @@ pub(super) fn args_from_config(path: &Path) -> Result<Args> {
         // getenv() in stats::default_port(); bridged like the USB/camera knobs
         // above so STATS_PORT can be set from config.env.
         ("STATS_PORT", "MACRDP_STATS_PORT"),
+        // Virtual display in a replaceable helper process, and Retina modes
+        // for high-DPI clients. Read when the display is created / re-moded.
+        ("DISPLAY_HOST", "MACRDP_DISPLAY_HOST"),
+        ("RETINA_VD", "MACRDP_RETINA_VD"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {

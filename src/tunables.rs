@@ -87,10 +87,12 @@ pub const ALL: &[Tunable] = &[
     t("MACRDP_AUTO_RECONNECT", Bool, "1", "main", "Provision the Server Auto-Reconnect Cookie so clients reconnect on their own after a drop."),
     t("MACRDP_NEGOTIATE", Bool, "1", "main", "Log the negotiated session plan (0 skips the negotiator's startup report)."),
     t("MACRDP_RETINA_VD", Bool, "0", "virtual_display", "Try Retina (2x backing) modes on the virtual display for high-DPI clients. Off: always 1x at the client's pixel size, the reliable path (a Retina request that lands on its 1x twin can leave the display stuck)."),
+    t("MACRDP_DISPLAY_HOST", Bool, "0", "virtual_display", "Run the virtual display in a separate macrdpdisplay process, so a display that cannot reach the wanted mode is replaced at the next connection instead of staying stuck. Off: the display lives in the Portico process."),
     // Helper processes and loopback ports.
     t("MACRDP_HUD_HELPER", Path, "bundled macrdphud", "main", "Path of the app-switcher HUD helper."),
     t("MACRDP_HUD_PORT", Int, "40243", "switcher_hud", "Loopback port of the app-switcher HUD helper."),
     t("MACRDP_SHIELD_HELPER", Path, "bundled macrdpshield", "main", "Path of the shield-window helper."),
+    t("MACRDP_DISPLAY_HOST_HELPER", Path, "bundled macrdpdisplay", "virtual_display", "Path of the virtual display host helper (MACRDP_DISPLAY_HOST=1)."),
     t("MACRDP_SHIELD_PORT", Int, "40244", "main", "Loopback port of the shield-window helper (passed to it)."),
     t("MACRDP_SHIELD_KEEP_PHYSICAL_MAIN", Bool, "1", "virtual_display", "Keep the physical panel as main under --shield-primary so the lock screen is visible."),
     t("MACRDP_SCARD_PORT", Int, "40242", "rdpdr::smartcard", "Loopback port of the smart-card bridge."),
