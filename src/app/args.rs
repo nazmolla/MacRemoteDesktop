@@ -973,7 +973,13 @@ pub(super) fn apply_negotiated_defaults(
 ) -> Vec<String> {
     let d = negotiator::session::connect_defaults(host);
     let mut reasons = d.reasons.clone();
-    args.enable_h264 |= d.enable_h264;
+    // MACRDP_H264=0 keeps sessions on legacy bitmaps (field diagnosis: tells a
+    // client's H.264 decode problem apart from everything else).
+    if crate::tunables::var("MACRDP_H264").as_deref() == Ok("0") {
+        reasons.push("video: H.264 off (MACRDP_H264=0) — legacy bitmaps".into());
+    } else {
+        args.enable_h264 |= d.enable_h264;
+    }
     args.adaptive_bitrate |= d.adaptive_bitrate;
     args.enable_udp_multitransport |= d.udp_multitransport;
     let size_pinned = args.width.is_some() || args.height.is_some() || args.hidpi;

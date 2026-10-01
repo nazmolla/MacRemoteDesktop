@@ -98,6 +98,8 @@ pub const ALL: &[Tunable] = &[
     // Video encoding.
     t("MACRDP_H264_FULL_RANGE", Bool, "1", "videotoolbox", "Encode full-range NV12 (0 = let VideoToolbox produce video range)."),
     t("MACRDP_H264_LENGTH_PREFIXED", Bool, "0", "h264", "Emit length-prefixed (AVCC) NAL units instead of Annex-B, for ironrdp-decoder interop."),
+    t("MACRDP_H264", Bool, "1", "args", "Negotiate H.264 over EGFX. 0 keeps every session on legacy bitmaps (diagnosis)."),
+    t("MACRDP_AVC_REGIONS", Bool, "0", "h264", "Send each H.264 frame with its changed regions instead of one full-surface region. Off until verified on Windows clients."),
     t("MACRDP_LOSSLESS_REFINE", Bool, "0", "h264", "Re-send regions that stop changing losslessly (ClearCodec over EGFX). Off until verified on Windows clients."),
     t("MACRDP_AVC444", Bool, "0", "h264", "Offer AVC444 to clients that support it. Off: AVC420 only (AVC444 output is corrupt on real decoders until fixed)."),
     t("MACRDP_ADAPTIVE_FLOOR_FPS", Int, "10", "h264", "Adaptive controller: lowest frame rate it throttles to."),
@@ -111,7 +113,7 @@ pub const ALL: &[Tunable] = &[
     t("MACRDP_UDP_ADAPTIVE_DECREASE", Float, "0.7", "h264", "Adaptive controller: multiplicative decrease on congestion."),
     t("MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE", Int, "2", "h264", "Adaptive controller: UDP retransmits per interval tolerated before backing off."),
     // Blank-presentation recovery (mstsc reconnect blank; docs/known-quirks.md).
-    t("MACRDP_BLANK_RECOVERY", Bool, "1", "h264", "Detect a client that decodes but never presents, and recover it."),
+    t("MACRDP_BLANK_RECOVERY", Bool, "0", "h264", "Detect a client that decodes but never presents, and recover it (reactivate, then drop). Opt-in: its signal misfires on some presenting clients."),
     t("MACRDP_BLANK_RECOVERY_REACTIVATE", Bool, "1", "h264", "Recover with a bare deactivation-reactivation first (0 = drop the connection)."),
     t("MACRDP_BLANK_RECOVERY_MIN_QOE", Int, "24", "h264", "All-zero QoE reports needed before recovering."),
     t("MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS", Int, "3", "h264", "Consecutive nonzero render reports that count as presenting."),
