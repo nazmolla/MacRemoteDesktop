@@ -96,6 +96,7 @@ pub const ALL: &[Tunable] = &[
     t("MACRDP_SCARD_PORT", Int, "40242", "rdpdr::smartcard", "Loopback port of the smart-card bridge."),
     t("MACRDP_STATS_PORT", Int, "40245", "stats", "Loopback port of the read-only stats endpoint."),
     // Video encoding.
+    t("MACRDP_GPU_CONVERT", Bool, "1", "videotoolbox", "Convert captured frames to YUV on the GPU (same maths as the CPU path); 0 converts on the CPU."),
     t("MACRDP_H264_FULL_RANGE", Bool, "1", "videotoolbox", "Encode full-range NV12 (0 = let VideoToolbox produce video range)."),
     t("MACRDP_H264_LENGTH_PREFIXED", Bool, "0", "h264", "Emit length-prefixed (AVCC) NAL units instead of Annex-B, for ironrdp-decoder interop."),
     t("MACRDP_H264", Bool, "1", "args", "Negotiate H.264 over EGFX. 0 keeps every session on legacy bitmaps (diagnosis)."),

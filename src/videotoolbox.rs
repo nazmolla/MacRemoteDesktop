@@ -1135,22 +1135,41 @@ mod ffi {
         } else {
             K_CV_PIXEL_FORMAT_TYPE_32_BGRA
         };
+        // BGRA frames are converted on the GPU when it is available
+        // (src/gpu_convert): the buffer is then IOSurface-backed and Metal-writable.
+        let gpu_attrs = match source {
+            Source::Bgra { .. } if full_range => crate::gpu_convert::nv12_attributes(),
+            _ => None,
+        };
         let mut pbuf: CVPixelBufferRef = ptr::null();
-        // SAFETY: null allocator and attributes ask CoreVideo for a default buffer of the given
-        // size and format; `pbuf` is a valid out-pointer.
+        // SAFETY: null allocator asks CoreVideo for a default allocation; the attributes are null
+        // or a live CFDictionary from gpu_convert; `pbuf` is a valid out-pointer.
         let status = unsafe {
             CVPixelBufferCreate(
                 ptr::null(),
                 width.into(),
                 height.into(),
                 pixel_format,
-                ptr::null(),
+                gpu_attrs.map_or(ptr::null(), |a| a.cast()),
                 &mut pbuf,
             )
         };
         if status != 0 || pbuf.is_null() {
             bail!("CVPixelBufferCreate failed: {status}");
         }
+        let gpu_done = match source {
+            // SAFETY: `pbuf` was just created at `width × height` with the GPU attributes.
+            Source::Bgra { bgra, stride } if gpu_attrs.is_some() => unsafe {
+                crate::gpu_convert::bgra_to_nv12(
+                    bgra,
+                    stride,
+                    width.into(),
+                    height.into(),
+                    pbuf.cast(),
+                )
+            },
+            _ => false,
+        };
 
         // Pixel buffer ownership: VTCompressionSessionEncodeFrame
         // retains the CVPixelBuffer for the duration of the encode, so
@@ -1179,6 +1198,7 @@ mod ffi {
                 // generation failed, or odd dimensions). Both produce full-range
                 // BT.709 NV12, so the fallback is transparent.
                 match source {
+                    Source::Bgra { .. } if gpu_done => {}
                     Source::Bgra { bgra, stride } => {
                         if bgra_to_nv12_full_range_vimage(
                             bgra,
@@ -1418,6 +1438,53 @@ mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GPU conversion (src/gpu_convert) must produce exactly the CPU's bytes,
+    /// so moving it to the GPU cannot change colour.
+    #[test]
+    #[ignore = "needs a Metal GPU; run: cargo test gpu_conversion_matches_cpu -- --ignored"]
+    fn gpu_conversion_matches_cpu() {
+        use super::ffi::bgra_to_nv12_full_range;
+        let (w, h) = (322usize, 186usize);
+        let mut seed = 0x1234_5678_u32;
+        let mut noise = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        };
+        let mut bgra = vec![0u8; w * h * 4];
+        for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+            let (x, y) = (i % w, i / w);
+            let v = match y * 3 / h {
+                0 => [noise(), noise(), noise(), 255],
+                1 => [
+                    (x * 255 / w) as u8,
+                    (y * 255 / h) as u8,
+                    ((x + y) % 256) as u8,
+                    255,
+                ],
+                _ => [
+                    [255, 0, 0, 255],
+                    [0, 255, 0, 255],
+                    [0, 0, 255, 255],
+                    [255, 255, 255, 255],
+                ][x % 4],
+            };
+            px.copy_from_slice(&v);
+        }
+        let (gy, gc) =
+            crate::gpu_convert::selftest(&bgra, w as u32, h as u32).expect("GPU path ran");
+        let (mut cy, mut cc) = (vec![0u8; w * h], vec![0u8; w * h / 2]);
+        bgra_to_nv12_full_range(&bgra, w * 4, w, h, &mut cy, w, &mut cc, w);
+        let dy = gy.iter().zip(&cy).filter(|(a, b)| a != b).count();
+        let dc = gc.iter().zip(&cc).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            (dy, dc),
+            (0, 0),
+            "bytes differing from the CPU conversion (Y, CbCr)"
+        );
+    }
 
     /// Round-trip sanity test. Creates a session, encodes a single
     /// solid-color BGRA frame, drains the channel, and asserts that

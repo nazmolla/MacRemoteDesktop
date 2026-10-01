@@ -23,6 +23,15 @@ fn main() {
         .flag("-fobjc-arc")
         .compile("macrdp_usb_spike");
     println!("cargo:rustc-link-lib=framework=IOUSBHost");
+
+    // GPU BGRA -> NV12 conversion for the H.264 encoder (src/gpu_convert).
+    println!("cargo:rerun-if-changed=src/gpu_convert/gpu_convert.m");
+    cc::Build::new()
+        .file("src/gpu_convert/gpu_convert.m")
+        .flag("-fobjc-arc")
+        .compile("portico_gpu_convert");
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=CoreVideo");
     println!("cargo:rustc-link-lib=framework=Foundation");
 
     // /usr/lib/swift holds most of Swift's stdlib on modern macOS — cheap to
