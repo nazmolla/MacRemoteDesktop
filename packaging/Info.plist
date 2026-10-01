@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  macrdp.app Info.plist (template).
+  App Info.plist (template). __PRODUCT__ / __PRODUCT_ID__ are the product name
+  and lower-case id (see src/brand.rs); make-app.sh substitutes them.
 
   __VERSION__ is substituted by make-app.sh from Cargo.toml.
 
@@ -21,13 +22,13 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>macrdp</string>
+    <string>__PRODUCT__</string>
     <key>CFBundleDisplayName</key>
-    <string>macrdp</string>
+    <string>__PRODUCT__</string>
     <key>CFBundleIdentifier</key>
     <string>__BUNDLE_ID__</string>
     <key>CFBundleExecutable</key>
-    <string>macrdp</string>
+    <string>__PRODUCT_ID__</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>
@@ -39,8 +40,8 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>macrdp uses AppleScript to forward macOS hotkeys (Spotlight, clipboard paste) on behalf of connected RDP clients.</string>
+    <string>__PRODUCT__ uses AppleScript to forward macOS hotkeys (Spotlight, clipboard paste) on behalf of connected RDP clients.</string>
     <key>NSHumanReadableCopyright</key>
-    <string>macrdp — native RDP server for macOS.</string>
+    <string>__PRODUCT__ — native RDP server for macOS.</string>
 </dict>
 </plist>

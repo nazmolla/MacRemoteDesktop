@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build macrdp.app — a stably-signed bundle with the binary as a co-signed
+# Build the app bundle ($PRODUCT.app, default Portico.app) — a stably-signed bundle with the binary as a co-signed
 # helper at a fixed path, so the Screen Recording / Accessibility TCC grants
 # survive rebuilds. Designed for personal use, but the bundle layout is also
 # the foundation a future menu-bar GUI controller would spawn.
@@ -33,33 +33,37 @@ fi
 # Bundle-ID prefix (reverse-DNS of the publishing entity). MUST match what
 # install-launchagent.sh and gui/make-tray-app.sh use, or the controller will
 # target the wrong LaunchAgent label.
-BUNDLE_PREFIX="${BUNDLE_PREFIX:-com.clintcan}"
-BUNDLE_ID="$BUNDLE_PREFIX.macrdp"
+# Product name and lower-case id; keep in step with src/brand.rs.
+PRODUCT="${PRODUCT:-Portico}"
+PRODUCT_ID="${PRODUCT_ID:-portico}"
+BUNDLE_PREFIX="${BUNDLE_PREFIX:-ca.nazmi}"
+BUNDLE_ID="$BUNDLE_PREFIX.$PRODUCT_ID"
 
 VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
 [ -n "$VERSION" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
 
-echo "==> macrdp.app v$VERSION  (id: $BUNDLE_ID, identity: $IDENTITY, install: $APP_DIR)"
+echo "==> $PRODUCT.app v$VERSION  (id: $BUNDLE_ID, identity: $IDENTITY, install: $APP_DIR)"
 
 # 1. Build the release binary (native target).
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     echo "==> cargo build --release"
     ( cd "$REPO_ROOT" && cargo build --release )
 fi
-BIN="$REPO_ROOT/target/release/macrdp"
+BIN="$REPO_ROOT/target/release/$PRODUCT_ID"
 [ -x "$BIN" ] || { echo "missing release binary at $BIN (unset SKIP_BUILD?)" >&2; exit 1; }
 
 # 2. Assemble the bundle in a staging dir under target/ (already gitignored;
 #    dist/ holds the tracked install scripts, not build output).
-STAGE="$REPO_ROOT/target/macrdp.app"
+STAGE="$REPO_ROOT/target/$PRODUCT.app"
 echo "==> staging bundle at $STAGE"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 
 sed -e "s/__VERSION__/$VERSION/g" -e "s#__BUNDLE_ID__#$BUNDLE_ID#g" \
+    -e "s/__PRODUCT_ID__/$PRODUCT_ID/g" -e "s/__PRODUCT__/$PRODUCT/g" \
     "$PKG_DIR/Info.plist" > "$STAGE/Contents/Info.plist"
-cp "$BIN" "$STAGE/Contents/MacOS/macrdp"
-chmod +x "$STAGE/Contents/MacOS/macrdp"
+cp "$BIN" "$STAGE/Contents/MacOS/$PRODUCT_ID"
+chmod +x "$STAGE/Contents/MacOS/$PRODUCT_ID"
 # No wrapper script: the LaunchAgent runs this signed binary directly with
 # `--config` (the binary reads config.env itself). That gives macOS Background
 # Task Management a stable Developer-ID identity to approve once, instead of an
@@ -68,10 +72,14 @@ chmod +x "$STAGE/Contents/MacOS/macrdp"
 # 2b. App icon (optional): drop packaging/macrdp.png or packaging/icon.png
 #     (square, ideally 1024×1024) to brand the bundle. Done before signing so
 #     the icon + Info.plist key are sealed.
+#     A prebuilt packaging/AppIcon.icns (branding/make-icon.swift) wins.
 ICON_SRC=""
-for c in "$PKG_DIR/macrdp.png" "$PKG_DIR/icon.png"; do [ -f "$c" ] && { ICON_SRC="$c"; break; }; done
+for c in "$PKG_DIR/AppIcon.icns" "$PKG_DIR/macrdp.png" "$PKG_DIR/icon.png"; do [ -f "$c" ] && { ICON_SRC="$c"; break; }; done
 if [ -n "$ICON_SRC" ]; then
-    "$PKG_DIR/make-icns.sh" "$ICON_SRC" "$STAGE/Contents/Resources/AppIcon.icns"
+    case "$ICON_SRC" in
+        *.icns) cp "$ICON_SRC" "$STAGE/Contents/Resources/AppIcon.icns" ;;
+        *) "$PKG_DIR/make-icns.sh" "$ICON_SRC" "$STAGE/Contents/Resources/AppIcon.icns" ;;
+    esac
     /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string AppIcon' "$STAGE/Contents/Info.plist" \
         2>/dev/null || /usr/libexec/PlistBuddy -c 'Set :CFBundleIconFile AppIcon' "$STAGE/Contents/Info.plist"
     echo "==> app icon: $(basename "$ICON_SRC")"
@@ -182,7 +190,7 @@ echo "==> codesign (hardened runtime, ts: $TS${ENT_ARG:+, entitlements})"
 # Entitlements go on the main executable (which actually runs) and the bundle.
 # The other signed items (IFD dylib/bundle, macrdphud, macrdpshield) deliberately
 # get NO entitlements — only macrdp needs the USB host-controller capability.
-codesign --force --options runtime $TS $ENT_ARG -s "$IDENTITY" "$STAGE/Contents/MacOS/macrdp"
+codesign --force --options runtime $TS $ENT_ARG -s "$IDENTITY" "$STAGE/Contents/MacOS/$PRODUCT_ID"
 codesign --force --options runtime $TS $ENT_ARG -s "$IDENTITY" "$STAGE"
 codesign --verify --deep --strict "$STAGE"
 
@@ -194,23 +202,23 @@ if [ "${NOTARIZE:-0}" = "1" ]; then
 fi
 
 # 4. Install to the stable path. cp -R preserves the signature.
-echo "==> installing to $APP_DIR/macrdp.app"
+echo "==> installing to $APP_DIR/$PRODUCT.app"
 if ! mkdir -p "$APP_DIR" 2>/dev/null || [ ! -w "$APP_DIR" ]; then
     echo "    $APP_DIR is not writable — re-run with sudo, or set APP_DIR=\$HOME/Applications" >&2
     exit 1
 fi
-rm -rf "$APP_DIR/macrdp.app"
-cp -R "$STAGE" "$APP_DIR/macrdp.app"
-codesign --verify --strict "$APP_DIR/macrdp.app"
+rm -rf "$APP_DIR/$PRODUCT.app"
+cp -R "$STAGE" "$APP_DIR/$PRODUCT.app"
+codesign --verify --strict "$APP_DIR/$PRODUCT.app"
 
 echo
-echo "Done. Installed: $APP_DIR/macrdp.app"
-codesign -dv "$APP_DIR/macrdp.app" 2>&1 | sed 's/^/    /'
+echo "Done. Installed: $APP_DIR/$PRODUCT.app"
+codesign -dv "$APP_DIR/$PRODUCT.app" 2>&1 | sed 's/^/    /'
 echo
 echo "Next:"
 echo "  1. Store the password once:"
-echo "       security add-generic-password -s macrdp -a \"\$(id -un)\" -w 'YOUR_PASSWORD'"
+echo "       security add-generic-password -s $PRODUCT_ID -a \"\$(id -un)\" -w 'YOUR_PASSWORD'"
 echo "  2. Install + load the LaunchAgent:"
 echo "       APP_DIR=\"$APP_DIR\" packaging/install-launchagent.sh"
-echo "  3. Grant Screen Recording + Accessibility to macrdp.app when prompted"
+echo "  3. Grant Screen Recording + Accessibility to $PRODUCT.app when prompted"
 echo "     (System Settings -> Privacy & Security)."

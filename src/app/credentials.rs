@@ -4,27 +4,29 @@
 
 use super::*;
 
-/// Shell out to `security find-generic-password -s macrdp -a <user> -w`,
-/// which prints the password on stdout. The Keychain entry has to be
-/// created out-of-band; this never prompts the user interactively. The tool
-/// is named by absolute path so a `security` earlier on `PATH` cannot stand in
-/// for it (and the Keychain ACL is tied to `/usr/bin/security` anyway, see
-/// docs/macos-gotchas.md).
+/// Shell out to `security find-generic-password -s portico -a <user> -w`,
+/// which prints the password on stdout. Falls back to the upstream service
+/// name `macrdp`, so an entry stored before the rename keeps working. The
+/// Keychain entry has to be created out-of-band; this never prompts the user
+/// interactively. The tool is named by absolute path so a `security` earlier
+/// on `PATH` cannot stand in for it (and the Keychain ACL is tied to
+/// `/usr/bin/security` anyway, see docs/macos-gotchas.md).
 pub(super) fn read_password_from_keychain(username: &str) -> Result<Zeroizing<String>> {
-    let out = std::process::Command::new("/usr/bin/security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "macrdp",
-            "-a",
-            username,
-            "-w",
-        ])
-        .output()
-        .context("invoke security(1)")?;
+    const LEGACY_SERVICE: &str = "macrdp";
+    let lookup = |service: &str| {
+        std::process::Command::new("/usr/bin/security")
+            .args(["find-generic-password", "-s", service, "-a", username, "-w"])
+            .output()
+            .context("invoke security(1)")
+    };
+    let mut out = lookup(crate::brand::ID)?;
+    if !out.status.success() {
+        out = lookup(LEGACY_SERVICE)?;
+    }
     if !out.status.success() {
         return Err(anyhow!(
-            "keychain entry not found (run: security add-generic-password -s macrdp -a {username} -w)"
+            "keychain entry not found (run: security add-generic-password -s {} -a {username} -w)",
+            crate::brand::ID
         ));
     }
     // Wrap as soon as we touch the bytes so the underlying allocation is

@@ -168,7 +168,7 @@ mod macos {
         /// resolved on this macOS version. Caller should treat that as
         /// "this feature isn't usable here," not a fatal bug.
         pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
-            let handle = private_api::create(width, height, refresh_hz, "macrdp")
+            let handle = private_api::create(width, height, refresh_hz, crate::brand::NAME)
                 .context("creating virtual display")?;
 
             // CGDisplayBounds gives both the origin (in global point space)
@@ -1851,7 +1851,7 @@ mod stub {
 /// ```text
 /// for t in display_colorspace_is_srgb one_x_plan_is_one_to_one retina_plan_gets_2x_backing \
 ///          select_mode_verifies_and_falls_back resizes_keep_working_after_a_fallback; do
-///   cargo test --bin macrdp virtual_display::planned_tests::$t -- --ignored --exact; sleep 3
+///   cargo test --bin portico virtual_display::planned_tests::$t -- --ignored --exact; sleep 3
 /// done
 /// ```
 #[cfg(all(test, target_os = "macos"))]

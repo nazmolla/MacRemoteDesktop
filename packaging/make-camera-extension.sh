@@ -21,14 +21,14 @@
 #   CAMERA_PROVISION_PROFILE   .provisionprofile for the extension App ID
 #                       (com.clintcan.macrdp.camera) with the App Group. Embedded
 #                       into the bundle. Required for a Developer-ID activatable build.
-#   BUNDLE_PREFIX       reverse-DNS prefix (default com.clintcan).
+#   BUNDLE_PREFIX       reverse-DNS prefix (default ca.nazmi).
 #   OUT_DIR             where to stage the bundle (default target/).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG_DIR="$REPO_ROOT/packaging"
 GUI_DIR="$REPO_ROOT/gui"
-BUNDLE_PREFIX="${BUNDLE_PREFIX:-com.clintcan}"
+BUNDLE_PREFIX="${BUNDLE_PREFIX:-ca.nazmi}"
 # The extension bundle id MUST be a child of the container (controller) app id —
 # macOS enforces that an embedded system extension's id is prefixed by the host
 # app's id, or activation fails validation.

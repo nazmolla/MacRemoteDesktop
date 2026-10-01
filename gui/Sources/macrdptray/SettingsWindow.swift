@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-// The tabbed Settings window opened by "Show macrdp…". A SwiftUI TabView hosted
+// The tabbed Settings window opened by "Show Portico…". A SwiftUI TabView hosted
 // in a plain NSWindow (the status-bar item stays AppKit). While the window is
 // open the app switches to a .regular activation policy so it behaves like a
 // real app (Dock icon + reliable focus + a working Edit menu for the text
@@ -18,7 +18,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             contentRect: NSRect(x: 0, y: 0, width: 600, height: 580),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false)
-        window.title = "macrdp Settings"
+        window.title = "Portico Settings"
         window.contentViewController = NSHostingController(rootView: SettingsView(model: model))
         window.isReleasedWhenClosed = false
         window.center()
@@ -82,11 +82,11 @@ extension AppController {
         let appItem = NSMenuItem()
         main.addItem(appItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About macrdp", action: #selector(showAbout), keyEquivalent: "")
+        appMenu.addItem(withTitle: "About Portico", action: #selector(showAbout), keyEquivalent: "")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Hide macrdp", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Hide Portico", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Quit macrdp Controller", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Quit Portico Controller", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 
         let editItem = NSMenuItem()
@@ -243,7 +243,7 @@ private struct ConnectionTab: View {
                         if on {
                             let a = NSAlert()
                             a.messageText = "Allow connections from the network?"
-                            a.informativeText = "macrdp will listen on all interfaces (0.0.0.0), so other "
+                            a.informativeText = "Portico will listen on all interfaces (0.0.0.0), so other "
                                 + "devices on your network can connect. Access still requires TLS and your "
                                 + "macOS account password — enable only on a network you trust."
                             a.addButton(withTitle: "Allow")
@@ -515,7 +515,7 @@ private struct PermissionsTab: View {
 
     var body: some View {
         Form {
-            Text("macrdp needs these grants (owned by the server binary, not this controller). "
+            Text("Portico needs these grants (owned by the server binary, not this controller). "
                 + "Status is read from the server log.")
                 .font(.caption).foregroundColor(.secondary)
             Section("Screen Recording") {
@@ -757,7 +757,7 @@ extension AppController {
             + "displays, and drive / smart-card / camera / USB redirection.\n\n"
             + statusLine
         let opts: [NSApplication.AboutPanelOptionKey: Any] = [
-            .applicationName: "macrdp",
+            .applicationName: "Portico",
             .applicationVersion: version,
             .credits: NSAttributedString(
                 string: body,

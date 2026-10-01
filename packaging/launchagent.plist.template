@@ -1,19 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaunchAgent template. __LABEL__, __APP_DIR__ and __HOME__ are substituted by
+  LaunchAgent template. __LABEL__, __APP_DIR__, __HOME__, __PRODUCT__ and
+  __PRODUCT_ID__ are substituted by
   install-launchagent.sh and the result is written to
-  ~/Library/LaunchAgents/<label>.plist (label = $BUNDLE_PREFIX.macrdp).
+  ~/Library/LaunchAgents/<label>.plist (label = $BUNDLE_PREFIX.<product id>).
 
-  This launches the SIGNED macrdp binary directly with `--config`, so macOS
+  This launches the SIGNED server binary directly with `--config`, so macOS
   Background Task Management identifies the agent by its stable Developer-ID
   identity (approve once, survives rebuilds) rather than re-flagging an unsigned
   wrapper script on every update. The binary reads config.env itself. Keeps the
-  job alive. The binary owns ~/Library/Logs/macrdp.log itself now (a self-rotating,
+  job alive. The binary owns ~/Library/Logs/<product id>.log itself now (a self-rotating,
   size-bounded file — see src/logging.rs), so there is NO StandardOutPath redirect:
   having launchd ALSO write that path would corrupt the file and strand launchd on a
   rotated-away inode. StandardErrorPath still captures panics + pre-logging stderr in
-  a small separate macrdp.err.log.
+  a small separate <product id>.err.log.
 -->
 <plist version="1.0">
 <dict>
@@ -22,9 +23,9 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__APP_DIR__/macrdp.app/Contents/MacOS/macrdp</string>
+        <string>__APP_DIR__/__PRODUCT__.app/Contents/MacOS/__PRODUCT_ID__</string>
         <string>--config</string>
-        <string>__HOME__/Library/Application Support/macrdp/config.env</string>
+        <string>__HOME__/Library/Application Support/__PRODUCT__/config.env</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -38,7 +39,7 @@
     <!-- No StandardOutPath: the binary writes (and rotates) macrdp.log itself.
          StandardErrorPath keeps panics + pre-logging-init stderr in a small file. -->
     <key>StandardErrorPath</key>
-    <string>__HOME__/Library/Logs/macrdp.err.log</string>
+    <string>__HOME__/Library/Logs/__PRODUCT_ID__.err.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
