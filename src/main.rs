@@ -38,6 +38,8 @@ mod file_promise_lazy;
 #[cfg(test)]
 mod garbage_input_test;
 #[cfg(target_os = "macos")]
+mod gpu_convert;
+#[cfg(target_os = "macos")]
 mod h264;
 mod health;
 mod input;

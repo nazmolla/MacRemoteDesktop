@@ -870,7 +870,7 @@ impl Gfx {
         reason = "whole-frame entry point; capture currently calls submit_bgra_regions"
     )]
     pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
-        self.submit_bgra_regions(bgra, stride, request_keyframe, FrameRegions::Full)
+        self.submit_bgra_regions(bgra, stride, request_keyframe, FrameRegions::Full, None)
     }
 
     /// [`Self::submit_bgra`] with the surface regions this frame updates.
@@ -880,6 +880,9 @@ impl Gfx {
         stride: usize,
         request_keyframe: bool,
         regions: FrameRegions,
+        // The capture CVPixelBuffer `bgra` was read from, if any: lets the GPU
+        // convert it without a copy (see src/gpu_convert).
+        surface: Option<*const std::ffi::c_void>,
     ) -> Result<bool> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_encoder_locked)
@@ -1324,7 +1327,7 @@ impl Gfx {
                     encoder.encode_yuv420(my, mu, mv, force_keyframe)?;
                     aux.encode_yuv420(ay, au, av, force_keyframe)?;
                 }
-                _ => encoder.encode_bgra(bgra, stride, force_keyframe)?,
+                _ => encoder.encode_bgra_from(bgra, stride, force_keyframe, surface)?,
             }
             let debt = ctx.region_debt.take();
             let resolved = if force_keyframe { None } else { debt };
@@ -1901,9 +1904,9 @@ impl Gfx {
     /// under `ctx`, which is released before `server_handle` is taken.
     /// `piggyback` calls (after a submit) are rate-limited to one per 100 ms.
     pub(crate) fn refine_tick(&self, bgra: &[u8], stride: usize, piggyback: bool) -> Result<()> {
-        // Opt-in until verified on Windows clients: with it on, mstsc's blank
-        // detector misfired and clients ran short of memory (2026-10-01).
-        if !crate::tunables::truthy("MACRDP_LOSSLESS_REFINE") {
+        // Verified on Windows 11 / RDM (2026-10-01); ClearCodec is a few percent
+        // of the process's CPU. MACRDP_LOSSLESS_REFINE=0 turns it off.
+        if crate::tunables::var("MACRDP_LOSSLESS_REFINE").as_deref() == Ok("0") {
             return Ok(());
         }
         let now = Instant::now();
@@ -2234,10 +2237,10 @@ impl Gfx {
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
-            // Per-region updates are opt-in: with them on, Windows clients' Desktop
-            // Window Manager memory climbed until the client crashed (2026-10-01).
-            // Off, every frame carries one full-surface region, as upstream did.
-            let per_region = crate::tunables::truthy("MACRDP_AVC_REGIONS");
+            // Per-region updates (less bandwidth). Verified on Windows 11 / RDM
+            // once the SPS and ack-pacing bugs were fixed (2026-10-01).
+            // MACRDP_AVC_REGIONS=0 sends one full-surface region, as upstream did.
+            let per_region = crate::tunables::var("MACRDP_AVC_REGIONS").as_deref() != Ok("0");
             for ((f, rects), aux_frame) in frames.iter().zip(frame_regions.iter()).zip(aux) {
                 // A keyframe always repaints the whole surface.
                 let regions = if f.is_keyframe || !per_region {

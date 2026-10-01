@@ -162,7 +162,20 @@ impl Encoder {
     /// Returns immediately; encoded output arrives asynchronously via
     /// `drain()`. VT calls our output callback on its own thread, so
     /// the channel decouples producer and consumer cleanly.
+    #[cfg_attr(not(test), allow(dead_code, reason = "tests and the colour harness"))]
     pub fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<()> {
+        self.encode_bgra_from(bgra, stride, force_keyframe, None)
+    }
+
+    /// [`Self::encode_bgra`], with the capture CVPixelBuffer the bytes came from,
+    /// so the GPU can convert it without copying (`None` = use the bytes).
+    pub fn encode_bgra_from(
+        &mut self,
+        bgra: &[u8],
+        stride: usize,
+        force_keyframe: bool,
+        surface: Option<*const std::ffi::c_void>,
+    ) -> Result<()> {
         // Odd source height: the session is one row taller (see `new`) than
         // the caller's buffer, so replicate its last row into a reused buffer.
         let src_rows = bgra.len().checked_div(stride).unwrap_or(0);
@@ -191,7 +204,12 @@ impl Encoder {
         self.next_pts = self.next_pts.wrapping_add(1);
         let r = ffi::encode_frame(
             &self.inner,
-            ffi::Source::Bgra { bgra, stride },
+            ffi::Source::Bgra {
+                bgra,
+                stride,
+                // The padded copy no longer matches the capture buffer.
+                surface: if padded.is_some() { None } else { surface },
+            },
             self.width,
             self.height,
             pts,
@@ -1105,7 +1123,13 @@ mod ffi {
     /// Pixels for one encoded frame.
     pub(super) enum Source<'a> {
         /// Packed BGRA, `stride` bytes per row.
-        Bgra { bgra: &'a [u8], stride: usize },
+        /// `surface` is the capture CVPixelBuffer the bytes came from, when known:
+        /// the GPU then converts it in place instead of copying the bytes.
+        Bgra {
+            bgra: &'a [u8],
+            stride: usize,
+            surface: Option<*const std::ffi::c_void>,
+        },
         /// Full-range I420 planes, tightly packed (`width`, `width/2` bytes per row).
         Yuv420 {
             y: &'a [u8],
@@ -1135,22 +1159,62 @@ mod ffi {
         } else {
             K_CV_PIXEL_FORMAT_TYPE_32_BGRA
         };
-        let mut pbuf: CVPixelBufferRef = ptr::null();
-        // SAFETY: null allocator and attributes ask CoreVideo for a default buffer of the given
-        // size and format; `pbuf` is a valid out-pointer.
-        let status = unsafe {
-            CVPixelBufferCreate(
-                ptr::null(),
-                width.into(),
-                height.into(),
-                pixel_format,
-                ptr::null(),
-                &mut pbuf,
-            )
+        // BGRA frames are converted on the GPU when it is available
+        // (src/gpu_convert): the buffer is then IOSurface-backed and Metal-writable.
+        // BGRA frames are converted on the GPU when it is available
+        // (src/gpu_convert), into a pooled IOSurface-backed buffer; the capture
+        // buffer itself is read in place when the caller passed it.
+        let gpu_buf = match source {
+            Source::Bgra { .. } if full_range => {
+                crate::gpu_convert::create_nv12(width.into(), height.into())
+            }
+            _ => None,
         };
-        if status != 0 || pbuf.is_null() {
-            bail!("CVPixelBufferCreate failed: {status}");
+        let mut pbuf: CVPixelBufferRef = ptr::null();
+        if let Some(pb) = gpu_buf {
+            pbuf = pb;
+        } else {
+            // SAFETY: null allocator and attributes ask CoreVideo for a default buffer of the
+            // given size and format; `pbuf` is a valid out-pointer.
+            let status = unsafe {
+                CVPixelBufferCreate(
+                    ptr::null(),
+                    width.into(),
+                    height.into(),
+                    pixel_format,
+                    ptr::null(),
+                    &mut pbuf,
+                )
+            };
+            if status != 0 || pbuf.is_null() {
+                bail!("CVPixelBufferCreate failed: {status}");
+            }
         }
+        let gpu_done = match source {
+            Source::Bgra {
+                bgra,
+                stride,
+                surface,
+            } if gpu_buf.is_some() => {
+                // SAFETY: `pbuf` is a pooled `width × height` GPU buffer; `surface`, when present,
+                // is the caller's capture buffer, alive for this call.
+                let in_place = surface.is_some_and(|src| unsafe {
+                    crate::gpu_convert::convert_surface(src, pbuf.cast())
+                });
+                // SAFETY: as above; `bgra` is the caller's slice for this frame.
+                in_place
+                    || unsafe {
+                        crate::gpu_convert::bgra_to_nv12(
+                            bgra,
+                            stride,
+                            width.into(),
+                            height.into(),
+                            pbuf.cast(),
+                        )
+                    }
+            }
+            _ => false,
+        };
 
         // Pixel buffer ownership: VTCompressionSessionEncodeFrame
         // retains the CVPixelBuffer for the duration of the encode, so
@@ -1179,7 +1243,8 @@ mod ffi {
                 // generation failed, or odd dimensions). Both produce full-range
                 // BT.709 NV12, so the fallback is transparent.
                 match source {
-                    Source::Bgra { bgra, stride } => {
+                    Source::Bgra { .. } if gpu_done => {}
+                    Source::Bgra { bgra, stride, .. } => {
                         if bgra_to_nv12_full_range_vimage(
                             bgra,
                             stride,
@@ -1221,7 +1286,7 @@ mod ffi {
                         }
                     }
                 }
-            } else if let Source::Bgra { bgra, stride } = source {
+            } else if let Source::Bgra { bgra, stride, .. } = source {
                 let dst = CVPixelBufferGetBaseAddress(pbuf) as *mut u8;
                 let dst_stride = CVPixelBufferGetBytesPerRow(pbuf);
                 let row_bytes = usize::from(width) * 4;
@@ -1418,6 +1483,66 @@ mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GPU conversion (src/gpu_convert) must produce exactly the CPU's bytes,
+    /// so moving it to the GPU cannot change colour.
+    #[test]
+    #[ignore = "needs a Metal GPU; run: cargo test gpu_conversion_matches_cpu -- --ignored"]
+    fn gpu_conversion_matches_cpu() {
+        use super::ffi::bgra_to_nv12_full_range;
+        let (w, h) = (322usize, 186usize);
+        let mut seed = 0x1234_5678_u32;
+        let mut noise = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        };
+        let mut bgra = vec![0u8; w * h * 4];
+        for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+            let (x, y) = (i % w, i / w);
+            let v = match y * 3 / h {
+                0 => [noise(), noise(), noise(), 255],
+                1 => [
+                    (x * 255 / w) as u8,
+                    (y * 255 / h) as u8,
+                    ((x + y) % 256) as u8,
+                    255,
+                ],
+                _ => [
+                    [255, 0, 0, 255],
+                    [0, 255, 0, 255],
+                    [0, 0, 255, 255],
+                    [255, 255, 255, 255],
+                ][x % 4],
+            };
+            px.copy_from_slice(&v);
+        }
+        let (mut cy, mut cc) = (vec![0u8; w * h], vec![0u8; w * h / 2]);
+        bgra_to_nv12_full_range(&bgra, w * 4, w, h, &mut cy, w, &mut cc, w);
+        let paths = [
+            (
+                "copy",
+                crate::gpu_convert::selftest(&bgra, w as u32, h as u32),
+            ),
+            (
+                "zero-copy",
+                crate::gpu_convert::selftest_surface(&bgra, w as u32, h as u32),
+            ),
+        ];
+        let mut diffs = Vec::new();
+        for (path, out) in paths {
+            let (gy, gc) = out.unwrap_or_else(|| panic!("GPU {path} path did not run"));
+            let dy = gy.iter().zip(&cy).filter(|(a, b)| a != b).count();
+            let dc = gc.iter().zip(&cc).filter(|(a, b)| a != b).count();
+            diffs.push((path, dy, dc));
+        }
+        assert_eq!(
+            diffs,
+            [("copy", 0, 0), ("zero-copy", 0, 0)],
+            "bytes differing from the CPU conversion (path, Y, CbCr)"
+        );
+    }
 
     /// Round-trip sanity test. Creates a session, encodes a single
     /// solid-color BGRA frame, drains the channel, and asserts that
