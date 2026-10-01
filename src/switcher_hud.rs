@@ -19,7 +19,6 @@
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -45,11 +44,13 @@ static SENDER: OnceLock<SyncSender<HudMsg>> = OnceLock::new();
 /// The `CGDirectDisplayID` macrdp is capturing — the helper centers the panel on
 /// it. Set once from `main` (the virtual display's id, or the main display's id on
 /// the mirror-primary path). 0 = let the helper fall back to the main screen.
-static DISPLAY_ID: AtomicU32 = AtomicU32::new(0);
+static DISPLAY_ID: std::sync::OnceLock<crate::virtual_display::DisplayIdCell> =
+    std::sync::OnceLock::new();
 
-/// Set the captured display id the HUD should center on. Called from `main`.
-pub fn set_display_id(id: u32) {
-    DISPLAY_ID.store(id, Ordering::Relaxed);
+/// Set the captured display the HUD should center on. Called once from `main`;
+/// the cell is read at each show, so a replaced virtual display is followed.
+pub fn set_display_id(id: crate::virtual_display::DisplayIdCell) {
+    let _ = DISPLAY_ID.set(id);
 }
 
 fn port() -> u16 {
@@ -132,7 +133,7 @@ fn send(msg: HudMsg) {
 /// on the captured display (see [`set_display_id`]).
 pub fn show(apps: Vec<(i32, String)>, cursor: usize) {
     send(HudMsg::Show {
-        display_id: DISPLAY_ID.load(Ordering::Relaxed),
+        display_id: DISPLAY_ID.get().and_then(|c| c.get()).unwrap_or(0),
         cursor: u16::try_from(cursor).unwrap_or(0),
         apps,
     });

@@ -344,7 +344,7 @@ pub struct CaptureDisplay {
     /// formally documented as "main first," but in practice it is —
     /// and we only fall through to it when the caller didn't ask for
     /// anything specific.
-    pub display_id: Option<u32>,
+    pub display_id: crate::virtual_display::DisplayIdCell,
     /// Target display's logical size in points — fed through to
     /// `CursorState` for the (currently disabled) position-polling
     /// path. Caller queries it from `CGDisplay::main()` for the
@@ -884,7 +884,7 @@ impl CaptureDisplay {
                 width,
                 height,
                 self.fps,
-                self.display_id,
+                self.display_id.get(),
                 self.screen_size_pts,
                 self.cursor_scale,
                 self.warp_cursor_home,

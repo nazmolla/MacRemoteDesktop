@@ -77,8 +77,9 @@ pub struct MacRdpsnd {
     /// `--capture-primary`: binding to a physical display that those modes
     /// then disable/capture kills the audio stream's content source. The
     /// virtual display survives both, so audio must follow it, not
-    /// `displays.first()` (which is the physical primary).
-    target_display_id: Option<u32>,
+    /// `displays.first()` (which is the physical primary). Read once per
+    /// connection, so a replaced virtual display is followed on reconnect.
+    target_display_id: crate::virtual_display::DisplayIdCell,
     /// The Ctrl+Alt+Shift+R resync request (raised by the input handler);
     /// the capture loop consumes its audio half by rebuilding the stream.
     resync: crate::resync::ResyncSignal,
@@ -90,7 +91,7 @@ impl MacRdpsnd {
         mute_on_minimize: bool,
         enable_aac: bool,
         aac_bitrate: u32,
-        target_display_id: Option<u32>,
+        target_display_id: crate::virtual_display::DisplayIdCell,
         resync: crate::resync::ResyncSignal,
     ) -> Self {
         Self {
@@ -128,7 +129,7 @@ impl SoundServerFactory for MacRdpsnd {
             display_suppressed: self.display_suppressed.clone(),
             mute_on_minimize: self.mute_on_minimize,
             aac_bitrate: self.aac_bitrate,
-            target_display_id: self.target_display_id,
+            target_display_id: self.target_display_id.clone(),
             resync: self.resync.clone(),
         })
     }
@@ -200,7 +201,7 @@ struct MacRdpsndBackend {
     /// format is `WAVE_FORMAT_AAC_MS`.
     aac_bitrate: u32,
     /// Display the audio SCStream binds to — see [`MacRdpsnd::target_display_id`].
-    target_display_id: Option<u32>,
+    target_display_id: crate::virtual_display::DisplayIdCell,
     /// See [`MacRdpsnd::resync`].
     resync: crate::resync::ResyncSignal,
 }
@@ -252,7 +253,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         let display_suppressed = self.display_suppressed.clone();
         let mute_on_minimize = self.mute_on_minimize;
         let aac_bitrate = self.aac_bitrate;
-        let target_display_id = self.target_display_id;
+        let target_display_id = self.target_display_id.clone();
         let resync = self.resync.clone();
         // Dedicated OS thread at USER_INTERACTIVE QoS for the entire
         // capture / resample / channel-send pipeline. Tokio workers ride
@@ -343,10 +344,11 @@ async fn capture_loop(
     mute_on_minimize: bool,
     use_aac: bool,
     aac_bitrate: u32,
-    target_display_id: Option<u32>,
+    target_display_id: crate::virtual_display::DisplayIdCell,
     resync: crate::resync::ResyncSignal,
 ) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
+    let target_display_id = target_display_id.get();
     use rubato::Resampler;
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
     use screencapturekit::prelude::{SCContentFilter, SCStreamConfiguration, SCStreamOutputType};
@@ -795,7 +797,7 @@ async fn capture_loop(
     _mute_on_minimize: bool,
     _use_aac: bool,
     _aac_bitrate: u32,
-    _target_display_id: Option<u32>,
+    _target_display_id: crate::virtual_display::DisplayIdCell,
     _resync: crate::resync::ResyncSignal,
 ) -> anyhow::Result<()> {
     Ok(())

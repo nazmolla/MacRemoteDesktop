@@ -272,6 +272,12 @@ pub(crate) async fn run() -> Result<()> {
 
     let (width, height, capture_display_id, screen_size_pts) =
         resolve_desktop(&args, virtual_display.as_ref()).await?;
+    // The display capture, input and audio address. Follows the virtual
+    // display if it is replaced; fixed (or none) on the mirror-primary path.
+    let display_cell = match virtual_display.as_ref() {
+        Some(vd) => vd.lock_or_recover().id_cell(),
+        None => virtual_display::DisplayIdCell::new(capture_display_id),
+    };
 
     // Frame rate: explicit --fps wins; otherwise 60 for H.264 (mstsc holds a
     // ~2-frame presentation buffer, so 60fps keeps typing latency low) or 15 for
@@ -358,9 +364,11 @@ pub(crate) async fn run() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     let _hud_helper = if args.app_switcher_hud {
-        let did =
-            capture_display_id.unwrap_or_else(|| core_graphics::display::CGDisplay::main().id);
-        crate::switcher_hud::set_display_id(did);
+        crate::switcher_hud::set_display_id(if capture_display_id.is_some() {
+            display_cell.clone()
+        } else {
+            virtual_display::DisplayIdCell::new(Some(core_graphics::display::CGDisplay::main().id))
+        });
         spawn_hud_helper()
     } else {
         None
@@ -443,7 +451,7 @@ pub(crate) async fn run() -> Result<()> {
         auto_size,
         stretch: args.stretch,
         fps,
-        display_id: capture_display_id,
+        display_id: display_cell.clone(),
         screen_size_pts,
         // Virtual-display sessions drive the cursor into the virtual display's
         // off-panel coordinate region; warp it back to the primary on
@@ -496,7 +504,7 @@ pub(crate) async fn run() -> Result<()> {
         std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let input_handler = MacInputHandler::new(
         desktop_size.clone(),
-        capture_display_id,
+        display_cell.clone(),
         click_signal,
         args.keyboard_layout.clone(),
         Some(keyboard_layout_klid.clone()),
@@ -523,7 +531,7 @@ pub(crate) async fn run() -> Result<()> {
         // Bind audio to the same display the video captures so --detach-primary
         // / --capture-primary (which disable/capture the physical panel) don't
         // kill the audio stream's content source.
-        capture_display_id,
+        display_cell.clone(),
         resync,
     ));
 

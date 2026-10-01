@@ -65,10 +65,16 @@ pub(super) fn engage_headless_mode(
             .lock_or_recover()
             .display_id()
     };
+    let vd_cell = |flag: &str| -> virtual_display::DisplayIdCell {
+        virtual_display
+            .unwrap_or_else(|| panic!("validate requires --virtual-display with {flag}"))
+            .lock_or_recover()
+            .id_cell()
+    };
     if args.detach_primary {
         spawn_primary_overlay_watcher(
             "detach",
-            vd_id("--detach-primary"),
+            vd_cell("--detach-primary"),
             slots.detached.clone(),
             virtual_display::DetachedPrimary::install,
             opts,
@@ -76,7 +82,7 @@ pub(super) fn engage_headless_mode(
     } else if args.capture_primary {
         spawn_primary_overlay_watcher(
             "capture",
-            vd_id("--capture-primary"),
+            vd_cell("--capture-primary"),
             slots.captured.clone(),
             virtual_display::CapturedPrimary::install,
             opts,
@@ -84,7 +90,7 @@ pub(super) fn engage_headless_mode(
     } else if args.shield_primary {
         spawn_primary_overlay_watcher(
             "shield",
-            vd_id("--shield-primary"),
+            vd_cell("--shield-primary"),
             slots.shielded.clone(),
             virtual_display::ShieldedPrimary::install,
             opts,
@@ -114,7 +120,7 @@ pub(super) fn engage_headless_mode(
 
 pub(super) fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
-    vd_id: u32,
+    vd_cell: virtual_display::DisplayIdCell,
     slot: Arc<std::sync::Mutex<Option<T>>>,
     install: fn(u32) -> Result<T>,
     opts: WatcherOptions,
@@ -176,6 +182,12 @@ pub(super) fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         was_zero = true;
                         continue;
                     }
+                    // Read at each engage: a replaced virtual display has a new id.
+                    let Some(vd_id) = vd_cell.get() else {
+                        warn!(label, "no virtual display id — skipping install");
+                        was_zero = true;
+                        continue;
+                    };
                     match install(vd_id) {
                         Ok(ovr) => {
                             installed_at = Some(Instant::now());

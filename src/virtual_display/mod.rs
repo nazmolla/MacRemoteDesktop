@@ -23,6 +23,34 @@ pub struct AppliedMode {
     pub fell_back_to_one_x: bool,
 }
 
+/// The display the session is on, shared by everything that addresses it
+/// (capture, input, audio, overlays). Fixed for a connection's lifetime; a
+/// replaced virtual display publishes its new id here between connections.
+/// `None` means "no specific display" (mirror-primary).
+#[derive(Debug, Clone, Default)]
+pub struct DisplayIdCell(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+impl DisplayIdCell {
+    pub fn new(id: Option<u32>) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+            id.unwrap_or(0),
+        )))
+    }
+
+    /// Current display id; 0 is never a valid CGDirectDisplayID.
+    pub fn get(&self) -> Option<u32> {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    #[allow(dead_code, reason = "used once a virtual display can be replaced")]
+    pub fn set(&self, id: u32) {
+        self.0.store(id, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub use macos::{
     online_display_facts, screen_is_locked, shield_keeps_physical_main,
@@ -153,6 +181,7 @@ mod macos {
         // logged anything we want to log about it.
         _handle: private_api::Handle,
         display_id: u32,
+        id_cell: super::DisplayIdCell,
         origin_pts: (f64, f64),
         size_pts: (f64, f64),
     }
@@ -189,6 +218,7 @@ mod macos {
             Ok(Self {
                 _handle: handle,
                 display_id: id,
+                id_cell: super::DisplayIdCell::new(Some(id)),
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
             })
@@ -274,6 +304,11 @@ mod macos {
 
         pub fn display_id(&self) -> u32 {
             self.display_id
+        }
+
+        /// Shared id that follows this display if it is ever replaced.
+        pub fn id_cell(&self) -> super::DisplayIdCell {
+            self.id_cell.clone()
         }
 
         pub fn origin_pts(&self) -> (f64, f64) {
@@ -1787,6 +1822,9 @@ mod stub {
         }
         pub fn backing_pixels(&self) -> (u32, u32) {
             (0, 0)
+        }
+        pub fn id_cell(&self) -> super::DisplayIdCell {
+            super::DisplayIdCell::default()
         }
         pub fn display_id(&self) -> u32 {
             0
