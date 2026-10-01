@@ -1214,19 +1214,20 @@ impl Gfx {
                 );
                 return Ok(true); // still the active path; just dropped this frame
             }
-            // EGFX-on-UDP frame-ack backpressure: on the UDP tunnel there's no
-            // socket backpressure to pace us to the client (unlike TCP), so without
-            // this the server floods frames and the client's DECODE queue runs away
-            // → frozen video while audio (on TCP) keeps playing. When the client's
-            // decode backlog (shipped − decoded, from FrameAcknowledge) exceeds the
-            // threshold, drop this capture so the client catches up — video degrades
-            // to choppy-but-live instead of freezing. Gated to the UDP tunnel
-            // (TCP push path stays byte-identical), to acks actually flowing (a
-            // suspended-ack client falls back to the submitted−shipped throttle
-            // above), and to having seen ≥1 ack (no cold-start false drop). Dropping
-            // before encode keeps the H.264 reference chain valid.
-            if self.egfx_on_udp.load(Ordering::Relaxed) && ctx.egfx_acks_seen && !ctx.acks_suspended
-            {
+            // Frame-ack backpressure, on every transport: when the client's decode
+            // backlog (shipped − decoded, from FrameAcknowledge) exceeds the
+            // threshold, drop this capture so the client catches up — video
+            // degrades to choppy-but-live instead of piling up. Upstream gated this
+            // to the UDP tunnel, trusting TCP's socket backpressure on TCP; but
+            // socket buffers hold seconds of video, so a client that decodes
+            // slower than we capture (a Windows 11 laptop, 2026-10-01) fell 233
+            // frames / ~15 s behind, its DWM memory climbed, input stalled and the
+            // client crashed. Windows' own RDP servers pace on frame acks the same
+            // way. Gated to acks actually flowing (a suspended-ack client falls
+            // back to the submitted−shipped throttle above) and to having seen ≥1
+            // ack (no cold-start false drop). Dropping before encode keeps the
+            // H.264 reference chain valid.
+            if ctx.egfx_acks_seen && !ctx.acks_suspended {
                 let lag = ctx
                     .last_shipped_frame_id
                     .load(Ordering::Relaxed)
@@ -1247,14 +1248,14 @@ impl Gfx {
                     if now.duration_since(ctx.last_throttle_ship) < UDP_THROTTLE_FLOOR {
                         trace!(
                             lag,
-                            "EGFX-on-UDP lag high; dropping capture (trickle floor)"
+                            "EGFX frame-ack lag high; dropping capture (trickle floor)"
                         );
                         return Ok(true);
                     }
                     ctx.last_throttle_ship = now;
                     trace!(
                         lag,
-                        "EGFX-on-UDP lag high; letting a trickle frame through to drain client buffer"
+                        "EGFX frame-ack lag high; letting a trickle frame through to drain client buffer"
                     );
                     // fall through: ship this one to keep the client presenting/acking
                 }
