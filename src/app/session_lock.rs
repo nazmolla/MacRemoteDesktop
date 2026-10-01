@@ -632,7 +632,10 @@ mod auto_unlock_flag_tests {
             true,
         );
         assert!(
-            a.enable_h264 && a.adaptive_bitrate && a.enable_udp_multitransport && a.virtual_display
+            a.enable_h264
+                && a.adaptive_bitrate
+                && !a.enable_udp_multitransport
+                && a.virtual_display
         );
         assert!(!a.shield_primary);
         assert!(!r.is_empty());

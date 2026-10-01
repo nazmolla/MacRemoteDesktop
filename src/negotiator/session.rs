@@ -123,7 +123,9 @@ pub fn connect_defaults(host: &HostCaps) -> StartupDefaults {
     let mut reasons = vec![
         "video: H.264 over EGFX on (clients without AVC fall back to bitmaps)".to_owned(),
         "network: adaptive bitrate on".to_owned(),
-        "network: UDP offered; used only if the client accepts".to_owned(),
+        // UDP stays off: on idle the client's UDP channel died and took input
+        // with it (Windows 11, 2026-10-01). ENABLE_UDP_MULTITRANSPORT=1 opts in.
+        "network: UDP off (TCP only)".to_owned(),
     ];
     let virtual_display = host.virtual_display_available;
     reasons.push(if virtual_display {
@@ -135,7 +137,7 @@ pub fn connect_defaults(host: &HostCaps) -> StartupDefaults {
         virtual_display,
         enable_h264: true,
         adaptive_bitrate: true,
-        udp_multitransport: true,
+        udp_multitransport: false,
         client_resolution: true,
         reasons,
     }
@@ -259,13 +261,8 @@ mod tests {
     #[test]
     fn connect_defaults_enable_the_negotiated_features() {
         let d = connect_defaults(&host(0, true));
-        assert!(
-            d.virtual_display
-                && d.enable_h264
-                && d.adaptive_bitrate
-                && d.udp_multitransport
-                && d.client_resolution
-        );
+        assert!(d.virtual_display && d.enable_h264 && d.adaptive_bitrate && d.client_resolution);
+        assert!(!d.udp_multitransport, "UDP is opt-in");
         let d = connect_defaults(&host(1, false));
         assert!(!d.virtual_display);
         assert!(
