@@ -1567,6 +1567,7 @@ mod macos {
                                                     stride,
                                                     false,
                                                     crate::h264::FrameRegions::SameAsLast,
+                                                    Some(pb.as_ptr().cast_const()),
                                                 )
                                                 .map(|_| ())
                                             } else {
@@ -1746,6 +1747,7 @@ mod macos {
                         stride_bytes,
                         big_change || resume_keyframe,
                         regions,
+                        Some(pixel_buffer.as_ptr().cast_const()),
                     );
                     // Refine static tiles even while something animates (review I4).
                     if matches!(submitted, Ok(true)) && gfx.refine_pending() {

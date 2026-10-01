@@ -870,7 +870,7 @@ impl Gfx {
         reason = "whole-frame entry point; capture currently calls submit_bgra_regions"
     )]
     pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
-        self.submit_bgra_regions(bgra, stride, request_keyframe, FrameRegions::Full)
+        self.submit_bgra_regions(bgra, stride, request_keyframe, FrameRegions::Full, None)
     }
 
     /// [`Self::submit_bgra`] with the surface regions this frame updates.
@@ -880,6 +880,9 @@ impl Gfx {
         stride: usize,
         request_keyframe: bool,
         regions: FrameRegions,
+        // The capture CVPixelBuffer `bgra` was read from, if any: lets the GPU
+        // convert it without a copy (see src/gpu_convert).
+        surface: Option<*const std::ffi::c_void>,
     ) -> Result<bool> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_encoder_locked)
@@ -1324,7 +1327,7 @@ impl Gfx {
                     encoder.encode_yuv420(my, mu, mv, force_keyframe)?;
                     aux.encode_yuv420(ay, au, av, force_keyframe)?;
                 }
-                _ => encoder.encode_bgra(bgra, stride, force_keyframe)?,
+                _ => encoder.encode_bgra_from(bgra, stride, force_keyframe, surface)?,
             }
             let debt = ctx.region_debt.take();
             let resolved = if force_keyframe { None } else { debt };

@@ -18,6 +18,16 @@ extern "C" {
         height: u32,
         dst: *const c_void,
     ) -> i32;
+    fn macrdp_gpu_create_nv12(width: u32, height: u32) -> *const c_void;
+    fn macrdp_gpu_convert_surface(src: *const c_void, dst: *const c_void) -> i32;
+    #[cfg(test)]
+    fn macrdp_gpu_selftest_surface(
+        bgra: *const u8,
+        width: u32,
+        height: u32,
+        y_out: *mut u8,
+        cbcr_out: *mut u8,
+    ) -> i32;
     #[cfg(test)]
     fn macrdp_gpu_selftest(
         bgra: *const u8,
@@ -27,6 +37,41 @@ extern "C" {
         y_out: *mut u8,
         cbcr_out: *mut u8,
     ) -> i32;
+}
+
+/// A GPU-writable full-range NV12 buffer from a reusable pool (+1 retained; the
+/// caller releases it), or `None` when the GPU path is off or unavailable.
+pub fn create_nv12(width: u32, height: u32) -> Option<*const c_void> {
+    nv12_attributes()?;
+    // SAFETY: plain values in; returns a +1 CVPixelBuffer or NULL.
+    let pb = unsafe { macrdp_gpu_create_nv12(width, height) };
+    (!pb.is_null()).then_some(pb)
+}
+
+/// Convert the capture buffer `src` (32BGRA) into `dst` without copying it.
+/// `false` = not done (sizes or formats differ, or the GPU failed).
+///
+/// # Safety
+/// `src` and `dst` must be valid CVPixelBuffers for the duration of the call.
+pub unsafe fn convert_surface(src: *const c_void, dst: *const c_void) -> bool {
+    // SAFETY: both buffers are valid per the caller; the call waits for the GPU.
+    unsafe { macrdp_gpu_convert_surface(src, dst) == 0 }
+}
+
+/// Test hook for the zero-copy path: same output as [`selftest`].
+#[cfg(test)]
+pub fn selftest_surface(bgra: &[u8], width: u32, height: u32) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (w, h) = (width as usize, height as usize);
+    if bgra.len() < w * 4 * h {
+        return None;
+    }
+    let mut y = vec![0u8; w * h];
+    let mut c = vec![0u8; w * h / 2];
+    // SAFETY: `bgra` holds `h` tight rows of `w * 4` bytes; the outputs hold w*h and w*h/2 bytes.
+    let rc = unsafe {
+        macrdp_gpu_selftest_surface(bgra.as_ptr(), width, height, y.as_mut_ptr(), c.as_mut_ptr())
+    };
+    (rc == 0).then_some((y, c))
 }
 
 /// Test hook: GPU-convert `bgra` and return the packed (Y, CbCr) planes.
