@@ -113,7 +113,7 @@ pub const ALL: &[Tunable] = &[
     t("MACRDP_UDP_ADAPTIVE_DECREASE", Float, "0.7", "h264", "Adaptive controller: multiplicative decrease on congestion."),
     t("MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE", Int, "2", "h264", "Adaptive controller: UDP retransmits per interval tolerated before backing off."),
     // Blank-presentation recovery (mstsc reconnect blank; docs/known-quirks.md).
-    t("MACRDP_BLANK_RECOVERY", Bool, "1", "h264", "Detect a client that decodes but never presents, and recover it."),
+    t("MACRDP_BLANK_RECOVERY", Bool, "0", "h264", "Detect a client that decodes but never presents, and recover it (reactivate, then drop). Opt-in: its signal misfires on some presenting clients."),
     t("MACRDP_BLANK_RECOVERY_REACTIVATE", Bool, "1", "h264", "Recover with a bare deactivation-reactivation first (0 = drop the connection)."),
     t("MACRDP_BLANK_RECOVERY_MIN_QOE", Int, "24", "h264", "All-zero QoE reports needed before recovering."),
     t("MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS", Int, "3", "h264", "Consecutive nonzero render reports that count as presenting."),

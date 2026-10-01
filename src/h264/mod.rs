@@ -678,10 +678,11 @@ impl Gfx {
         // remap was live-verified never to heal mstsc; ≥2 re-enables
         // remap-first). max_consecutive_drops caps the cross-connection
         // drop → reconnect → blank → drop loop on a truly-stuck client.
-        let blank_recovery_enabled = match crate::tunables::var("MACRDP_BLANK_RECOVERY") {
-            Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
-            Err(_) => true,
-        };
+        // Opt-in: the "decodes but never presents" symptom it was built for
+        // matches the SPS reordering bug (h264/sps.rs), now fixed, and its
+        // zero-render-time signal misfired on a presenting Windows 11 client,
+        // dropping a working session (2026-10-01).
+        let blank_recovery_enabled = crate::tunables::truthy("MACRDP_BLANK_RECOVERY");
         // These two RTT knobs allow an explicit 0 (= "disable"), unlike env_u32
         // whose zero-filter falls back to the default.
         let env_u32_zero_ok = |name: &str, default: u32| -> u32 {
