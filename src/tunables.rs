@@ -98,6 +98,7 @@ pub const ALL: &[Tunable] = &[
     // Video encoding.
     t("MACRDP_H264_FULL_RANGE", Bool, "1", "videotoolbox", "Encode full-range NV12 (0 = let VideoToolbox produce video range)."),
     t("MACRDP_H264_LENGTH_PREFIXED", Bool, "0", "h264", "Emit length-prefixed (AVCC) NAL units instead of Annex-B, for ironrdp-decoder interop."),
+    t("MACRDP_LOSSLESS_REFINE", Bool, "0", "h264", "Re-send regions that stop changing losslessly (ClearCodec over EGFX). Off until verified on Windows clients."),
     t("MACRDP_AVC444", Bool, "0", "h264", "Offer AVC444 to clients that support it. Off: AVC420 only (AVC444 output is corrupt on real decoders until fixed)."),
     t("MACRDP_ADAPTIVE_FLOOR_FPS", Int, "10", "h264", "Adaptive controller: lowest frame rate it throttles to."),
     t("MACRDP_ADAPTIVE_QUEUE_HIGH_MS", Float, "100", "h264", "Adaptive controller: client queue depth treated as congestion."),
