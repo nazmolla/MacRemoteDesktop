@@ -1894,6 +1894,11 @@ impl Gfx {
     /// under `ctx`, which is released before `server_handle` is taken.
     /// `piggyback` calls (after a submit) are rate-limited to one per 100 ms.
     pub(crate) fn refine_tick(&self, bgra: &[u8], stride: usize, piggyback: bool) -> Result<()> {
+        // Opt-in until verified on Windows clients: with it on, mstsc's blank
+        // detector misfired and clients ran short of memory (2026-10-01).
+        if !crate::tunables::truthy("MACRDP_LOSSLESS_REFINE") {
+            return Ok(());
+        }
         let now = Instant::now();
         let (surface_id, server_handle, epoch, ready, tiles) = {
             let mut guard = lock_ctx(&self.ctx);
