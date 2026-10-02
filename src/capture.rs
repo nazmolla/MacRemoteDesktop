@@ -682,6 +682,25 @@ impl CaptureDisplay {
             .client_advert
             .as_ref()
             .is_some_and(|advert| advert.take_new_connection());
+        if may_replace {
+            // Multi-monitor: the primary monitor uses this display; every other
+            // monitor gets its own, placed like the client's layout.
+            let extras: Vec<(i32, i32, u32, u32)> = self
+                .client_advert
+                .as_ref()
+                .and_then(|a| a.monitor_plans())
+                .map(|plans| {
+                    let (x0, y0) = (plans[0].left, plans[0].top);
+                    plans[1..]
+                        .iter()
+                        .map(|m| (m.left - x0, m.top - y0, m.plan.capture_w, m.plan.capture_h))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Err(e) = vd.set_extra_monitors(&extras) {
+                tracing::warn!(error = ?e, "could not set up the extra monitor displays");
+            }
+        }
         let plan = self.client_advert.as_ref().map(|advert| {
             crate::negotiator::display::plan_display(crate::negotiator::display::ClientMonitor {
                 width_px: u32::from(width),

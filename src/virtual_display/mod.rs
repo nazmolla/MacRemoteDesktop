@@ -221,6 +221,8 @@ mod macos {
         id_cell: super::DisplayIdCell,
         origin_pts: (f64, f64),
         size_pts: (f64, f64),
+        /// Displays for a multi-monitor client's other monitors, one helper each.
+        extras: Vec<(HostProcess, u32)>,
     }
 
     impl VirtualDisplay {
@@ -274,6 +276,7 @@ mod macos {
                 id_cell: super::DisplayIdCell::new(Some(id)),
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
+                extras: Vec::new(),
             })
         }
 
@@ -292,6 +295,7 @@ mod macos {
                 id_cell: super::DisplayIdCell::new(Some(mode.display_id)),
                 origin_pts: (0.0, 0.0),
                 size_pts: (0.0, 0.0),
+                extras: Vec::new(),
             };
             vd.refresh_bounds();
             Ok(vd)
@@ -475,6 +479,42 @@ mod macos {
                 }
                 Err(e) => Err(e),
             }
+        }
+
+        /// Displays for a multi-monitor client's other monitors. Each entry is
+        /// `(dx, dy, width_px, height_px)`: the monitor's offset from the primary
+        /// in the client layout, and its size. Replaces any previous extras; an
+        /// empty slice removes them. Hosted displays only. Returns the new ids.
+        pub fn set_extra_monitors(&mut self, monitors: &[(i32, i32, u32, u32)]) -> Result<Vec<u32>> {
+            // Each old helper removes its display under the machine-wide lock.
+            self.extras.clear();
+            if monitors.is_empty() {
+                return Ok(Vec::new());
+            }
+            let Backend::Host { serial, .. } = &self._handle else {
+                return Err(anyhow!("multi-monitor needs the display host (MACRDP_DISPLAY_HOST)"));
+            };
+            let base = *serial;
+            for (i, &(_, _, w, h)) in monitors.iter().enumerate() {
+                let (proc, mode) = start_host(base.wrapping_add(1 + i as u32), w, h, 1)?;
+                self.extras.push((proc, mode.display_id));
+            }
+            let primary = CGDisplay::new(self.display_id).bounds().origin;
+            let first = CGDisplay::new(self.extras[0].1);
+            let config = first
+                .begin_configuration()
+                .map_err(|e| anyhow!("CGBeginDisplayConfiguration (monitors): CGError {e}"))?;
+            for (&(dx, dy, _, _), (_, id)) in monitors.iter().zip(&self.extras) {
+                CGDisplay::new(*id)
+                    .configure_display_origin(&config, primary.x as i32 + dx, primary.y as i32 + dy)
+                    .map_err(|e| anyhow!("CGConfigureDisplayOrigin({id}): CGError {e}"))?;
+            }
+            first
+                .complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (monitors): CGError {e}"))?;
+            let ids: Vec<u32> = self.extras.iter().map(|(_, id)| *id).collect();
+            tracing::info!(?ids, ?monitors, "extra monitor displays created and arranged");
+            Ok(ids)
         }
 
         /// The display's framebuffer size in pixels (2× points in Retina modes).
@@ -2022,6 +2062,9 @@ mod stub {
         pub fn backing_pixels(&self) -> (u32, u32) {
             (0, 0)
         }
+        pub fn set_extra_monitors(&mut self, _m: &[(i32, i32, u32, u32)]) -> Result<Vec<u32>> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
         pub fn id_cell(&self) -> super::DisplayIdCell {
             super::DisplayIdCell::default()
         }
@@ -2229,5 +2272,31 @@ mod planned_tests {
             (red[0] - 1.0).abs() < 0.01 && red[1].abs() < 0.01 && red[2].abs() < 0.01,
             "{red:?}"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod monitor_tests {
+    use super::VirtualDisplay;
+    use core_graphics::display::CGDisplay;
+
+    /// On-device (run in a GUI or login-window session): a primary display plus
+    /// two extra monitor displays, placed right of and left of the primary.
+    #[test]
+    #[ignore = "creates virtual displays; run on a test machine"]
+    fn extra_monitors_are_arranged_like_the_client() {
+        let mut vd = VirtualDisplay::new(1280, 720, 60).expect("primary display");
+        let ids = vd
+            .set_extra_monitors(&[(1280, 0, 1024, 768), (-800, 0, 800, 600)])
+            .expect("extra displays");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let p = CGDisplay::new(vd.display_id()).bounds();
+        for (id, (dx, w)) in ids.iter().zip([(1280.0, 1024.0), (-800.0, 800.0)]) {
+            let b = CGDisplay::new(*id).bounds();
+            println!("display {id}: origin {:?} size {:?}", b.origin, b.size);
+            assert_eq!((b.origin.x - p.origin.x, b.size.width), (dx, w));
+        }
+        vd.set_extra_monitors(&[]).expect("remove extras");
+        println!("MONITOR-TEST-OK");
     }
 }

@@ -27,7 +27,6 @@ pub struct ClientAdvert {
 
 impl ClientAdvert {
     /// The current connection's per-monitor plans (see [`crate::negotiator::display::plan_monitors`]).
-    #[allow(dead_code, reason = "consumed by Phase 4a step 3 (one display per monitor)")]
     pub fn monitor_plans(&self) -> Option<Vec<crate::negotiator::display::MonitorPlan>> {
         self.monitor_plans
             .lock()
