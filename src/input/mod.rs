@@ -23,8 +23,37 @@ pub struct MacInputHandler {
     /// Records mouse-button-down timestamps so the H.264 path can lower its
     /// keyframe threshold briefly after a click. `None` unless `--enable-h264`.
     click_signal: Option<crate::capture::ClickSignal>,
+    activity: InputActivity,
     #[cfg(target_os = "macos")]
     inner: macos::Inner,
+}
+
+/// Logs when input arrives after a long silence, so a session whose input
+/// stopped can be told apart from one whose client stopped sending.
+#[derive(Default)]
+struct InputActivity {
+    last: Option<std::time::Instant>,
+    events: u64,
+}
+
+impl InputActivity {
+    const SILENCE: std::time::Duration = std::time::Duration::from_secs(300);
+
+    fn note(&mut self, kind: &'static str) {
+        let now = std::time::Instant::now();
+        match self.last {
+            None => tracing::info!(kind, "first input event received"),
+            Some(t) if now.duration_since(t) >= Self::SILENCE => tracing::info!(
+                kind,
+                silent_secs = now.duration_since(t).as_secs(),
+                events_before = self.events,
+                "input received after a long silence"
+            ),
+            _ => {}
+        }
+        self.last = Some(now);
+        self.events += 1;
+    }
 }
 
 impl MacInputHandler {
@@ -60,6 +89,7 @@ impl MacInputHandler {
         Ok(Self {
             desktop_size,
             click_signal,
+            activity: InputActivity::default(),
             #[cfg(target_os = "macos")]
             inner,
         })
@@ -68,6 +98,7 @@ impl MacInputHandler {
 
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
+        self.activity.note("keyboard");
         #[cfg(target_os = "macos")]
         self.inner.keyboard(event);
         #[cfg(not(target_os = "macos"))]
@@ -75,6 +106,7 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
+        self.activity.note("mouse");
         // A button-down is the "user intent" signal the H.264 path uses to lower
         // its keyframe threshold for a moment (a click usually precedes a UI
         // change). Record before delegating, since `inner.mouse` takes `event`.
