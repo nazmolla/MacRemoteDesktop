@@ -46,6 +46,7 @@ mod input;
 mod keyboard_layout;
 mod lock_activity;
 mod logging;
+mod multimon;
 #[allow(dead_code)]
 mod lossless;
 mod multitransport;

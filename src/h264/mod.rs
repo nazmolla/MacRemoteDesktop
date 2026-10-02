@@ -75,6 +75,7 @@ use crate::videotoolbox::{EncodedFrame, Encoder};
 mod annexb;
 mod blank;
 mod congestion;
+mod lanes;
 mod regions;
 pub(crate) mod sps;
 mod udp_watchdog;
@@ -234,6 +235,8 @@ struct ConnectionContext {
     /// a main + auxiliary H.264 pair and shipped with `send_avc444_frame`.
     avc444: bool,
     avc444_buf: Avc444Buffers,
+    /// Extra-monitor pipelines (Phase 4a), indexed like the extra displays.
+    lanes: Vec<Option<lanes::Lane>>,
     /// Regions for frames submitted but not yet shipped, keyed by encoder PTS.
     /// `None` = whole surface.
     region_queue: std::collections::VecDeque<(i64, Option<Vec<crate::refine::Rect>>)>,
@@ -2427,6 +2430,7 @@ impl GfxServerFactory for Gfx {
         *lock_ctx(&self.ctx) = Some(ConnectionContext {
             avc444: false,
             avc444_buf: Avc444Buffers::default(),
+            lanes: Vec::new(),
             region_queue: std::collections::VecDeque::new(),
             last_regions: None,
             region_debt: RegionDebt::Full,
