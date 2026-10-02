@@ -33,14 +33,23 @@ if let ev = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPo
 let done = DispatchSemaphore(value: 0)
 Task {
     do {
-        try await Task.sleep(nanoseconds: 1_000_000_000)
-        let content = try await SCShareableContent.current
+        var content = try await SCShareableContent.current
+        for _ in 0..<50 where !content.displays.contains(where: { $0.displayID == vd.displayID }) {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            content = try await SCShareableContent.current
+        }
+        result["sck_displays"] = content.displays.map { "\($0.displayID):\($0.width)x\($0.height)" }.joined(separator: " ")
+        result["own_display_listed"] = String(content.displays.contains(where: { $0.displayID == vd.displayID }))
         guard let d = content.displays.first(where: { $0.displayID == vd.displayID }) ?? content.displays.first else {
             result["capture"] = "error no displays"; done.signal(); return
         }
         let cfg = SCStreamConfiguration(); cfg.width = 640; cfg.height = 360
         let img = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: d, excludingWindows: []), configuration: cfg)
         result["capture"] = "ok \(img.width)x\(img.height) display=\(d.displayID)"
+        let url = URL(fileURLWithPath: "/Users/Shared/viga-probe-\(NSUserName()).png")
+        if let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, img, nil); CGImageDestinationFinalize(dest)
+        }
     } catch {
         result["capture"] = "error \(esc(error.localizedDescription))"
     }

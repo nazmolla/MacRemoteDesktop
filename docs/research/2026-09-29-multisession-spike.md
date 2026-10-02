@@ -79,3 +79,12 @@ Private symbols Phase 3 depends on: `CGSCreateLoginSessionWithDataAndVisibility`
    time at the lock screen. The broker must handle "session exists but locked" — unlock on
    successful RDP authentication, as Jump's `UnlockSlow` / `CGSSessionScreenIsLocked`
    handling suggests — not only "no session".
+
+## Results, 2026-10-02 (Mac mini, macOS 27)
+
+1. **Fast User Switching background session (`rdpspike`, probe run via `launchctl asuser` + `sudo -u`, launched by root):** `console=0`; the probe's own virtual display never appeared in ScreenCaptureKit within 5 s; SCK listed only the console's displays (the physical 3440×1440 and Viga's 1718×1334) and captured the *console user's* desktop; the posted mouse event landed on the console. A Fast-User-Switching background session does not render on its own. (Launching from root also bypassed per-user TCC, so this run says nothing about rdpspike's grants.)
+2. **Call recovered from `screensharingd` (arm64e):** `err = CGSCreateLoginSessionWithDataAndVisibility(bytes, len, 0, &session, NULL)` where `bytes` is a **binary plist** (format 200). `CreateOffConsoleLoginWindowSession` sends `{SessionStartedBy: "ScreenSharing"}`; `LoginUser` adds `username` and `UserPasswordKey` (the account password) to the caller's dictionary. Both pass visibility 0 and run as root.
+3. **Off-console login-window session, created from a root tool** (`spikes/multisession/loginsession/`): `err=0`, a new `loginwindow` (running as root) appears; `CGSReleaseSession` returns 0 and that `loginwindow` exits within seconds. Three create/release cycles, no effect on WindowServer or the console session.
+4. **Probe inside that session via `launchctl bsexec <loginwindow pid>`:** runs as root in the session (`id` works) but the probe traps (exit 133) at virtual display creation. Joining the bootstrap namespace from outside is not enough; Apple's `ScreensharingAgent` and Jump's agent are LaunchAgents limited to `LoginWindow`/`Aqua` session types that launchd starts inside the session.
+
+**Next:** a test LaunchAgent with `LimitLoadToSessionType = LoginWindow`, loaded into the off-console session (find how screensharingd triggers it: `launchctl bootstrap` into the session's domain, or the notifyd-matching launch event Jump uses), running the probe there; then the logged-in-user path (`LoginUser` with credentials).
