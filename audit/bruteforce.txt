@@ -1,0 +1,11 @@
+event="auth" src_ip=192.168.0.80 src_port=55741 outcome="did_not_complete" reason=[Credssp server error] custom error
+event="auth" src_ip=192.168.0.80 src_port=55742 outcome="did_not_complete" reason=[Credssp server error] custom error
+event="auth" src_ip=192.168.0.80 src_port=55743 outcome="did_not_complete" reason=[Credssp server error] custom error
+event="auth" src_ip=192.168.0.80 src_port=55744 outcome="did_not_complete" reason=[Credssp server error] custom error
+event="auth" src_ip=192.168.0.80 src_port=55745 outcome="did_not_complete" reason=[Credssp server error] custom error
+event="reject" reason="lockout" src_ip=192.168.0.80 retry_after_secs=28
+event="reject" reason="lockout" src_ip=192.168.0.80 retry_after_secs=28
+event="reject" reason="lockout" src_ip=192.168.0.80 retry_after_secs=26
+event="reject" reason="lockout" src_ip=192.168.0.80 retry_after_secs=26
+event="reject" reason="lockout" src_ip=192.168.0.80 retry_after_secs=25
+event="reject" reason="lockout" src_ip=192.168.0.80 retry_after_secs=25

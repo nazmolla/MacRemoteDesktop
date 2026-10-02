@@ -1,0 +1,13 @@
+negotiate standard RDP: closed (0 bytes)
+negotiate TLS only    : closed (0 bytes)
+negotiate NLA (hybrid): selected 2
+negotiate TLS|NLA     : selected 2
+TLSv1   : refused (SSLError: [SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake f)
+TLSv1_1 : refused (SSLError: [SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake f)
+TLSv1_2 : ACCEPTED TLSv1.2 ECDHE-ECDSA-CHACHA20-POLY1305
+TLSv1_3 : refused (ValueError: Unsupported protocol version 0x304)
+default client negotiates: TLSv1.2 ECDHE-ECDSA-CHACHA20-POLY1305 | OpenSSL: LibreSSL 2.8.3
+TLSv1   : refused (SSLError: [SSL: NO_PROTOCOLS_AVAILABLE] no protocols available (_ssl.c)
+TLSv1_1 : refused (SSLError: [SSL: NO_PROTOCOLS_AVAILABLE] no protocols available (_ssl.c)
+TLSv1_2 : ACCEPTED TLSv1.2 ECDHE-ECDSA-AES256-GCM-SHA384
+TLSv1_3 : ACCEPTED TLSv1.3 TLS_AES_256_GCM_SHA384

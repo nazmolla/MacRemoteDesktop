@@ -1,0 +1,9 @@
+{"test": "negotiate_standard_rdp", "result": "PASS", "detail": "refused (short reply): 0 bytes received"}
+{"test": "negotiate_tls_only", "result": "INFO", "detail": "neg type: None"}
+{"test": "negotiate_hybrid", "result": "INFO", "detail": "selected protocol: 2"}
+{"test": "tls_versions", "result": "PASS", "detail": "[{\"version\": \"TLSv1\", \"accepted\": false, \"refused\": \"connection error: module 'ssl' has no attribute 'SSLVersionError'\", \"cipher\": null}, {\"version\": \"TLSv1_1\", \"accepted\": false, \"refused\": \"connection error: module 'ssl' has no attribute 'SSLVersionError'\", \"cipher\": null}, {\"version\": \"TLSv1_2\", \"accepted\": false, \"refused\": \"connection error: module 'ssl' has no attribute 'SSLVersionError'\", \"cipher\": null}, {\"version\": \"TLSv1_3\", \"accepted\": null, \"refused\": null, \"cipher\": null, \"detail\": \"unsupported locally: Unsupported protocol version 0x304\"}]"}
+{"test": "garbage_fuzz", "result": "PASS", "detail": "300 connections refused"}
+{"test": "truncated_handshakes", "result": "PASS", "detail": "alive"}
+{"test": "idle_flood", "result": "PASS", "detail": "closed_by_server=200, liveness_passed=True"}
+{"test": "slow_drip", "result": "INFO", "detail": "0 closed before completion"}
+{"test": "summary", "PASS": 0, "FAIL": 0, "INFO": 0}

@@ -1,0 +1,13 @@
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/mnazmi/Code/MacRemoteDesktop/deny.toml:89:4
+   │
+89 │   "MPL-2.0",
+   │    ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/mnazmi/Code/MacRemoteDesktop/deny.toml:87:4
+   │
+87 │   "Unicode-DFS-2016",
+   │    ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+licenses ok
