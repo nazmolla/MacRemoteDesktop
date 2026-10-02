@@ -682,7 +682,7 @@ impl CaptureDisplay {
             .client_advert
             .as_ref()
             .is_some_and(|advert| advert.take_new_connection());
-        if may_replace {
+        if may_replace && crate::tunables::truthy("MACRDP_MULTIMON") {
             // Multi-monitor: the primary monitor uses this display; every other
             // monitor gets its own, placed like the client's layout.
             let extras: Vec<(i32, i32, u32, u32)> = self

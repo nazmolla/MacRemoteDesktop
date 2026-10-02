@@ -88,6 +88,7 @@ pub const ALL: &[Tunable] = &[
     t("MACRDP_NEGOTIATE", Bool, "1", "main", "Log the negotiated session plan (0 skips the negotiator's startup report)."),
     t("MACRDP_RETINA_VD", Bool, "0", "virtual_display", "Try Retina (2x backing) modes on the virtual display for high-DPI clients. Off: always 1x at the client's pixel size, the reliable path (a Retina request that lands on its 1x twin can leave the display stuck)."),
     t("MACRDP_SESSION_PROBE", Bool, "0", "main", "Multi-session spike: print this process's Screen Recording and Accessibility grants and exit."),
+    t("MACRDP_MULTIMON", Bool, "0", "capture", "Development: one virtual display per client monitor (Phase 4a, capture and EGFX of the extra monitors not done yet)."),
     t("MACRDP_DISPLAY_HOST", Bool, "1", "virtual_display", "Run the virtual display in a separate macrdpdisplay process, so a display that cannot reach the wanted mode is replaced at the next connection instead of staying stuck. 0: the display lives in the Viga process (also used when the helper is missing)."),
     // Helper processes and loopback ports.
     t("MACRDP_HUD_HELPER", Path, "bundled macrdphud", "main", "Path of the app-switcher HUD helper."),
