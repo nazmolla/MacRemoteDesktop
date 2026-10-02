@@ -18,7 +18,10 @@ pub use ironrdp_connector::DesktopSize;
 use ironrdp_pdu::nego;
 
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
-pub use self::connection::{Acceptor, AcceptorResult, AcceptorState, ClientDisplayInfo, MultitransportOffer};
+pub use self::connection::{
+    client_monitors, Acceptor, AcceptorResult, AcceptorState, ClientDisplayInfo, ClientMonitor,
+    MultitransportOffer,
+};
 pub use self::finalization::{FinalizationSequence, FinalizationState};
 use crate::credssp::resolve_generator;
 

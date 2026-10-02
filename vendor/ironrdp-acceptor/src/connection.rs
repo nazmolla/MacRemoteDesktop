@@ -37,6 +37,54 @@ pub struct ClientDisplayInfo {
     pub device_scale_factor: Option<u32>,
     pub physical_width_mm: Option<u32>,
     pub physical_height_mm: Option<u32>,
+    /// (vendored) divergence (6): the client's monitors from GCC Client Monitor
+    /// Data and Client Monitor Extended Data; empty when the client sent none
+    /// (a single-monitor client usually doesn't).
+    pub monitors: Vec<ClientMonitor>,
+}
+
+/// One client monitor, in the client's virtual-desktop coordinates. The
+/// rectangle is inclusive, as on the wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientMonitor {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub primary: bool,
+    /// Desktop scale factor in percent, from the extended data.
+    pub desktop_scale_factor: Option<u32>,
+    pub physical_width_mm: Option<u32>,
+    pub physical_height_mm: Option<u32>,
+}
+
+/// Pair each monitor with its extended data (same index), as MS-RDPBCGR orders them.
+pub fn client_monitors(
+    monitor: Option<&ironrdp_pdu::gcc::ClientMonitorData>,
+    extended: Option<&ironrdp_pdu::gcc::ClientMonitorExtendedData>,
+) -> Vec<ClientMonitor> {
+    let Some(monitor) = monitor else {
+        return Vec::new();
+    };
+    monitor
+        .monitors
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let ext = extended.and_then(|e| e.extended_monitors_info.get(i));
+            let nonzero = |v: u32| (v != 0).then_some(v);
+            ClientMonitor {
+                left: m.left,
+                top: m.top,
+                right: m.right,
+                bottom: m.bottom,
+                primary: m.flags.contains(ironrdp_pdu::gcc::MonitorFlags::PRIMARY),
+                desktop_scale_factor: ext.and_then(|e| nonzero(e.desktop_scale_factor)),
+                physical_width_mm: ext.and_then(|e| nonzero(e.physical_width)),
+                physical_height_mm: ext.and_then(|e| nonzero(e.physical_height)),
+            }
+        })
+        .collect()
 }
 
 pub struct Acceptor {
@@ -678,6 +726,10 @@ impl Sequence for Acceptor {
                     device_scale_factor: od.device_scale_factor,
                     physical_width_mm: od.desktop_physical_width,
                     physical_height_mm: od.desktop_physical_height,
+                    monitors: client_monitors(
+                        gcc_blocks.monitor.as_ref(),
+                        gcc_blocks.monitor_extended.as_ref(),
+                    ),
                 };
 
                 // Adopt the client's requested desktop size (from its Client
@@ -1189,5 +1241,50 @@ fn create_gcc_blocks(
         // out-of-contract and mstsc raises a protocol error + disconnects. `None` on
         // the default path keeps the handshake byte-identical.
         multi_transport_channel: multitransport.map(|flags| gcc::MultiTransportChannelData { flags }),
+    }
+}
+
+#[cfg(test)]
+mod client_monitor_tests {
+    use super::client_monitors;
+    use ironrdp_pdu::gcc::{
+        ClientMonitorData, ClientMonitorExtendedData, ExtendedMonitorInfo, Monitor, MonitorFlags,
+        MonitorOrientation,
+    };
+
+    #[test]
+    fn pairs_monitors_with_extended_data() {
+        let data = ClientMonitorData {
+            monitors: vec![
+                Monitor { left: 0, top: 0, right: 2559, bottom: 1439, flags: MonitorFlags::PRIMARY },
+                Monitor { left: 2560, top: 0, right: 4479, bottom: 1079, flags: MonitorFlags::empty() },
+            ],
+        };
+        let ext = ClientMonitorExtendedData {
+            extended_monitors_info: vec![
+                ExtendedMonitorInfo {
+                    physical_width: 600,
+                    physical_height: 340,
+                    orientation: MonitorOrientation::Landscape,
+                    desktop_scale_factor: 150,
+                    device_scale_factor: 140,
+                },
+                ExtendedMonitorInfo {
+                    physical_width: 0,
+                    physical_height: 0,
+                    orientation: MonitorOrientation::Landscape,
+                    desktop_scale_factor: 100,
+                    device_scale_factor: 100,
+                },
+            ],
+        };
+        let m = client_monitors(Some(&data), Some(&ext));
+        assert_eq!(m.len(), 2);
+        assert!(m[0].primary && !m[1].primary);
+        assert_eq!((m[1].left, m[1].right, m[1].bottom), (2560, 4479, 1079));
+        assert_eq!(m[0].desktop_scale_factor, Some(150));
+        assert_eq!(m[1].physical_width_mm, None);
+        assert!(client_monitors(None, Some(&ext)).is_empty());
+        assert_eq!(client_monitors(Some(&data), None)[0].desktop_scale_factor, None);
     }
 }

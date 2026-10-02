@@ -156,7 +156,7 @@ impl ConnectionHandler for NegotiationHandler {
         self.advert.new_connection.store(true, Ordering::Release);
 
         // Log display info
-        tracing::info!(target: "macrdp::negotiator", width = info.desktop_width, height = info.desktop_height, scale = info.desktop_scale_factor.unwrap_or(0), "display info recorded");
+        tracing::info!(target: "macrdp::negotiator", width = info.desktop_width, height = info.desktop_height, scale = info.desktop_scale_factor.unwrap_or(0), monitors = ?info.monitors, "display info recorded");
     }
 }
 

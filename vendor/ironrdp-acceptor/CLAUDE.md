@@ -199,3 +199,9 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     (4), carried across `new_deactivation_reactivation`, and exposed as
     `AcceptorResult::client_display`. Input for the fork's Session Negotiator (scale-aware
     display sizing). Pure addition; no behavior change.
+
+(6) Client monitors (MacRemoteDesktop fork, 2026-10-02; Phase 4a multi-monitor).
+`ClientDisplayInfo.monitors` carries the client's monitors from GCC Client
+Monitor Data paired by index with Client Monitor Extended Data
+(`client_monitors`, unit-tested). Rectangles stay inclusive, as on the wire.
+Empty when the client sends no monitor block.
