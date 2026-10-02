@@ -4,7 +4,7 @@
 use super::*;
 
 #[derive(Parser, Debug)]
-#[command(name = "portico", about = "Portico: native RDP server for macOS")]
+#[command(name = "viga", about = "Viga: native RDP server for macOS")]
 pub(super) struct Args {
     /// Address to bind. Defaults to loopback only — pass `0.0.0.0:3390`
     /// explicitly to accept LAN connections. Port 3389 (the standard RDP
@@ -69,16 +69,16 @@ pub(super) struct Args {
     pub(super) skip_auth: bool,
 
     /// Read the password from the macOS Keychain instead of prompting.
-    /// Expects a generic-password entry: service `portico`, account = the
+    /// Expects a generic-password entry: service `viga`, account = the
     /// resolved username. Create it once with:
-    ///   security add-generic-password -s portico -a $USER -w
+    ///   security add-generic-password -s viga -a $USER -w
     /// Lets launchd start macrdp without an interactive terminal.
     #[arg(long)]
     pub(super) keychain: bool,
 
     /// Directory holding cert.pem / key.pem. Generated on first run and
     /// reused thereafter so clients see a stable fingerprint across restarts.
-    /// Defaults to ~/Library/Application Support/Portico.
+    /// Defaults to ~/Library/Application Support/Viga.
     #[arg(long)]
     pub(super) cert_dir: Option<PathBuf>,
 
@@ -96,7 +96,7 @@ pub(super) struct Args {
     #[arg(long)]
     pub(super) key: Option<PathBuf>,
 
-    /// Directory for the rotating log file (`portico.log`, size-bounded via
+    /// Directory for the rotating log file (`viga.log`, size-bounded via
     /// MACRDP_LOG_MAX_BYTES / MACRDP_LOG_MAX_FILES). If unset, logs go to a
     /// rotating file in ~/Library/Logs when running headless (stdout is not a
     /// TTY, e.g. under the LaunchAgent) and to stdout when interactive.
@@ -109,7 +109,7 @@ pub(super) struct Args {
     /// and forward. Off by default; the human-readable audit lines still appear in
     /// the main log. The file self-rotates (MACRDP_AUDIT_LOG_MAX_BYTES /
     /// MACRDP_AUDIT_LOG_MAX_FILES). Setting MACRDP_AUDIT_JSON=1 enables it at the
-    /// default path `<log-dir>/portico-audit.log` without naming a file here. See
+    /// default path `<log-dir>/viga-audit.log` without naming a file here. See
     /// docs/siem-forwarding.md. Config key: AUDIT_FILE.
     #[arg(long)]
     pub(super) audit_file: Option<PathBuf>,

@@ -1,4 +1,4 @@
-// macrdpdisplay: owns ONE virtual display for its whole life, driven by Portico over stdin.
+// macrdpdisplay: owns ONE virtual display for its whole life, driven by Viga over stdin.
 //
 //   create <serial> <pixW> <pixH> <scale 1|2>  -> ok <id> <ptW> <ptH> <pixW> <pixH> | err <msg>
 //   mode <pixW> <pixH> <scale 1|2>             -> same, or "err needs-replace"
@@ -42,7 +42,7 @@
 static const unsigned kVendor = 0x6D616372, kProduct = 0x6D616372;
 
 static CGVirtualDisplay *gDisplay;
-static NSString *gName = @"Portico";
+static NSString *gName = @"Viga";
 static unsigned gSerial;
 static int gLockFd = -1;
 // Set once a mode was selected explicitly; that freezes the mode list, so later re-modes
@@ -180,7 +180,7 @@ static void lockAll(void) {
     char dir[1024];
     size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir);
     NSString *base = (n > 0 && n <= sizeof dir) ? @(dir) : NSTemporaryDirectory();
-    NSString *path = [base stringByAppendingPathComponent:@"portico-displayhost.lock"];
+    NSString *path = [base stringByAppendingPathComponent:@"viga-displayhost.lock"];
     gLockFd = open(path.fileSystemRepresentation, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
   }
   if (gLockFd >= 0) flock(gLockFd, LOCK_EX);
@@ -287,7 +287,7 @@ static void destroy(void) {
 
 int main(int argc, char **argv) {
   @autoreleasepool {
-    // If Portico dies mid-reply, finish the command and still remove the display under the lock.
+    // If Viga dies mid-reply, finish the command and still remove the display under the lock.
     signal(SIGPIPE, SIG_IGN);
     if (argc > 1) gName = @(argv[1]);
     char line[256];

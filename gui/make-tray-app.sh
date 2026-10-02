@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build the Portico Controller menu-bar app: `swift build` the SwiftPM
-# executable, wrap it in PorticoController.app (LSUIElement, signed), install it.
+# Build the Viga Controller menu-bar app: `swift build` the SwiftPM
+# executable, wrap it in VigaController.app (LSUIElement, signed), install it.
 #
 # Env overrides:
 #   APP_DIR=/Applications              # install location (default /Applications)
@@ -11,7 +11,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GUI_DIR="$REPO_ROOT/gui"
 APP_DIR="${APP_DIR:-/Applications}"
 IDENTITY="${CODESIGN_IDENTITY:--}"
-APP_NAME="PorticoController.app"
+APP_NAME="VigaController.app"
 # MUST match the BUNDLE_PREFIX used by packaging/{make-app,install-launchagent}.sh.
 # The controller derives the server's LaunchAgent label by stripping ".controller"
 # from its own bundle id at runtime, so this prefix decides which agent it drives.
@@ -21,7 +21,7 @@ CONTROLLER_ID="$BUNDLE_PREFIX.portico.controller"
 VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
 [ -n "$VERSION" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
 
-echo "==> PorticoController v$VERSION  (id: $CONTROLLER_ID, identity: $IDENTITY, install: $APP_DIR)"
+echo "==> VigaController v$VERSION  (id: $CONTROLLER_ID, identity: $IDENTITY, install: $APP_DIR)"
 
 echo "==> swift build -c release"
 ( cd "$GUI_DIR" && swift build -c release )
@@ -38,8 +38,8 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>Portico Controller</string>
-    <key>CFBundleDisplayName</key><string>Portico Controller</string>
+    <key>CFBundleName</key><string>Viga Controller</string>
+    <key>CFBundleDisplayName</key><string>Viga Controller</string>
     <key>CFBundleIdentifier</key><string>$CONTROLLER_ID</string>
     <key>CFBundleExecutable</key><string>macrdptray</string>
     <key>CFBundlePackageType</key><string>APPL</string>

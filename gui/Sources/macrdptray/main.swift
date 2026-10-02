@@ -29,11 +29,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var service: String { "gui/\(uid)/\(label)" }
 
     var home: URL { FileManager.default.homeDirectoryForCurrentUser }
-    var configURL: URL { home.appendingPathComponent("Library/Application Support/Portico/config.env") }
-    var logURL: URL { home.appendingPathComponent("Library/Logs/portico.log") }
+    var configURL: URL { home.appendingPathComponent("Library/Application Support/Viga/config.env") }
+    var logURL: URL { home.appendingPathComponent("Library/Logs/viga.log") }
     // The server owns + rotates macrdp.log itself; stderr (panics, pre-logging
     // startup errors) goes to a small separate file.
-    var errLogURL: URL { home.appendingPathComponent("Library/Logs/portico.err.log") }
+    var errLogURL: URL { home.appendingPathComponent("Library/Logs/viga.err.log") }
     var plistURL: URL { home.appendingPathComponent("Library/LaunchAgents/\(label).plist") }
 
     var timer: Timer?
@@ -45,7 +45,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory) // menu-bar only, no Dock icon
         installMainMenu() // so the Settings window's text fields get edit shortcuts
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "Portico")
+            button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "Viga")
             button.image?.isTemplate = true
         }
         let menu = NSMenu()
@@ -80,8 +80,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // glanceable without opening the menu.
         statusItem.button?.alphaValue = running ? 1.0 : 0.4
         statusItem.button?.toolTip = running
-            ? "Portico: running (pid \(st.pid!))"
-            : (st.loaded ? "Portico: stopped" : "Portico: not installed")
+            ? "Viga: running (pid \(st.pid!))"
+            : (st.loaded ? "Viga: stopped" : "Viga: not installed")
     }
 
     // MARK: - Server status (parsed from the log)
@@ -135,9 +135,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let st = agentState()
         let header: String
-        if !st.loaded { header = "Portico — not installed" }
-        else if let pid = st.pid { header = "Portico — running (pid \(pid))" }
-        else { header = "Portico — stopped" }
+        if !st.loaded { header = "Viga — not installed" }
+        else if let pid = st.pid { header = "Viga — running (pid \(pid))" }
+        else { header = "Viga — stopped" }
         let h = NSMenuItem(title: header, action: nil, keyEquivalent: "")
         h.isEnabled = false
         menu.addItem(h)
@@ -151,7 +151,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         // Show the tabbed Settings window (where all the config options now live).
-        menu.addItem(item("Show Portico…", #selector(showSettings)))
+        menu.addItem(item("Show Viga…", #selector(showSettings)))
         menu.addItem(.separator())
 
         let running = st.pid != nil
@@ -179,8 +179,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Self-install on first run: locate the server app, onboard the Keychain
         // password, write + register the LaunchAgent — no Terminal step needed.
         guard let serverApp = locateServerApp() else {
-            alert(style: .warning, "Can't find Portico.app",
-                  "Move both Portico.app and Portico Controller into /Applications "
+            alert(style: .warning, "Can't find Viga.app",
+                  "Move both Viga.app and Viga Controller into /Applications "
                   + "(or ~/Applications), then click Start again.")
             return
         }
@@ -234,7 +234,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         guard let serverApp = locateServerApp() else {
             FileHandle.standardError.write(Data(
-                "error: Portico.app not found next to the controller or in /Applications\n".utf8))
+                "error: Viga.app not found next to the controller or in /Applications\n".utf8))
             return 1
         }
         ensureConfigExists()
@@ -244,7 +244,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         print("installed: \(plistURL.path) -> \(serverApp.path)")
         if !hasKeychainPassword() {
             print("note: Keychain password not set — store it with:")
-            print("  security add-generic-password -U -s portico -a \(NSUserName()) -w '<password>'")
+            print("  security add-generic-password -U -s viga -a \(NSUserName()) -w '<password>'")
         }
         return 0
     }
@@ -256,13 +256,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// install locations.
     func locateServerApp() -> URL? {
         let candidates = [
-            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("Portico.app"),
-            URL(fileURLWithPath: "/Applications/Portico.app"),
-            home.appendingPathComponent("Applications/Portico.app"),
+            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("Viga.app"),
+            URL(fileURLWithPath: "/Applications/Viga.app"),
+            home.appendingPathComponent("Applications/Viga.app"),
         ]
         let fm = FileManager.default
         return candidates.first {
-            fm.fileExists(atPath: $0.appendingPathComponent("Contents/MacOS/portico").path)
+            fm.fileExists(atPath: $0.appendingPathComponent("Contents/MacOS/viga").path)
         }
     }
 
@@ -272,7 +272,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// the signed Mach-O — not an unsigned wrapper script — gives macOS
     /// Background Task Management a stable identity to approve once.
     func installLaunchAgent(serverApp: URL) {
-        let bin = serverApp.appendingPathComponent("Contents/MacOS/portico").path
+        let bin = serverApp.appendingPathComponent("Contents/MacOS/viga").path
         let dict: [String: Any] = [
             "Label": label,
             "ProgramArguments": [bin, "--config", configURL.path],
@@ -301,14 +301,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Keychain via the `security` CLI, so we write it the same way — keeping the
     /// item's access context as /usr/bin/security so no read-time prompt appears.
     func hasKeychainPassword() -> Bool {
-        run("/usr/bin/security", ["find-generic-password", "-s", "portico", "-a", NSUserName()]).code == 0
+        run("/usr/bin/security", ["find-generic-password", "-s", "viga", "-a", NSUserName()]).code == 0
     }
 
     @discardableResult
     func promptAndStorePassword() -> Bool {
         let a = NSAlert()
         a.messageText = "Enter your macOS account password"
-        a.informativeText = "Portico authenticates RDP clients against your Mac account and "
+        a.informativeText = "Viga authenticates RDP clients against your Mac account and "
             + "starts headless via launchd, so the password is stored in your login Keychain. "
             + "It never leaves this Mac."
         a.addButton(withTitle: "Save")
@@ -320,7 +320,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         guard a.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return false }
         let r = run("/usr/bin/security",
-                    ["add-generic-password", "-U", "-s", "portico", "-a", NSUserName(),
+                    ["add-generic-password", "-U", "-s", "viga", "-a", NSUserName(),
                      "-w", field.stringValue])
         if r.code != 0 {
             alert(style: .critical, "Couldn't save password", "Keychain returned an error.")
@@ -333,9 +333,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func remindPermissions() {
         let a = NSAlert()
-        a.messageText = "Grant Portico two permissions"
-        a.informativeText = "Portico needs Screen Recording (to share the display) and "
-            + "Accessibility (to forward keyboard/mouse). Enable Portico.app in System "
+        a.messageText = "Grant Viga two permissions"
+        a.informativeText = "Viga needs Screen Recording (to share the display) and "
+            + "Accessibility (to forward keyboard/mouse). Enable Viga.app in System "
             + "Settings → Privacy & Security, then it'll work."
         a.addButton(withTitle: "Open Privacy Settings")
         a.addButton(withTitle: "Later")
@@ -444,13 +444,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             _ = a.runModal()
         }
         guard let app = locateServerApp() else {
-            say("Portico.app not found", "Install Portico.app first, then run this again.")
+            say("Viga.app not found", "Install Viga.app first, then run this again.")
             return
         }
         let installer = app.appendingPathComponent("Contents/Resources/install-ifd-handler.sh").path
         guard FileManager.default.fileExists(atPath: installer) else {
             say("Installer not found",
-                "This Portico.app build doesn't bundle the smart-card handler installer.")
+                "This Viga.app build doesn't bundle the smart-card handler installer.")
             return
         }
         var env: [String: String] = [:]

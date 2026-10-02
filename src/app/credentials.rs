@@ -4,15 +4,14 @@
 
 use super::*;
 
-/// Shell out to `security find-generic-password -s portico -a <user> -w`,
-/// which prints the password on stdout. Falls back to the upstream service
-/// name `macrdp`, so an entry stored before the rename keeps working. The
+/// Shell out to `security find-generic-password -s viga -a <user> -w`,
+/// which prints the password on stdout. Falls back to the services of earlier
+/// product names, so an entry stored before a rename keeps working. The
 /// Keychain entry has to be created out-of-band; this never prompts the user
 /// interactively. The tool is named by absolute path so a `security` earlier
 /// on `PATH` cannot stand in for it (and the Keychain ACL is tied to
 /// `/usr/bin/security` anyway, see docs/macos-gotchas.md).
 pub(super) fn read_password_from_keychain(username: &str) -> Result<Zeroizing<String>> {
-    const LEGACY_SERVICE: &str = "macrdp";
     let lookup = |service: &str| {
         std::process::Command::new("/usr/bin/security")
             .args(["find-generic-password", "-s", service, "-a", username, "-w"])
@@ -20,8 +19,11 @@ pub(super) fn read_password_from_keychain(username: &str) -> Result<Zeroizing<St
             .context("invoke security(1)")
     };
     let mut out = lookup(crate::brand::ID)?;
-    if !out.status.success() {
-        out = lookup(LEGACY_SERVICE)?;
+    for legacy in crate::brand::LEGACY_KEYCHAIN_SERVICES {
+        if out.status.success() {
+            break;
+        }
+        out = lookup(legacy)?;
     }
     if !out.status.success() {
         return Err(anyhow!(
@@ -38,7 +40,7 @@ pub(super) fn read_password_from_keychain(username: &str) -> Result<Zeroizing<St
         s.pop();
     }
     if s.is_empty() {
-        return Err(anyhow!("keychain entry for macrdp is empty"));
+        return Err(anyhow!("keychain entry is empty"));
     }
     Ok(s)
 }

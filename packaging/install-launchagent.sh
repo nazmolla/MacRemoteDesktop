@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install + (re)load the Portico LaunchAgent for the current user.
+# Install + (re)load the Viga LaunchAgent for the current user.
 #
 # Seeds ~/Library/Application Support/macrdp/config.env from the example on
 # first run, renders the LaunchAgent plist from the template, and bootstraps it.
@@ -14,10 +14,11 @@ APP_DIR="${APP_DIR:-/Applications}"
 # MUST match the BUNDLE_PREFIX used by make-app.sh (and gui/make-tray-app.sh),
 # or the controller targets a different label than the agent installed here.
 # Product name and lower-case id; keep in step with src/brand.rs and make-app.sh.
-PRODUCT="${PRODUCT:-Portico}"
-PRODUCT_ID="${PRODUCT_ID:-portico}"
+PRODUCT="${PRODUCT:-Viga}"
+PRODUCT_ID="${PRODUCT_ID:-viga}"
 BUNDLE_PREFIX="${BUNDLE_PREFIX:-ca.nazmi}"
-LABEL="$BUNDLE_PREFIX.$PRODUCT_ID"
+# Same id as the app bundle (see make-app.sh), kept from the Portico name.
+LABEL="${LABEL:-$BUNDLE_PREFIX.portico}"
 UID_NUM="$(id -u)"
 
 APP="$APP_DIR/$PRODUCT.app"

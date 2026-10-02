@@ -2088,7 +2088,7 @@ mod stub {
 /// ```text
 /// for t in display_colorspace_is_srgb one_x_plan_is_one_to_one retina_plan_gets_2x_backing \
 ///          select_mode_verifies_and_falls_back resizes_keep_working_after_a_fallback; do
-///   cargo test --bin portico virtual_display::planned_tests::$t -- --ignored --exact; sleep 3
+///   cargo test --bin viga virtual_display::planned_tests::$t -- --ignored --exact; sleep 3
 /// done
 /// ```
 #[cfg(all(test, target_os = "macos"))]

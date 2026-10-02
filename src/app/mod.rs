@@ -186,9 +186,9 @@ pub(crate) async fn run() -> Result<()> {
         ensure_screen_recording_access();
         if !ensure_accessibility_access() {
             warn!(
-                "Accessibility permission NOT granted. Portico will appear in \
+                "Accessibility permission NOT granted. Viga will appear in \
                  System Settings → Privacy & Security → Accessibility. Enable \
-                 it, then RESTART Portico. Without it, keyboard/mouse input \
+                 it, then RESTART Viga. Without it, keyboard/mouse input \
                  from RDP clients is silently dropped."
             );
         } else {
@@ -690,7 +690,7 @@ pub(crate) async fn run() -> Result<()> {
     info!(
         addr = %args.bind,
         user = %username,
-        "Portico listening — connect with: mstsc / xfreerdp at port {} as {}",
+        "Viga listening — connect with: mstsc / xfreerdp at port {} as {}",
         args.bind.port(),
         username,
     );

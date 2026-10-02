@@ -1,4 +1,4 @@
-// Builds the Portico app icon from a square render of the squircle artwork.
+// Builds the Viga app icon from a square render of the squircle artwork.
 //
 //   swift branding/make-icon.swift <render.png> <out-dir>
 //
@@ -6,7 +6,7 @@
 // masks it with a continuous-corner rounded square, places it on Apple's macOS
 // icon grid (body 824/1024 of the canvas, centred, soft drop shadow) and writes
 // 16-bit-per-channel Display P3 PNGs for every size in an .iconset, plus a
-// 1024 px master. Run `iconutil -c icns <out-dir>/Portico.iconset` afterwards.
+// 1024 px master. Run `iconutil -c icns <out-dir>/Viga.iconset` afterwards.
 import AppKit
 import CoreGraphics
 import ImageIO
@@ -85,9 +85,9 @@ func writePNG(_ img: CGImage, _ url: URL) {
     guard CGImageDestinationFinalize(dest) else { fatalError("cannot write \(url.path)") }
 }
 
-let iconset = outDir.appendingPathComponent("Portico.iconset")
+let iconset = outDir.appendingPathComponent("Viga.iconset")
 try? FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
-writePNG(render(size: 1024), outDir.appendingPathComponent("portico-icon-1024.png"))
+writePNG(render(size: 1024), outDir.appendingPathComponent("viga-icon-1024.png"))
 for base in [16, 32, 128, 256, 512] {
     writePNG(render(size: base), iconset.appendingPathComponent("icon_\(base)x\(base).png"))
     writePNG(render(size: base * 2), iconset.appendingPathComponent("icon_\(base)x\(base)@2x.png"))

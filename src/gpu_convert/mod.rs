@@ -2,7 +2,7 @@
 //!
 //! The Metal kernel in `gpu_convert.m` ports `bgra_to_nv12_full_range`
 //! (src/videotoolbox.rs) exactly, so the colour result is unchanged; it only
-//! moves the per-frame conversion, Portico's main CPU cost, off the CPU.
+//! moves the per-frame conversion, Viga's main CPU cost, off the CPU.
 //! Best effort: any failure returns `false` and the caller converts on the
 //! CPU. `MACRDP_GPU_CONVERT=0` turns it off.
 

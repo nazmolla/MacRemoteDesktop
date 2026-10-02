@@ -98,7 +98,7 @@ static void setup(void) {
     gQueue = [gDevice newCommandQueue];
     if (!gPipeline || !gTexPipeline || !gQueue ||
         CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, gDevice, NULL, &gCache) != kCVReturnSuccess) {
-        if (err) NSLog(@"portico gpu_convert: %@", err);
+        if (err) NSLog(@"viga gpu_convert: %@", err);
         gReady = -1;
         return;
     }

@@ -201,9 +201,9 @@ pub(super) fn ensure_screen_recording_access() {
         return;
     }
     warn!(
-        "Screen Recording permission NOT granted. Portico will appear in \
+        "Screen Recording permission NOT granted. Viga will appear in \
          System Settings → Privacy & Security → Screen Recording. Enable it, \
-         then RESTART Portico (TCC grants only take effect on next launch)."
+         then RESTART Viga (TCC grants only take effect on next launch)."
     );
     // request() registers the binary with TCC and opens the prompt; the
     // returned bool reflects current state, which is still false on first run.

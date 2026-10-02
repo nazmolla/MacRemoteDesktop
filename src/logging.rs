@@ -2,21 +2,21 @@
 //!
 //! By default macrdp writes tracing to **stdout** (great for `cargo run`). Under
 //! the LaunchAgent there is no terminal, so we instead write to a **self-owned,
-//! size-bounded rotating file** at `~/Library/Logs/portico.log` — without it the
+//! size-bounded rotating file** at `~/Library/Logs/viga.log` — without it the
 //! launchd-redirected log grew unbounded. The live file keeps the **stable name**
-//! `portico.log` (the GUI controller reads that exact path and detects crashes by
-//! the substring `"panicked"`), rotating logrotate-style to `portico.log.1`, `.2`,
+//! `viga.log` (the GUI controller reads that exact path and detects crashes by
+//! the substring `"panicked"`), rotating logrotate-style to `viga.log.1`, `.2`,
 //! … up to `max_files`, dropping the oldest.
 //!
 //! Why a custom rotator and not `tracing-appender`: its `RollingFileAppender`
-//! only does **time/date-suffixed** files (`portico.log.2026-06-30`), which breaks
+//! only does **time/date-suffixed** files (`viga.log.2026-06-30`), which breaks
 //! the stable-name contract above, and its `non_blocking` writer was tried for
 //! macrdp before and reverted. This writer is **blocking** and **size-based**.
 //!
 //! Sink selection (see [`init`]): an explicit `--log-dir` always wins; otherwise
 //! we log to a file when stdout is **not** a TTY (the headless/launchd case) and
 //! to stdout when it is (interactive). On the file path we also install a panic
-//! hook so Rust's panic message lands in `portico.log` (preserving the GUI's crash
+//! hook so Rust's panic message lands in `viga.log` (preserving the GUI's crash
 //! detection now that stderr no longer goes to that file).
 
 use std::fs::{File, OpenOptions};
@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
-/// The stable live-log filename. Archives are `portico.log.1`, `.2`, …
-const BASE: &str = "portico.log";
+/// The stable live-log filename. Archives are `viga.log.1`, `.2`, …
+const BASE: &str = "viga.log";
 
 const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
 const DEFAULT_MAX_FILES: usize = 5;
@@ -176,9 +176,9 @@ fn make_file_writer(dir: &Path) -> Option<RotatingWriter> {
 
 /// Split an audit-file path into `(parent_dir, filename)`, defaulting a bare
 /// filename to the current dir and a **directory** target (an existing dir, or a
-/// path written with a trailing separator) to `<dir>/portico-audit.log`.
+/// path written with a trailing separator) to `<dir>/viga-audit.log`.
 fn split_audit_path(path: &Path) -> (PathBuf, String) {
-    const DEFAULT: &str = "portico-audit.log";
+    const DEFAULT: &str = "viga-audit.log";
     // Treat the whole path as a directory when it's an existing dir or was written
     // with a trailing separator (e.g. `/var/log/`) — otherwise `file_name()` would
     // pick the last component (`log`) and write `/var/log/log`.
@@ -234,7 +234,7 @@ fn default_log_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs"))
 }
 
-/// Route Rust panics through tracing so the message reaches `portico.log` (its
+/// Route Rust panics through tracing so the message reaches `viga.log` (its
 /// `Display` contains `"panicked at"`, which the GUI scans for), then chain the
 /// previous hook. **Observability only** — does NOT run cleanup (a panicking
 /// tokio task unwinds without killing the process; teardown is the startup
@@ -268,7 +268,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// (`std::sync::Mutex` is non-reentrant) — errors are reported via `eprintln!`.
 struct Rotator {
     dir: PathBuf,
-    /// The live filename (e.g. `portico.log` or `portico-audit.log`); archives are
+    /// The live filename (e.g. `viga.log` or `viga-audit.log`); archives are
     /// `<base>.1`, `.2`, … . Parameterized so the same rotation code backs both
     /// the operational log and the dedicated JSON audit stream.
     base: String,
@@ -349,7 +349,7 @@ impl Write for Rotator {
 pub struct RotatingWriter(Arc<Mutex<Rotator>>);
 
 impl RotatingWriter {
-    /// Open `dir/portico.log` (append), reading `MACRDP_LOG_MAX_BYTES`
+    /// Open `dir/viga.log` (append), reading `MACRDP_LOG_MAX_BYTES`
     /// (default 10 MiB) and `MACRDP_LOG_MAX_FILES` (default 5).
     pub fn new(dir: &Path) -> io::Result<Self> {
         let max_bytes = env_u64("MACRDP_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
@@ -358,7 +358,7 @@ impl RotatingWriter {
     }
 
     /// Open `dir/<base>` (append) with explicit rotation limits — used for the
-    /// dedicated JSON audit stream (`portico-audit.log`), independent of the
+    /// dedicated JSON audit stream (`viga-audit.log`), independent of the
     /// operational log's size/count knobs.
     pub fn with_base(
         dir: &Path,
@@ -432,12 +432,12 @@ mod tests {
         let mut r = Rotator::open(dir.clone(), BASE.to_string(), 100, 5).unwrap();
         // Two ~80-byte writes: the first fits, the second crosses 100 → rotates.
         r.write_all(&[b'a'; 80]).unwrap();
-        assert!(!dir.join("portico.log.1").exists());
+        assert!(!dir.join("viga.log.1").exists());
         r.write_all(&[b'b'; 80]).unwrap();
         r.flush().unwrap();
-        assert!(dir.join("portico.log.1").exists(), "archive should exist");
+        assert!(dir.join("viga.log.1").exists(), "archive should exist");
         // The live file now holds only the second write.
-        let live = std::fs::read(dir.join("portico.log")).unwrap();
+        let live = std::fs::read(dir.join("viga.log")).unwrap();
         assert_eq!(live.len(), 80);
         assert_eq!(live[0], b'b');
         let _ = std::fs::remove_dir_all(&dir);
@@ -453,11 +453,11 @@ mod tests {
             r.write_all(&[b'x'; 60]).unwrap();
         }
         r.flush().unwrap();
-        assert!(dir.join("portico.log").exists());
-        assert!(dir.join("portico.log.1").exists());
-        assert!(dir.join("portico.log.2").exists());
+        assert!(dir.join("viga.log").exists());
+        assert!(dir.join("viga.log.1").exists());
+        assert!(dir.join("viga.log.2").exists());
         assert!(
-            !dir.join(format!("portico.log.{}", max_files + 1)).exists(),
+            !dir.join(format!("viga.log.{}", max_files + 1)).exists(),
             "must not keep more than max_files archives"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn appends_and_seeds_counter_on_open() {
         let dir = unique_dir("seed");
-        std::fs::write(dir.join("portico.log"), b"preexisting-content").unwrap();
+        std::fs::write(dir.join("viga.log"), b"preexisting-content").unwrap();
         let r = Rotator::open(dir.clone(), BASE.to_string(), 1024, 5).unwrap();
         assert_eq!(r.written, "preexisting-content".len() as u64);
         let _ = std::fs::remove_dir_all(&dir);
@@ -488,16 +488,16 @@ mod tests {
     #[test]
     fn custom_base_rotates_under_its_own_name() {
         let dir = unique_dir("audit-base");
-        let mut r = Rotator::open(dir.clone(), "portico-audit.log".to_string(), 100, 5).unwrap();
+        let mut r = Rotator::open(dir.clone(), "viga-audit.log".to_string(), 100, 5).unwrap();
         r.write_all(&[b'a'; 80]).unwrap();
         r.write_all(&[b'b'; 80]).unwrap(); // crosses 100 → rotates
         r.flush().unwrap();
         assert!(
-            dir.join("portico-audit.log.1").exists(),
+            dir.join("viga-audit.log.1").exists(),
             "archives under base"
         );
         assert!(
-            !dir.join("portico.log").exists(),
+            !dir.join("viga.log").exists(),
             "must not touch the main-log name"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -505,9 +505,9 @@ mod tests {
 
     #[test]
     fn split_audit_path_variants() {
-        let (d, b) = split_audit_path(Path::new("/var/log/portico-audit.log"));
+        let (d, b) = split_audit_path(Path::new("/var/log/viga-audit.log"));
         assert_eq!(d, PathBuf::from("/var/log"));
-        assert_eq!(b, "portico-audit.log");
+        assert_eq!(b, "viga-audit.log");
         // Bare filename → current dir.
         let (d, b) = split_audit_path(Path::new("audit.log"));
         assert_eq!(d, PathBuf::from("."));
@@ -515,7 +515,7 @@ mod tests {
         // Trailing-separator directory → default filename inside it (not `/var/log/log`).
         let (d, b) = split_audit_path(Path::new("/var/log/"));
         assert_eq!(d, PathBuf::from("/var/log/"));
-        assert_eq!(b, "portico-audit.log");
+        assert_eq!(b, "viga-audit.log");
     }
 
     /// The load-bearing guarantee: the audit JSON sink receives `macrdp::audit`

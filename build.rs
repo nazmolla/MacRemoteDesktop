@@ -29,7 +29,7 @@ fn main() {
     cc::Build::new()
         .file("src/gpu_convert/gpu_convert.m")
         .flag("-fobjc-arc")
-        .compile("portico_gpu_convert");
+        .compile("viga_gpu_convert");
     println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-link-lib=framework=CoreVideo");
     println!("cargo:rustc-link-lib=framework=Foundation");

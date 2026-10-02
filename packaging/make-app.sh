@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the app bundle ($PRODUCT.app, default Portico.app) — a stably-signed bundle with the binary as a co-signed
+# Build the app bundle ($PRODUCT.app, default Viga.app) — a stably-signed bundle with the binary as a co-signed
 # helper at a fixed path, so the Screen Recording / Accessibility TCC grants
 # survive rebuilds. Designed for personal use, but the bundle layout is also
 # the foundation a future menu-bar GUI controller would spawn.
@@ -34,10 +34,12 @@ fi
 # install-launchagent.sh and gui/make-tray-app.sh use, or the controller will
 # target the wrong LaunchAgent label.
 # Product name and lower-case id; keep in step with src/brand.rs.
-PRODUCT="${PRODUCT:-Portico}"
-PRODUCT_ID="${PRODUCT_ID:-portico}"
+PRODUCT="${PRODUCT:-Viga}"
+PRODUCT_ID="${PRODUCT_ID:-viga}"
 BUNDLE_PREFIX="${BUNDLE_PREFIX:-ca.nazmi}"
-BUNDLE_ID="$BUNDLE_PREFIX.$PRODUCT_ID"
+# Kept from the Portico name: macOS keys the Screen Recording and Accessibility
+# grants to the bundle id, so changing it revokes them on existing installs.
+BUNDLE_ID="${BUNDLE_ID:-$BUNDLE_PREFIX.portico}"
 
 VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
 [ -n "$VERSION" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
