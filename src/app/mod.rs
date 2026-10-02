@@ -60,6 +60,24 @@ pub(crate) use helpers::boost_thread_qos;
 /// Resolve the configuration, set up the displays, helpers and channels,
 /// then run the RDP server until it stops.
 pub(crate) async fn run() -> Result<()> {
+    // Multi-session spike: report this process's Screen Recording and
+    // Accessibility grants in whatever login session launchd started it in.
+    #[cfg(target_os = "macos")]
+    if crate::tunables::truthy("MACRDP_SESSION_PROBE") {
+        #[link(name = "ApplicationServices", kind = "framework")]
+        extern "C" {
+            fn AXIsProcessTrusted() -> bool;
+        }
+        let screen = core_graphics::access::ScreenCaptureAccess.preflight();
+        // SAFETY: AXIsProcessTrusted takes no arguments and only reads TCC state.
+        let ax = unsafe { AXIsProcessTrusted() };
+        println!(
+            "{{\"uid\":{},\"screen_recording\":{screen},\"accessibility\":{ax}}}",
+            // SAFETY: getuid has no preconditions and cannot fail.
+            unsafe { libc::getuid() }
+        );
+        std::process::exit(0);
+    }
     let (mut args, negotiation_reasons) = args::resolve()?;
 
     // Research spike (Phase-1b USB-redirection go/no-go): run the UserHCI probe
