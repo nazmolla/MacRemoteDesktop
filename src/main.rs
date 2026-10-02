@@ -19,6 +19,7 @@ mod avc444;
 mod brand;
 mod camera;
 mod capture;
+mod capture_extra;
 mod clipboard;
 mod clipboard_rich;
 #[cfg(test)]
@@ -46,6 +47,7 @@ mod input;
 mod keyboard_layout;
 mod lock_activity;
 mod logging;
+mod multimon;
 #[allow(dead_code)]
 mod lossless;
 mod multitransport;

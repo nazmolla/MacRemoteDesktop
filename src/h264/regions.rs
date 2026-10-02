@@ -75,7 +75,7 @@ pub(super) fn avc_regions(
     let Some(rects) = rects.filter(|r| !r.is_empty()) else {
         return full();
     };
-    let clipped: Vec<(u32, u32, u32, u32)> = rects
+    let mut clipped: Vec<(u32, u32, u32, u32)> = rects
         .iter()
         .filter(|r| r.w > 0 && r.h > 0 && r.x < w && r.y < h)
         .map(|r| (r.x, r.y, (r.x + r.w).min(w) - 1, (r.y + r.h).min(h) - 1))
@@ -83,6 +83,9 @@ pub(super) fn avc_regions(
     if clipped.is_empty() {
         return full();
     }
+    // Clients reject a frame whose regions overlap (FreeRDP aborts the decode),
+    // and ScreenCaptureKit's dirty rects can overlap: merge overlaps into their union.
+    merge_overlaps(&mut clipped);
     if clipped.len() > MAX_AVC_REGIONS {
         let l = clipped.iter().map(|c| c.0).min().unwrap_or(0);
         let t = clipped.iter().map(|c| c.1).min().unwrap_or(0);
@@ -94,6 +97,26 @@ pub(super) fn avc_regions(
         .into_iter()
         .map(|(l, t, r, b)| region(l, t, r, b))
         .collect()
+}
+
+/// Replace overlapping inclusive rects `(l, t, r, b)` by their union until none overlap.
+fn merge_overlaps(rects: &mut Vec<(u32, u32, u32, u32)>) {
+    let overlap = |a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)| {
+        a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
+    };
+    'again: loop {
+        for i in 0..rects.len() {
+            for j in i + 1..rects.len() {
+                if overlap(rects[i], rects[j]) {
+                    let b = rects.swap_remove(j);
+                    let a = &mut rects[i];
+                    *a = (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3));
+                    continue 'again;
+                }
+            }
+        }
+        return;
+    }
 }
 
 #[cfg(test)]
@@ -142,5 +165,19 @@ mod avc_region_tests {
             (v.len(), v[0].left, v[0].top, v[0].right, v[0].bottom),
             (1, 0, 0, 194, 23)
         );
+    }
+
+    #[test]
+    fn overlapping_rects_are_merged() {
+        let r = |x, y, w, h| Rect { x, y, w, h };
+        let v = avc_regions(
+            Some(&[r(0, 0, 100, 100), r(50, 50, 100, 100), r(500, 500, 10, 10)]),
+            1920,
+            1080,
+        );
+        assert_eq!(v.len(), 2);
+        assert!(v.iter().any(|g| (g.left, g.top, g.right, g.bottom) == (0, 0, 149, 149)));
+        let touching = avc_regions(Some(&[r(0, 0, 10, 10), r(10, 0, 10, 10)]), 1920, 1080);
+        assert_eq!(touching.len(), 2);
     }
 }

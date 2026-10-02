@@ -75,6 +75,7 @@ use crate::videotoolbox::{EncodedFrame, Encoder};
 mod annexb;
 mod blank;
 mod congestion;
+mod lanes;
 mod regions;
 pub(crate) mod sps;
 mod udp_watchdog;
@@ -234,6 +235,8 @@ struct ConnectionContext {
     /// a main + auxiliary H.264 pair and shipped with `send_avc444_frame`.
     avc444: bool,
     avc444_buf: Avc444Buffers,
+    /// Extra-monitor pipelines (Phase 4a), indexed like the extra displays.
+    lanes: Vec<Option<lanes::Lane>>,
     /// Regions for frames submitted but not yet shipped, keyed by encoder PTS.
     /// `None` = whole surface.
     region_queue: std::collections::VecDeque<(i64, Option<Vec<crate::refine::Rect>>)>,
@@ -1672,9 +1675,15 @@ impl Gfx {
         // Read the live session size once and pin it for this connection's
         // surface + encoder + ship-side regions.
         let (width, height) = self.desktop_size.get();
+        // Multi-monitor: the primary surface covers only the primary monitor;
+        // RESET_GRAPHICS announces the whole desktop with every monitor.
+        let layout = crate::multimon::current();
+        let (out_w, out_h) = layout.as_ref().map_or((width, height), |l| l.union);
+        let (width, height) = layout.as_ref().map_or((width, height), |l| l.monitors[0].size);
+        let origin = layout.as_ref().map_or((0, 0), |l| l.monitors[0].origin);
         if ctx.surface_id.is_none() {
             ctx.dims = (width, height);
-            server.set_output_dimensions(width, height);
+            server.set_output_dimensions(out_w, out_h);
             // Emit RESET_GRAPHICS with an explicit single-monitor layout
             // covering the full desktop, BEFORE create_surface. The auto-reset
             // path inside create_surface sends an EMPTY monitor array; mstsc
@@ -1684,14 +1693,28 @@ impl Gfx {
             // + acked surface has nowhere to composite and the screen stays
             // blank. resize_with_monitors sets reset_graphics_sent=true so the
             // empty-monitor reset never fires. (reconnect-blank fix 2026-05-20.)
-            let monitor = Monitor {
-                left: 0,
-                top: 0,
-                right: i32::from(width).saturating_sub(1),
-                bottom: i32::from(height).saturating_sub(1),
-                flags: MonitorFlags::PRIMARY,
+            let monitors: Vec<Monitor> = match layout.as_ref() {
+                Some(l) => l
+                    .monitors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| Monitor {
+                        left: m.origin.0 as i32,
+                        top: m.origin.1 as i32,
+                        right: (m.origin.0 + u32::from(m.size.0)) as i32 - 1,
+                        bottom: (m.origin.1 + u32::from(m.size.1)) as i32 - 1,
+                        flags: if i == 0 { MonitorFlags::PRIMARY } else { MonitorFlags::empty() },
+                    })
+                    .collect(),
+                None => vec![Monitor {
+                    left: 0,
+                    top: 0,
+                    right: i32::from(width).saturating_sub(1),
+                    bottom: i32::from(height).saturating_sub(1),
+                    flags: MonitorFlags::PRIMARY,
+                }],
             };
-            server.resize_with_monitors(width, height, vec![monitor]);
+            server.resize_with_monitors(out_w, out_h, monitors);
             // Create the surface with upstream's auto-allocated id. mstsc retains
             // EGFX surfaces by id for its whole process lifetime and no-ops a
             // CreateSurface for an id it already holds, so a reconnect to the
@@ -1705,7 +1728,7 @@ impl Gfx {
             let sid = server
                 .create_surface_with_format(width, height, PixelFormat::XRgb)
                 .ok_or_else(|| anyhow!("EGFX: create_surface failed (not ready?)"))?;
-            if !server.map_surface_to_output(sid, 0, 0) {
+            if !server.map_surface_to_output(sid, origin.0, origin.1) {
                 return Err(anyhow!("EGFX: map_surface_to_output failed"));
             }
             ctx.surface_id = Some(sid);
@@ -2427,6 +2450,7 @@ impl GfxServerFactory for Gfx {
         *lock_ctx(&self.ctx) = Some(ConnectionContext {
             avc444: false,
             avc444_buf: Avc444Buffers::default(),
+            lanes: Vec::new(),
             region_queue: std::collections::VecDeque::new(),
             last_regions: None,
             region_debt: RegionDebt::Full,

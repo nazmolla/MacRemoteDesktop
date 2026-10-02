@@ -1234,6 +1234,13 @@ mod macos {
             // offset is what makes CGEventPost route events to a non-primary
             // display (virtual or external) — the WindowServer dispatches by
             // which display contains the global coord.
+            // Multi-monitor: each client monitor is its own 1x Mac display.
+            if let Some(layout) = crate::multimon::current() {
+                let (m, lx, ly) = layout.locate(f64::from(x), f64::from(y));
+                let b = CGDisplay::new(m.display_id).bounds();
+                self.post_move(b.origin.x + lx, b.origin.y + ly);
+                return;
+            }
             let (ox, oy, sw, sh) = self.target_bounds();
             let (mx, my) =
                 super::map_client_to_display(x, y, desktop_w, desktop_h, sw, sh, letterbox);
