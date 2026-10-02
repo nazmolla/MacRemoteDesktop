@@ -1986,3 +1986,9 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
       env" (for example P2.3's `MACRDP_UDP_LOSSY_AUDIO_DUP`) now describe the application
       side; the variable names and defaults are unchanged for operators.
     A test in `src/tunables.rs` fails if any `std::env` read of a `MACRDP_*` name reappears.
+
+(27) Generic extra dynamic channels (MacRemoteDesktop fork, 2026-10-02).
+`DvcFactory` + `RdpServer::add_dvc_factory`: each installed factory builds one
+`DvcProcessor` per connection, attached after the built-in channels through
+`BoxedDvc`. `RawDvcMessage` sends already-encoded bytes. No factories ⇒ the
+channel set is byte-identical. First user: the client microphone (MS-RDPEAI).

@@ -685,6 +685,11 @@ pub(crate) async fn run() -> Result<()> {
         }
     }
 
+    // Client microphone (MS-RDPEAI). The sink logs until the virtual microphone lands.
+    server.add_dvc_factory(Box::new(crate::audin::AudinFactory::new(std::sync::Arc::new(
+        crate::audin::LogSink::default(),
+    ))));
+
     transport::provision_auto_reconnect(&mut server);
 
     // Held for the process lifetime (Drop aborts the listener task).

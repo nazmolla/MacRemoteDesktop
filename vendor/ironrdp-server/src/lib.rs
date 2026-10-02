@@ -22,6 +22,8 @@ mod helper;
 #[cfg(feature = "multitransport")]
 mod multitransport;
 mod rdcamera;
+mod dvc_factory;
+pub use dvc_factory::{DvcFactory, RawDvcMessage};
 mod rdpdr;
 mod rdpeusb;
 mod server;

@@ -452,6 +452,8 @@ pub struct RdpServer {
     // protocol gate. The `RDCamera_Device_Enumerator` DVC is advertised only when
     // this is `Some`; byte-identical when None.
     camera_factory: Option<Rc<dyn crate::RdCameraServerFactory>>,
+    /// (divergence 27) extra dynamic channels, one processor per connection each.
+    dvc_factories: Vec<Rc<dyn crate::DvcFactory>>,
     echo_handle: EchoServerHandle,
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Rc<dyn GfxServerFactory>>,
@@ -757,6 +759,7 @@ fn attach_channels_impl(
     rdpdr_factory: Option<&dyn crate::RdpdrServerFactory>,
     usb_factory: Option<&dyn crate::UrbdrcServerFactory>,
     camera_factory: Option<&dyn crate::RdCameraServerFactory>,
+    dvc_factories: &[Rc<dyn crate::DvcFactory>],
     #[cfg(feature = "egfx")] gfx_factory: Option<&dyn GfxServerFactory>,
     #[cfg(feature = "multitransport")] multitransport_lossy_audio_formats: Option<
         Vec<ironrdp_rdpsnd::pdu::AudioFormat>,
@@ -858,6 +861,10 @@ fn attach_channels_impl(
         let mut dvc = dvc;
         if let Some(camera_factory) = camera_factory {
             dvc = dvc.with_dynamic_channel(camera_factory.build_processor());
+        }
+        // (divergence 27) application-installed dynamic channels.
+        for factory in dvc_factories {
+            dvc = dvc.with_dynamic_channel(crate::dvc_factory::BoxedDvc(factory.build()));
         }
         dvc
     };
@@ -1130,6 +1137,7 @@ impl RdpServer {
             rdpdr_factory: rdpdr_factory.map(Rc::from),
             usb_factory: usb_factory.map(Rc::from),
             camera_factory: camera_factory.map(Rc::from),
+            dvc_factories: Vec::new(),
             echo_handle: EchoServerHandle::new(ev_sender.clone()),
             #[cfg(feature = "egfx")]
             gfx_factory: gfx_factory.map(Rc::from),
@@ -1271,6 +1279,11 @@ impl RdpServer {
     /// at accept time via `TCP_CONNECTION_INFO`. Link-adaptive consumers
     /// (blank-recovery gating, adaptive-bitrate seeding) hold a clone.
     /// 0 = unknown. Must be called before any client connects.
+    /// (divergence 27) Add a dynamic channel offered on every connection.
+    pub fn add_dvc_factory(&mut self, factory: Box<dyn crate::DvcFactory>) {
+        self.dvc_factories.push(Rc::from(factory));
+    }
+
     pub fn set_link_rtt_handle(&mut self, handle: Arc<AtomicU32>) {
         self.link_rtt_ms = Some(handle);
     }
@@ -1413,6 +1426,7 @@ impl RdpServer {
             self.rdpdr_factory.as_deref(),
             self.usb_factory.as_deref(),
             self.camera_factory.as_deref(),
+            &self.dvc_factories,
             #[cfg(feature = "egfx")]
             self.gfx_factory.as_deref(),
             #[cfg(feature = "multitransport")]

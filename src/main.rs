@@ -13,6 +13,8 @@
 mod aac;
 mod app;
 mod audio;
+mod audin;
+mod audin_pdu;
 mod auth;
 mod auth_guard;
 mod avc444;
