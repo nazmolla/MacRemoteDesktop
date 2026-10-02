@@ -19,6 +19,7 @@ mod avc444;
 mod brand;
 mod camera;
 mod capture;
+mod capture_extra;
 mod clipboard;
 mod clipboard_rich;
 #[cfg(test)]

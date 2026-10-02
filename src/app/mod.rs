@@ -514,6 +514,8 @@ pub(crate) async fn run() -> Result<()> {
         client_advert: Some(client_advert.clone()),
         applied_plan: None,
         resync: resync.clone(),
+        #[cfg(target_os = "macos")]
+        extra_capture: Vec::new(),
     };
 
     // Shared cell the server fills with the connecting client's keyboard-layout

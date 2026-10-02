@@ -2,7 +2,7 @@
 //! capture, the H.264 pipeline and input. `None` for single-monitor sessions,
 //! which keep the existing single-display paths unchanged.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::sync_ext::LockExt;
 
@@ -64,18 +64,15 @@ impl Layout {
     }
 }
 
-/// Shared cell; set at each connection's first display sync.
-#[derive(Debug, Clone, Default)]
-pub struct SharedLayout(Arc<Mutex<Option<Layout>>>);
+static LAYOUT: Mutex<Option<Layout>> = Mutex::new(None);
 
-impl SharedLayout {
-    pub fn get(&self) -> Option<Layout> {
-        self.0.lock_or_recover().clone()
-    }
+/// The current connection's layout; set at its first display sync.
+pub fn current() -> Option<Layout> {
+    LAYOUT.lock_or_recover().clone()
+}
 
-    pub fn set(&self, layout: Option<Layout>) {
-        *self.0.lock_or_recover() = layout;
-    }
+pub fn set(layout: Option<Layout>) {
+    *LAYOUT.lock_or_recover() = layout;
 }
 
 #[cfg(test)]

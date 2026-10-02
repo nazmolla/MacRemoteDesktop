@@ -446,6 +446,9 @@ pub struct CaptureDisplay {
     pub client_advert: Option<Arc<crate::negotiator::handler::ClientAdvert>>,
     /// Display plan currently applied to the virtual display.
     pub applied_plan: Option<crate::negotiator::display::DisplayPlan>,
+    /// Capture tasks for a multi-monitor session's extra displays.
+    #[cfg(target_os = "macos")]
+    pub extra_capture: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
@@ -654,6 +657,22 @@ impl RdpServerDisplay for CaptureDisplay {
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
         let (width, height) = self.sync_virtual_display();
+        // Multi-monitor: this stream captures only the primary monitor.
+        let layout = crate::multimon::current();
+        let (width, height) = layout.as_ref().map_or((width, height), |l| l.monitors[0].size);
+        #[cfg(target_os = "macos")]
+        {
+            for task in self.extra_capture.drain(..) {
+                task.abort();
+            }
+            if let (Some(l), Some(gfx)) = (layout.as_ref(), self.gfx.as_ref()) {
+                self.extra_capture = l.monitors[1..]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| crate::capture_extra::spawn(i, *m, self.fps, gfx.clone()))
+                    .collect();
+            }
+        }
         self.build_updates(width, height).await
     }
 }
@@ -682,13 +701,16 @@ impl CaptureDisplay {
             .client_advert
             .as_ref()
             .is_some_and(|advert| advert.take_new_connection());
-        if may_replace && crate::tunables::truthy("MACRDP_MULTIMON") {
-            // Multi-monitor: the primary monitor uses this display; every other
-            // monitor gets its own, placed like the client's layout.
-            let extras: Vec<(i32, i32, u32, u32)> = self
-                .client_advert
+        // Multi-monitor (Phase 4a): the primary monitor uses this display; every
+        // other monitor gets its own, placed like the client's layout.
+        let monitor_plans = if crate::tunables::truthy("MACRDP_MULTIMON") {
+            self.client_advert.as_ref().and_then(|a| a.monitor_plans())
+        } else {
+            None
+        };
+        if may_replace {
+            let extras: Vec<(i32, i32, u32, u32)> = monitor_plans
                 .as_ref()
-                .and_then(|a| a.monitor_plans())
                 .map(|plans| {
                     let (x0, y0) = (plans[0].left, plans[0].top);
                     plans[1..]
@@ -697,17 +719,35 @@ impl CaptureDisplay {
                         .collect()
                 })
                 .unwrap_or_default();
-            if let Err(e) = vd.set_extra_monitors(&extras) {
-                tracing::warn!(error = ?e, "could not set up the extra monitor displays");
+            let layout = match vd.set_extra_monitors(&extras) {
+                Ok(extra_ids) => monitor_plans.as_ref().and_then(|plans| {
+                    let rects: Vec<(i32, i32, u16, u16)> = plans
+                        .iter()
+                        .map(|m| (m.left, m.top, saturate_u16(m.plan.capture_w), saturate_u16(m.plan.capture_h)))
+                        .collect();
+                    let ids: Vec<u32> = std::iter::once(vd.display_id()).chain(extra_ids).collect();
+                    crate::multimon::Layout::from_rects(&rects, &ids)
+                }),
+                Err(e) => {
+                    tracing::warn!(error = ?e, "could not set up the extra monitor displays");
+                    None
+                }
+            };
+            if let Some(l) = layout.as_ref() {
+                tracing::info!(union = ?l.union, monitors = ?l.monitors, "multi-monitor layout");
             }
+            crate::multimon::set(layout);
         }
-        let plan = self.client_advert.as_ref().map(|advert| {
+        let primary_plan = monitor_plans
+            .filter(|_| crate::multimon::current().is_some())
+            .map(|plans| plans[0].plan.clone());
+        let plan = primary_plan.or_else(|| self.client_advert.as_ref().map(|advert| {
             crate::negotiator::display::plan_display(crate::negotiator::display::ClientMonitor {
                 width_px: u32::from(width),
                 height_px: u32::from(height),
                 desktop_scale_pct: advert.scale_pct.load(Ordering::Relaxed),
             })
-        });
+        }));
         let result = match plan.as_ref() {
             Some(p) => {
                 if self.applied_plan.as_ref() == Some(p) {
