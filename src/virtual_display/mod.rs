@@ -234,8 +234,21 @@ mod macos {
         /// resolved on this macOS version. Caller should treat that as
         /// "this feature isn't usable here," not a fatal bug.
         pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
-            if crate::tunables::truthy("MACRDP_DISPLAY_HOST") {
-                return Self::new_hosted(width, height);
+            // On unless MACRDP_DISPLAY_HOST is set to a false value.
+            let hosted = crate::tunables::var("MACRDP_DISPLAY_HOST").map_or(true, |v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            });
+            if hosted {
+                if super::host::helper_available() {
+                    return Self::new_hosted(width, height);
+                }
+                tracing::warn!(
+                    "macrdpdisplay helper not found — running the virtual display \
+                     in-process (it cannot be replaced if it gets stuck)"
+                );
             }
             let handle = private_api::create(width, height, refresh_hz, crate::brand::NAME)
                 .context("creating virtual display")?;

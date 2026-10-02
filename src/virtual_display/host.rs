@@ -123,6 +123,10 @@ impl Drop for HostProcess {
     }
 }
 
+pub(super) fn helper_available() -> bool {
+    locate().is_some()
+}
+
 fn locate() -> Option<PathBuf> {
     if let Some(p) = crate::tunables::var_os("MACRDP_DISPLAY_HOST_HELPER") {
         let p = PathBuf::from(p);
