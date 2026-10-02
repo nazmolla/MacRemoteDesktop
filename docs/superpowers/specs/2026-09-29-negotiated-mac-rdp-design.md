@@ -85,6 +85,7 @@ The user is whoever authenticated via NLA/CredSSP. The broker validates credenti
 | 6 | Client disconnects | Session persists; lock-on-disconnect per policy; reconnect resumes |
 | 7 | User logs out in-session | Session ends; connection closes cleanly |
 | 8 | Reboot with FileVault on | Unreachable until unlocked; status app + docs explain `fdesetup authrestart` and SSH FileVault unlock |
+| 9 | Someone at the Mac (physical display attached, even mid-session) | The physical display shows the normal login window, independent of any remote session, which keeps running. A different user logging in gets their own session; the remote user logging in locally takes the session over and the RDP connection closes with a reason (Windows behaviour). Requires remote sessions to be background sessions, not the console (added 2026-10-02) |
 
 ### 5.3 Risks to resolve in the Phase 0 spike
 Simultaneous multi-user remoting is **proven feasible on macOS by existing products**: Apple Remote Desktop / Screen Sharing and Jump Desktop both support multiple users connected in parallel, each in their own session. The spike therefore answers **how** (which mechanism, what it costs us), not **whether**.
@@ -219,7 +220,7 @@ Default in personal mode: all on. Any row can be disabled by policy.
 2. Protocol: FreeRDP as automated CI client — connect, resize, clipboard both ways, redirection, reconnect.
 3. Color: known sRGB patches + fine text through the full pipeline to a frame-dumping FreeRDP client; assert bit-exact after refinement and ΔE < 1 in motion (AVC444).
 4. Performance gates per §9.
-5. Real-mstsc release checklist: windowed resize on an ultrawide, mixed-DPI move, multi-user scenarios 1–8, FileVault messaging (manual first, scripted later).
+5. Real-mstsc release checklist: windowed resize on an ultrawide, mixed-DPI move, multi-user scenarios 1–9, FileVault messaging (manual first, scripted later).
 6. Upstream soak after each macrdp pull, under simulated loss (existing harness).
 
 ## 13. Productization
@@ -237,7 +238,7 @@ Default in personal mode: all on. Any row can be disabled by policy.
 | 0 Foundation + spike | Fork into this repo; working branding; CI; color harness; performance harness with baselines incl. Jump Desktop; **throwaway spike** for §5.3 risks; submit Apple entitlement requests | Baselines recorded; spike identifies the working mechanism for simultaneous sessions |
 | 1 Negotiator + headless single user | Negotiator replaces flags; sRGB virtual displays; windowed resize; mixed-DPI scaling; headless detection; clipboard verified both ways | Daily use from the ultrawide windowed setup with no config |
 | 2 Color + speed | Dirty-region encode; AVC444 end-to-end; lossless refinement; low-latency encoder; zero-copy GPU path; client-load feedback; color + perf gates in CI | Bit-exact static content; budgets met; lighter than Jump on the client |
-| 3 Broker + multi-user | Root broker; PAM login as credentialed user; socket handoff; scenarios 1–8 (simultaneous or fallback per spike) | All §5.2 scenarios pass on real mstsc |
+| 3 Broker + multi-user | Root broker; PAM login as credentialed user; socket handoff; scenarios 1–9 (simultaneous or fallback per spike) | All §5.2 scenarios pass on real mstsc |
 | 4 Devices | Multi-monitor spanning; printers; microphone; FSKit drives; entitled USB | Each redirection verified on mstsc |
 | 5 Product packaging | Signed/notarized `.pkg`; first-run assistant; Sparkle; MDM profile; license review; product name | Installable by a third party |
 | Later | WebAuthn / Windows Hello redirection | — |
