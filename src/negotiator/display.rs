@@ -96,6 +96,49 @@ pub fn plan_display(m: ClientMonitor) -> DisplayPlan {
     }
 }
 
+/// One planned display of a multi-monitor session: where the client shows it
+/// (its virtual-desktop origin) and how the Mac display is set up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorPlan {
+    pub left: i32,
+    pub top: i32,
+    pub primary: bool,
+    pub plan: DisplayPlan,
+}
+
+/// Plan one display per client monitor. `None` when the client announced
+/// fewer than two monitors: the single-display path stays as it is. Each
+/// monitor uses its own scale, falling back to the session's. The primary
+/// comes first.
+pub fn plan_monitors(
+    monitors: &[ironrdp_acceptor::ClientMonitor],
+    session_scale_pct: u32,
+) -> Option<Vec<MonitorPlan>> {
+    if monitors.len() < 2 {
+        return None;
+    }
+    let mut plans: Vec<MonitorPlan> = monitors
+        .iter()
+        .map(|m| {
+            // Inclusive rectangle; H.264 codes in 2-pixel units, so round down to even.
+            let w = ((m.right - m.left + 1).max(2) as u32) & !1;
+            let h = ((m.bottom - m.top + 1).max(2) as u32) & !1;
+            MonitorPlan {
+                left: m.left,
+                top: m.top,
+                primary: m.primary,
+                plan: plan_display(ClientMonitor {
+                    width_px: w,
+                    height_px: h,
+                    desktop_scale_pct: m.desktop_scale_factor.unwrap_or(session_scale_pct),
+                }),
+            }
+        })
+        .collect();
+    plans.sort_by_key(|p| !p.primary);
+    Some(plans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +223,41 @@ mod tests {
         let p = plan_display(m(3840, 2160, 300));
         assert_eq!((p.points_w, p.points_h, p.hidpi), (1920, 1080, true));
         assert!(p.reason.contains("300%"), "{}", p.reason);
+    }
+}
+
+#[cfg(test)]
+mod monitor_plan_tests {
+    use super::*;
+    use ironrdp_acceptor::ClientMonitor as Wire;
+
+    fn wire(left: i32, right: i32, bottom: i32, primary: bool, scale: Option<u32>) -> Wire {
+        Wire { left, top: 0, right, bottom, primary, desktop_scale_factor: scale, ..Wire::default() }
+    }
+
+    #[test]
+    fn one_monitor_keeps_the_single_display_path() {
+        assert!(plan_monitors(&[wire(0, 1919, 1079, true, None)], 100).is_none());
+        assert!(plan_monitors(&[], 100).is_none());
+    }
+
+    #[test]
+    fn plans_each_monitor_primary_first() {
+        let p = plan_monitors(
+            &[wire(-1920, -1, 1079, false, Some(100)), wire(0, 3439, 1439, true, None)],
+            100,
+        )
+        .unwrap();
+        assert_eq!(p.len(), 2);
+        assert!(p[0].primary && p[0].left == 0);
+        assert_eq!((p[0].plan.capture_w, p[0].plan.capture_h), (3440, 1440));
+        assert_eq!((p[1].left, p[1].plan.capture_w), (-1920, 1920));
+    }
+
+    #[test]
+    fn odd_sizes_round_down_to_even() {
+        let p = plan_monitors(&[wire(0, 1714, 1286, true, None), wire(1715, 2714, 999, false, None)], 100).unwrap();
+        assert_eq!((p[0].plan.capture_w, p[0].plan.capture_h), (1714, 1286));
+        assert_eq!(p[1].plan.capture_w, 1000);
     }
 }

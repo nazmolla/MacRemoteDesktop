@@ -21,9 +21,20 @@ pub struct ClientAdvert {
     /// Set once per connection (never on a reactivation); taken by the first
     /// display sync, the only point where the display may still be replaced.
     new_connection: AtomicBool,
+    /// One display plan per client monitor; `None` for a single-monitor client.
+    monitor_plans: std::sync::Mutex<Option<Vec<crate::negotiator::display::MonitorPlan>>>,
 }
 
 impl ClientAdvert {
+    /// The current connection's per-monitor plans (see [`crate::negotiator::display::plan_monitors`]).
+    #[allow(dead_code, reason = "consumed by Phase 4a step 3 (one display per monitor)")]
+    pub fn monitor_plans(&self) -> Option<Vec<crate::negotiator::display::MonitorPlan>> {
+        self.monitor_plans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// True once per connection, for the first caller.
     pub fn take_new_connection(&self) -> bool {
         self.new_connection.swap(false, Ordering::AcqRel)
@@ -154,6 +165,20 @@ impl ConnectionHandler for NegotiationHandler {
             .scale_pct
             .store(info.desktop_scale_factor.unwrap_or(0), Ordering::Relaxed);
         self.advert.new_connection.store(true, Ordering::Release);
+        let plans = crate::negotiator::display::plan_monitors(
+            &info.monitors,
+            info.desktop_scale_factor.unwrap_or(0),
+        );
+        if let Some(p) = plans.as_ref() {
+            for m in p {
+                tracing::info!(target: "macrdp::negotiator", left = m.left, top = m.top, primary = m.primary, reason = %m.plan.reason, "display: monitor planned");
+            }
+        }
+        *self
+            .advert
+            .monitor_plans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = plans;
 
         // Log display info
         tracing::info!(target: "macrdp::negotiator", width = info.desktop_width, height = info.desktop_height, scale = info.desktop_scale_factor.unwrap_or(0), monitors = ?info.monitors, "display info recorded");
