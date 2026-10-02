@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PKG_DIR="$REPO_ROOT/packaging"
+PKG_DIR="${PKG_DIR:-$REPO_ROOT/packaging}"
 APP_DIR="${APP_DIR:-/Applications}"
 # MUST match the BUNDLE_PREFIX used by make-app.sh (and gui/make-tray-app.sh),
 # or the controller targets a different label than the agent installed here.

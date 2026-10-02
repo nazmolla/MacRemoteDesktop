@@ -195,3 +195,9 @@ reader registered with `system_profiler SPSmartCardsDataType`.
   One re-grant after switching identities, then grants persist.
 - Login-window / lock-screen / secure-input contexts still can't receive
   synthetic input — an OS limitation, unchanged by packaging.
+
+## Installer package and MDM profile (Viga)
+
+- `packaging/make-pkg.sh` builds `target/Viga-<version>.pkg` from `target/Viga.app` (run `make-app.sh` first), signed with the Developer ID Installer identity. It installs `Viga.app` into `/Applications`; its postinstall sets up the LaunchAgent and `config.env` for the user logged in at the console (others run `Viga.app/Contents/Resources/setup/install-launchagent.sh` with `APP_DIR=/Applications PKG_DIR=<that setup dir>`). Verified in the macOS 27 test VM.
+- Notarize with `NOTARY_PROFILE=<profile> packaging/notarize.sh target/Viga-<version>.pkg` after a one-time `xcrun notarytool store-credentials`.
+- `packaging/make-pppc-profile.sh > Viga-PPPC.mobileconfig` generates an MDM privacy profile: Accessibility pre-approved, Screen Recording approvable by standard users (macOS does not let MDM grant it outright).

@@ -1,0 +1,15 @@
+#!/bin/bash
+# Installer postinstall (runs as root): set up Viga's LaunchAgent for the user
+# logged in at the console. Other users run the same script themselves:
+#   APP_DIR=/Applications PKG_DIR=/Applications/Viga.app/Contents/Resources/setup \
+#     /Applications/Viga.app/Contents/Resources/setup/install-launchagent.sh
+SETUP="$2/Applications/Viga.app/Contents/Resources/setup"
+USER_NAME=$(/usr/bin/stat -f %Su /dev/console)
+if [ -z "$USER_NAME" ] || [ "$USER_NAME" = "root" ]; then
+    echo "no console user; skipping LaunchAgent setup"
+    exit 0
+fi
+USER_ID=$(/usr/bin/id -u "$USER_NAME")
+/bin/launchctl asuser "$USER_ID" /usr/bin/sudo -u "$USER_NAME" \
+    /usr/bin/env APP_DIR=/Applications PKG_DIR="$SETUP" "$SETUP/install-launchagent.sh"
+exit 0

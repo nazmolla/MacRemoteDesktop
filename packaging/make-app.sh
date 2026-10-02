@@ -201,6 +201,13 @@ else
     echo "==> WARNING: macrdpdisplay not found; MACRDP_DISPLAY_HOST=1 will fail (unset SKIP_BUILD?)" >&2
 fi
 
+# 2g. Per-user setup files the installer package's postinstall runs for the
+#     console user (LaunchAgent + seeded config.env).
+mkdir -p "$STAGE/Contents/Resources/setup"
+cp "$REPO_ROOT/packaging/install-launchagent.sh" "$REPO_ROOT/packaging/launchagent.plist.template" \
+   "$REPO_ROOT/packaging/config.env.example" "$STAGE/Contents/Resources/setup/"
+chmod +x "$STAGE/Contents/Resources/setup/install-launchagent.sh"
+
 # 3. Sign the Mach-O executable, then the bundle (which seals Info.plist + the
 #    Resources, including the app icon + the embedded IFD bundle).
 # Embed the provisioning profile (if any) BEFORE the bundle sign so it's sealed in.
