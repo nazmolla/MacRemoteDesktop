@@ -581,6 +581,47 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         try? out.write(to: configURL, atomically: true, encoding: .utf8)
     }
 
+    // MARK: - Multi-user broker policy (root-owned)
+
+    /// The root-owned policy the multi-user broker reads on each connection.
+    var policyURL: URL { URL(fileURLWithPath: "/Library/Application Support/Viga/policy.env") }
+
+    /// Read the policy file (world-readable, 644). Empty if the multi-user stack
+    /// isn't installed yet.
+    func readPolicy() -> [String: String] {
+        guard let text = try? String(contentsOf: policyURL, encoding: .utf8) else { return [:] }
+        var d: [String: String] = [:]
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            d[String(line[..<eq]).trimmingCharacters(in: .whitespaces)] =
+                String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+        }
+        return d
+    }
+
+    /// Write the root-owned policy via one admin-authenticated shell (the file
+    /// lives under /Library and is read by the root broker). Returns false on
+    /// cancel/failure. The body is base64'd so no value can break the shell quoting.
+    @discardableResult
+    func writePolicy(primaryUser: String, multiUser: Bool, allowedUsers: String) -> Bool {
+        let body = """
+        # Viga multi-user broker policy (edited by the menu-bar app).
+        PRIMARY_USER=\(primaryUser)
+        MULTI_USER=\(multiUser ? "1" : "0")
+        ALLOWED_USERS=\(allowedUsers)
+        """
+        let dir = "/Library/Application Support/Viga"
+        let b64 = Data(body.utf8).base64EncodedString()
+        let shell = "mkdir -p '\(dir)' && /bin/echo \(b64) | /usr/bin/base64 --decode > '\(dir)/policy.env' && chmod 644 '\(dir)/policy.env'"
+        let script = "do shell script \"\(shell)\" with administrator privileges"
+        let p = Process()
+        p.launchPath = "/usr/bin/osascript"
+        p.arguments = ["-e", script]
+        do { try p.run(); p.waitUntilExit(); return p.terminationStatus == 0 } catch { return false }
+    }
+
     func ensureConfigExists() {
         let fm = FileManager.default
         try? fm.createDirectory(at: configURL.deletingLastPathComponent(),
