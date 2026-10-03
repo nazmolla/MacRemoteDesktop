@@ -93,12 +93,15 @@ pub(crate) async fn run() -> Result<()> {
     // console the full virtual-display path is available; a background
     // (Fast-User-Switching) session can't activate a virtual display, so the
     // negotiator falls back to native-framebuffer capture + resize (see
-    // `virtual_display::virtual_display_available`). Purely informational.
+    // `virtual_display::virtual_display_available`). Audio still works in a
+    // background session — ScreenCaptureKit delivers system audio off-console
+    // (verified in the VM) — but SCK audio is system-wide, so with several
+    // active users it is NOT per-session isolated. Purely informational.
     #[cfg(target_os = "macos")]
     match virtual_display::session_is_on_console() {
         Some(true) => info!("session: on the physical console — full virtual-display path available"),
         Some(false) => info!(
-            "session: background (off-console) — native-framebuffer capture + resize, no virtual display / audio"
+            "session: background (off-console) — native-framebuffer capture + resize + system audio (not per-session isolated); no virtual display"
         ),
         None => {}
     }

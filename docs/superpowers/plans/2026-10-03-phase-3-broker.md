@@ -73,10 +73,15 @@ preference:
    (no dirty-rects while scaling), mitigated by the encoder frame-diff. Acceptable for one
    extra user. This is also the handler for **live client resize** (rescale, since we can't
    re-mode a display we may not own).
-3. **Audio:** SCK display-bound audio likely fails off-console (the probable reason Jump
-   documents "audio … will not work" in background). Use a **Core Audio process tap** scoped
-   to the background session's audio processes instead — Viga already uses taps (VigaMic
-   path), so the machinery exists; background-session behaviour is unverified (step 0).
+3. **Audio: WORKS — verified in the VM.** Contrary to the initial assumption (Jump documents
+   "audio … will not work" in background, but that's *their* JumpAudio driver's limit), Viga's
+   existing ScreenCaptureKit system-audio capture **does deliver audio off-console** — the VM
+   agent logged `SCK audio format rate=48000 channels=2` while a client was connected and sound
+   played in the background session. No Core Audio tap needed. **Caveat:** SCK audio is
+   *system-wide*, so it is **not per-session isolated** — with several users playing audio at
+   once, each client hears the mixed system output. Fine for one active user; a Core Audio
+   process tap scoped to the session's processes is the future path to per-session isolation
+   if needed.
 - **Handoff** — `/var/run/ca.nazmi.portico.agent.<uid>.sock`. Broker → agent passes the
   connection fd plus the negotiated `SessionPlan` seed and the authenticated username.
 
