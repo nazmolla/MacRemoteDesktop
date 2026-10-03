@@ -685,9 +685,9 @@ pub(crate) async fn run() -> Result<()> {
         }
     }
 
-    // Client microphone (MS-RDPEAI). The sink logs until the virtual microphone lands.
+    // Client microphone (MS-RDPEAI), played by the VigaMic virtual microphone.
     server.add_dvc_factory(Box::new(crate::audin::AudinFactory::new(std::sync::Arc::new(
-        crate::audin::LogSink::default(),
+        crate::audin::RingSink::new(),
     ))));
 
     transport::provision_auto_reconnect(&mut server);
