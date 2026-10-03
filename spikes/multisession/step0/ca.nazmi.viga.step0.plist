@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ca.nazmi.viga.step0</string>
+  <!-- Aqua only: launchd starts one copy inside EACH logged-in GUI session,
+       console AND background. That is what makes it an in-session agent (unlike
+       `launchctl asuser`, which bound SCK to the console in the 2026-10-02 run). -->
+  <key>LimitLoadToSessionType</key><array><string>Aqua</string></array>
+  <key>ProgramArguments</key>
+  <array>
+    <!-- The bundle's signed Mach-O so TCC grants on Viga.app carry (the
+         standalone probe failed TCC in spike result #5). -->
+    <string>/Applications/Viga.app/Contents/MacOS/viga</string>
+    <string>--config</string>
+    <string>/Users/Shared/vigatest/step0.config.env</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/Shared/vigatest/step0.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/Shared/vigatest/step0.err.log</string>
+</dict>
+</plist>
