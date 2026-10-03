@@ -26,7 +26,7 @@ int main(int argc, char **argv) {
 
     int session = -1;
     int err = CGSCreateLoginSessionWithDataAndVisibility(CFDataGetBytePtr(plist), (size_t)CFDataGetLength(plist),
-                                                         0, &session, NULL);
+                                                         argc > 2 ? atoi(argv[2]) : 0, &session, NULL);
     printf("create: err=%d session=%d\n", err, session);
     fflush(stdout);
     if (err != 0) return 1;
