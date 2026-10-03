@@ -18,6 +18,7 @@ mod audin_pdu;
 mod auth;
 mod auth_guard;
 mod avc444;
+mod broker;
 mod brand;
 mod camera;
 mod capture;
@@ -89,6 +90,13 @@ fn main() -> Result<()> {
             app::boost_thread_qos();
         })
         .build()?;
+    // Multi-user: `--broker` runs the root connection router (public port →
+    // per-user session agents by mstshash cookie) and never touches capture or
+    // displays. Everything else (including a `--session-agent` bound to its
+    // uid's loopback port) is the normal per-session server.
+    if std::env::args().any(|a| a == "--broker") {
+        return rt.block_on(broker::run());
+    }
     rt.block_on(app::run())
 }
 
