@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Multi-user BROKER (LaunchDaemon, runs as root). Installed to
+  /Library/LaunchDaemons/<label>.broker.plist. Binds the public RDP port and
+  routes each connection to the right per-user session agent by the mstshash
+  cookie (see src/broker/). Terminates nothing — the per-user Aqua agents
+  (session-agent.plist.template) do TLS/NLA/RDP. Root is needed only to bind the
+  privileged port and to read the root-owned policy file; it never captures or
+  injects input itself. __LABEL__, __APP_DIR__, __PRODUCT__, __PRODUCT_ID__ are
+  substituted by install-multiuser.sh.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__.broker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__APP_DIR__/__PRODUCT__.app/Contents/MacOS/__PRODUCT_ID__</string>
+        <string>--broker</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/__PRODUCT_ID__-broker.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <!-- Public bind (standard RDP port; root can bind it). -->
+        <key>MACRDP_BROKER_BIND</key>
+        <string>0.0.0.0:3389</string>
+        <!-- Root-owned owner policy: PRIMARY_USER / MULTI_USER / ALLOWED_USERS. -->
+        <key>VIGA_POLICY_FILE</key>
+        <string>/Library/Application Support/__PRODUCT__/policy.env</string>
+        <key>MACRDP_AGENT_PORT_BASE</key>
+        <string>39000</string>
+    </dict>
+</dict>
+</plist>
