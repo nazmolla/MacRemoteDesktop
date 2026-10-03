@@ -58,15 +58,16 @@ impl DisplayIdCell {
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    online_display_facts, screen_is_locked, shield_keeps_physical_main,
+    online_display_facts, screen_is_locked, session_is_on_console, shield_keeps_physical_main,
     take_detach_reenable_failed, virtual_display_available, CapturedPrimary, DetachedPrimary,
     PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    online_display_facts, screen_is_locked, take_detach_reenable_failed, virtual_display_available,
-    CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    online_display_facts, screen_is_locked, session_is_on_console, take_detach_reenable_failed,
+    virtual_display_available, CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary,
+    VirtualDisplay,
 };
 
 #[cfg(target_os = "macos")]
@@ -114,9 +115,18 @@ mod macos {
         }
     }
 
-    /// Whether the private `CGVirtualDisplay` class exists on this macOS.
+    /// Whether a virtual display can actually be *activated* in this session.
+    /// Requires the private `CGVirtualDisplay` class AND that we are on the
+    /// console: WindowServer refuses to activate a virtual display in a
+    /// background (off-console) session, so in that case the negotiator must
+    /// fall back to native-framebuffer capture + resize (see
+    /// `session_is_on_console`). `None`/unknown console state is treated as
+    /// "on console" so the single-session path is byte-unchanged.
     pub fn virtual_display_available() -> bool {
-        objc2::runtime::AnyClass::get("CGVirtualDisplay").is_some()
+        if objc2::runtime::AnyClass::get("CGVirtualDisplay").is_none() {
+            return false;
+        }
+        private_api::session_is_on_console() != Some(false)
     }
 
     /// Set true by `DetachedPrimary::drop` when its re-enable transaction is
@@ -146,6 +156,15 @@ mod macos {
     /// mechanism and its maintenance/fallback notes.
     pub fn screen_is_locked() -> Option<bool> {
         private_api::screen_is_locked()
+    }
+
+    /// Whether this process's GUI session is on the physical console (vs a
+    /// background Fast-User-Switching session). `None` if the lookup failed —
+    /// callers treat that as "assume console". See
+    /// `private_api::session_is_on_console` for the mechanism and why it gates
+    /// virtual-display availability for multi-user.
+    pub fn session_is_on_console() -> Option<bool> {
+        private_api::session_is_on_console()
     }
 
     // CGGetOnlineDisplayList is a public CoreGraphics symbol but isn't in the
@@ -2028,6 +2047,10 @@ mod stub {
     }
     pub fn virtual_display_available() -> bool {
         false
+    }
+    pub fn session_is_on_console() -> Option<bool> {
+        // No GUI session concept off macOS; the Linux build is a compile stub.
+        None
     }
 
     /// No detach path off macOS, so nothing ever leaves a panel stuck.

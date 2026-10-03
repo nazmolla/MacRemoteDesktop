@@ -89,6 +89,20 @@ pub(crate) async fn run() -> Result<()> {
 
     init_logging(&args, &negotiation_reasons);
 
+    // Multi-user: report which kind of GUI session this agent landed in. On the
+    // console the full virtual-display path is available; a background
+    // (Fast-User-Switching) session can't activate a virtual display, so the
+    // negotiator falls back to native-framebuffer capture + resize (see
+    // `virtual_display::virtual_display_available`). Purely informational.
+    #[cfg(target_os = "macos")]
+    match virtual_display::session_is_on_console() {
+        Some(true) => info!("session: on the physical console — full virtual-display path available"),
+        Some(false) => info!(
+            "session: background (off-console) — native-framebuffer capture + resize, no virtual display / audio"
+        ),
+        None => {}
+    }
+
     // Sweep leftovers from a PRIOR macrdp that died uncleanly (SIGKILL / panic /
     // power-loss skip Drop AND the signal handler, stranding NFS mounts + paste
     // temp dirs). Dead-pid-gated so it's safe with another instance live; on a
