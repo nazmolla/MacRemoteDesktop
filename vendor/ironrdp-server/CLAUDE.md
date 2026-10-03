@@ -1992,3 +1992,8 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
 `DvcProcessor` per connection, attached after the built-in channels through
 `BoxedDvc`. `RawDvcMessage` sends already-encoded bytes. No factories ⇒ the
 channel set is byte-identical. First user: the client microphone (MS-RDPEAI).
+
+(28) Printer redirection (MacRemoteDesktop fork, 2026-10-02). The server core
+capability request now advertises the Printer capability, and `RdpdrHandle::print_job`
+sends one job to a redirected printer (create with an empty path, chunked writes,
+close). The Mac side (`src/rdpdr/printer.rs`) turns each printer into a CUPS queue.

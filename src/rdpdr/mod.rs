@@ -13,6 +13,8 @@
 //! Opt-in via `--enable-drive-redirection`. Read-write.
 
 #[cfg(target_os = "macos")]
+mod printer;
+#[cfg(target_os = "macos")]
 mod smartcard;
 #[cfg(target_os = "macos")]
 mod surface;
@@ -80,13 +82,15 @@ use tracing::info;
 pub struct MacRdpdr {
     enable_drive: bool,
     enable_smartcard: bool,
+    enable_printers: bool,
 }
 
 impl MacRdpdr {
-    pub fn new(enable_drive: bool, enable_smartcard: bool) -> Self {
+    pub fn new(enable_drive: bool, enable_smartcard: bool, enable_printers: bool) -> Self {
         Self {
             enable_drive,
             enable_smartcard,
+            enable_printers,
         }
     }
 }
@@ -101,13 +105,17 @@ impl ServerEventSender for MacRdpdr {
 impl RdpdrBackendFactory for MacRdpdr {
     fn build_backend(&self) -> Box<dyn RdpdrServerHandler> {
         #[cfg(not(target_os = "macos"))]
-        let _ = (self.enable_drive, self.enable_smartcard);
+        let _ = (self.enable_drive, self.enable_smartcard, self.enable_printers);
         Box::new(MacRdpdrHandler {
             handle: None,
             #[cfg(target_os = "macos")]
             enable_drive: self.enable_drive,
             #[cfg(target_os = "macos")]
             enable_smartcard: self.enable_smartcard,
+            #[cfg(target_os = "macos")]
+            enable_printers: self.enable_printers,
+            #[cfg(target_os = "macos")]
+            printers: HashMap::new(),
             #[cfg(target_os = "macos")]
             surfaces: HashMap::new(),
             #[cfg(target_os = "macos")]
@@ -132,6 +140,11 @@ struct MacRdpdrHandler {
     enable_drive: bool,
     #[cfg(target_os = "macos")]
     enable_smartcard: bool,
+    #[cfg(target_os = "macos")]
+    enable_printers: bool,
+    /// One local CUPS queue per redirected printer, removed with the connection.
+    #[cfg(target_os = "macos")]
+    printers: HashMap<u32, printer::Printer>,
     /// One live NFS mount per redirected filesystem device, keyed by device id
     /// so a re-announce doesn't double-mount an already-mounted drive.
     #[cfg(target_os = "macos")]
@@ -177,6 +190,20 @@ impl RdpdrServerHandler for MacRdpdrHandler {
                     info!(device_id = dev.device_id, name = %dev.name, "drive redirection: mounting client drive as NFS volume");
                     let surface = surface::Surface::start(handle.clone(), dev.device_id, &dev.name);
                     self.surfaces.insert(dev.device_id, surface);
+                }
+            }
+
+            if self.enable_printers {
+                for dev in devices.iter().filter(|d| d.device_type == DeviceType::Print) {
+                    if self.printers.contains_key(&dev.device_id) {
+                        continue;
+                    }
+                    match printer::Printer::start(handle.clone(), dev.device_id, &dev.name) {
+                        Ok(p) => {
+                            self.printers.insert(dev.device_id, p);
+                        }
+                        Err(e) => tracing::warn!(error = %e, name = %dev.name, "printer: could not add a local queue"),
+                    }
                 }
             }
 

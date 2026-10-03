@@ -2198,9 +2198,10 @@ impl DeviceCreateResponse {
     /// server reading the client's create response.
     pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         let device_io_reply = DeviceIoResponse::decode(src)?;
-        ensure_size!(ctx: Self::NAME, in: src, size: 4 + 1);
+        // Information is optional: FreeRDP omits it when opening a printer.
+        ensure_size!(ctx: Self::NAME, in: src, size: 4);
         let file_id = src.read_u32();
-        let information = Information::from_bits_retain(src.read_u8());
+        let information = Information::from_bits_retain(if src.len() >= 1 { src.read_u8() } else { 0 });
         Ok(Self {
             device_io_reply,
             file_id,

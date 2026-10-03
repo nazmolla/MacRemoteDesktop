@@ -569,10 +569,11 @@ pub(crate) async fn run() -> Result<()> {
     // (--enable-smartcard-redirection) lets macOS apps use the client's reader.
     // Both ride the one RDPDR channel, so attach the factory if either is on.
     let rdpdr_factory: Option<Box<dyn ironrdp_server::RdpdrServerFactory>> =
-        if args.enable_drive_redirection || args.enable_smartcard_redirection {
+        if args.enable_drive_redirection || args.enable_smartcard_redirection || printers_enabled() {
             Some(Box::new(rdpdr::MacRdpdr::new(
                 args.enable_drive_redirection,
                 args.enable_smartcard_redirection,
+                printers_enabled(),
             )))
         } else {
             None
@@ -798,4 +799,9 @@ pub(super) async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// Client printers become local queues unless `MACRDP_PRINTERS=0`.
+fn printers_enabled() -> bool {
+    std::env::var("MACRDP_PRINTERS").map_or(true, |v| v != "0")
 }

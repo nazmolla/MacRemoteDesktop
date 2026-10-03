@@ -366,6 +366,31 @@ impl RdpdrHandle {
         self.close(device_id, file_id).await
     }
 
+    /// Send one print job to a redirected printer: open the device (empty
+    /// path), write `data` in chunks, close. The client spools it to its printer.
+    pub async fn print_job(&self, device_id: u32, data: &[u8]) -> Result<()> {
+        let file_id = self
+            .open_with(
+                device_id,
+                "",
+                DesiredAccess::FILE_WRITE_DATA_OR_FILE_ADD_FILE | DesiredAccess::SYNCHRONIZE,
+                CreateDisposition::FILE_OPEN_IF,
+                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE,
+            )
+            .await?;
+        let mut offset = 0u64;
+        let mut result = Ok(());
+        for chunk in data.chunks(64 * 1024) {
+            if let Err(e) = self.write(device_id, file_id, offset, chunk).await {
+                result = Err(e);
+                break;
+            }
+            offset += chunk.len() as u64;
+        }
+        let _ = self.close(device_id, file_id).await;
+        result
+    }
+
     /// Create a directory at `path` (fails if it already exists).
     pub async fn create_dir(&self, device_id: u32, path: &str) -> Result<()> {
         let file_id = self
@@ -1015,6 +1040,7 @@ impl RdpdrServer {
     fn server_capabilities() -> CoreCapability {
         let mut caps = Capabilities::new(); // GENERAL
         caps.add_drive();
+        caps.add_printer();
         CoreCapability {
             capabilities: caps.clone_inner(),
             kind: CoreCapabilityKind::ServerCoreCapabilityRequest,

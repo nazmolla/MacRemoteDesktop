@@ -131,3 +131,7 @@ as `vendor/ironrdp-acceptor`. Its `ironrdp-error = "0.1"` dep is why the root
 adds an `ironrdp-error` git pin to `[patch.crates-io]`: without it, this crate
 would pull `ironrdp-error` from crates.io and split it from the copy the other
 ironrdp crates use transitively.
+
+- Device Create Response decode accepts a missing trailing Information byte
+  (MacRemoteDesktop fork, 2026-10-02): FreeRDP omits it when the server opens a
+  redirected printer, and the strict decode rejected every print job.
