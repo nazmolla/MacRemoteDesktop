@@ -94,6 +94,34 @@ pub(super) fn seeded_initial_bitrate(
     (ceiling / 3).clamp(floor.min(ceiling), ceiling.max(1))
 }
 
+/// LAN-aware ceiling (2026-10-08): the `--bitrate` default (6 Mbit) is tuned to
+/// be safe on a constrained link (Wi-Fi/VPN) — big per-frame writes can fill the
+/// socket buffer and delay audio. On a provably LOCAL link that conservative cap
+/// just leaves quality on the table: the muddiness on changing regions is the
+/// encoder raising QP to stay under the cap, not the network. So when the
+/// kernel-measured accept-time RTT says the link is LAN-class
+/// (`link_rtt_ms <= lan_rtt_ms`, a known nonzero RTT) AND the operator did NOT
+/// set `--bitrate` explicitly (`bitrate_is_default`), raise the ceiling to
+/// `lan_bitrate_bps`. An explicit `--bitrate` is always respected exactly (even a
+/// deliberately low one for testing); an unknown RTT (`0`) or a non-LAN RTT keeps
+/// the configured value; `lan_bitrate_bps == 0` disables the whole mechanism.
+/// This only ever RAISES, and only on a link we've measured as local. Pure,
+/// unit-tested. Feeds the per-connection ceiling in [`Gfx::build_server_with_handle`].
+pub(super) fn lan_effective_ceiling(
+    configured_bps: u32,
+    bitrate_is_default: bool,
+    link_rtt_ms: u32,
+    lan_rtt_ms: u32,
+    lan_bitrate_bps: u32,
+) -> u32 {
+    let lan_detected = link_rtt_ms != 0 && link_rtt_ms <= lan_rtt_ms;
+    if lan_bitrate_bps == 0 || !bitrate_is_default || !lan_detected {
+        return configured_bps;
+    }
+    // Only ever raise — never drop a configured value below what the operator left.
+    lan_bitrate_bps.max(configured_bps)
+}
+
 /// Pure AIMD step for congestion-responsive bitrate (P1). Given the current target,
 /// the reliable-tunnel loss delta observed this control interval, and the bounds/
 /// params, return the new target bitrate. **Multiplicative-decrease** on any loss

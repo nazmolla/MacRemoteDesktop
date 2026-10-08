@@ -451,6 +451,10 @@ pub(crate) async fn run() -> Result<()> {
             args.adaptive_bitrate,
             congestion_retransmits.clone(),
             link_rtt_ms.clone(),
+            // LAN-aware auto-ceiling applies only when --bitrate was left at its
+            // clap default (6). Any explicit value — even a coincidental 6 — is
+            // respected exactly; to force 6 on a LAN, set MACRDP_LAN_BITRATE=0.
+            args.bitrate == 6,
         )
     });
 

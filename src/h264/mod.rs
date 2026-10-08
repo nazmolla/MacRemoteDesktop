@@ -372,6 +372,12 @@ struct ConnectionContext {
     /// last sampled value of the shared cumulative-retransmit loss counter, so the
     /// controller works on per-interval deltas. See [`Gfx::adaptive_bitrate_step`].
     adaptive_target_bps: u32,
+    /// This connection's effective bitrate ceiling — the configured `--bitrate`,
+    /// or the LAN-raised value when the link measured local at accept (see
+    /// [`lan_effective_ceiling`]). The adaptive controller climbs back toward
+    /// THIS, not the process-wide `Gfx::bitrate_bps`, so a LAN connection's
+    /// controller can use the full raised ceiling.
+    ceiling_bps: u32,
     adaptive_last_control: Instant,
     adaptive_last_retransmits: u64,
     /// P2a IDR-backoff state: true while the periodic keyframe is suppressed
@@ -581,6 +587,22 @@ pub struct Gfx {
     /// seeded at ceiling/3 instead of the full ceiling (the controller climbs
     /// from there). `MACRDP_ADAPTIVE_SEED_RTT_MS`, default 50; 0 disables.
     adaptive_seed_rtt_ms: u32,
+    /// LAN-aware auto-ceiling (2026-10-08). When a connection's accept-time
+    /// kernel RTT is at or below `lan_rtt_ms` (a measured local link) AND the
+    /// operator left `--bitrate` at its default (`bitrate_is_default`), the
+    /// per-connection encoder ceiling is raised to `lan_bitrate_bps` instead of
+    /// the conservative Wi-Fi-safe 6 Mbit default — so a wired LAN gets sharp
+    /// video automatically without losing the safe default for constrained
+    /// links. `lan_bitrate_bps == 0` disables it. See [`lan_effective_ceiling`].
+    lan_rtt_ms: u32,
+    lan_bitrate_bps: u32,
+    bitrate_is_default: bool,
+    /// How long a tile must sit unchanged before it's re-sent losslessly
+    /// (ClearCodec) — the delay after motion stops before a region snaps from
+    /// lossy-H.264 soft to crisp. `MACRDP_REFINE_IDLE_MS`, default
+    /// [`REFINE_IDLE`] (200 ms). Lower = sharpens sooner at the cost of more
+    /// frequent lossless re-sends (cheap on a LAN, more bandwidth on a thin link).
+    refine_idle: Duration,
     /// EXPERIMENTAL blank-recovery reactivation request (see
     /// [`BlankAction::Reactivate`]). Packed `(width << 16) | height`; `0` = no
     /// request. Set by [`Gfx::perform_blank_reactivate`] and drained by the
@@ -605,6 +627,7 @@ impl Gfx {
         adaptive_bitrate: bool,
         congestion_retransmits: Arc<AtomicU64>,
         link_rtt_ms: Arc<AtomicU32>,
+        bitrate_is_default: bool,
     ) -> Self {
         let wire_format = WireFormat::from_env();
         let (recovery_enabled, recovery_params) = recovery_config_from_env();
@@ -770,6 +793,20 @@ impl Gfx {
             reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
+        // LAN-aware auto-ceiling knobs (2026-10-08). `MACRDP_LAN_RTT_MS` = the
+        // accept-time RTT at or below which a link counts as local (default 5 ms);
+        // `MACRDP_LAN_BITRATE` = the ceiling (Mbit/s) to raise to on such a link
+        // when `--bitrate` is left at its default (default 50 Mbit; 0 disables).
+        let lan_rtt_ms = env_u32_zero_ok("MACRDP_LAN_RTT_MS", 5);
+        let lan_bitrate_bps = env_u32_zero_ok("MACRDP_LAN_BITRATE", 50).saturating_mul(1_000_000);
+        // Lossless-refinement idle delay (ms): how long a region must be still
+        // before it's re-sent crisp. Default = REFINE_IDLE (200). 0 is treated as
+        // the default, not "instant" (instant would re-send every settled tile
+        // every tick). See the `refine_idle` field.
+        let refine_idle = Duration::from_millis(u64::from(env_u32(
+            "MACRDP_REFINE_IDLE_MS",
+            REFINE_IDLE.as_millis() as u32,
+        )));
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -804,6 +841,10 @@ impl Gfx {
             desktop_size,
             fps,
             bitrate_bps,
+            lan_rtt_ms,
+            lan_bitrate_bps,
+            bitrate_is_default,
+            refine_idle,
             keyframe_secs,
             max_in_flight,
             wire_format,
@@ -1389,7 +1430,10 @@ impl Gfx {
             return actions;
         }
         let on_udp = self.egfx_on_udp.load(Ordering::Relaxed);
-        let ceiling = self.bitrate_bps.max(1);
+        // Per-connection ceiling: the configured --bitrate, or the LAN-raised
+        // value when the link measured local at accept. The controller climbs
+        // back toward THIS, so a LAN connection reclaims its full raised ceiling.
+        let ceiling = ctx.ceiling_bps.max(1);
         let now = Instant::now();
         // Cold-start guard: arm the warmup window the first time acks flow, then
         // ignore the ack-lag signal until it elapses (the connect-time startup
@@ -1801,8 +1845,8 @@ impl Gfx {
             s.connected.store(true, Ordering::Relaxed);
             s.width.store(u32::from(w), Ordering::Relaxed);
             s.height.store(u32::from(h), Ordering::Relaxed);
-            s.ceiling_bps.store(self.bitrate_bps, Ordering::Relaxed);
-            s.bitrate_bps.store(self.bitrate_bps, Ordering::Relaxed);
+            s.ceiling_bps.store(ctx.ceiling_bps, Ordering::Relaxed);
+            s.bitrate_bps.store(ctx.adaptive_target_bps, Ordering::Relaxed);
             s.fps.store(self.fps, Ordering::Relaxed);
             s.adaptive.store(self.adaptive_enabled, Ordering::Relaxed);
         }
@@ -1962,7 +2006,7 @@ impl Gfx {
                 );
                 return Ok(());
             }
-            let ready = ctx.refine.take_ready(now, REFINE_IDLE, REFINE_BUDGET_TILES);
+            let ready = ctx.refine.take_ready(now, self.refine_idle, REFINE_BUDGET_TILES);
             trace!(piggyback, ready = ready.len(), "refine: tick");
             if ready.is_empty() {
                 return Ok(());
@@ -2422,30 +2466,54 @@ impl GfxServerFactory for Gfx {
         // (set by on_ready for a no-AVC client) and its bridge (discards all
         // EGFX output while set). Per-connection: a reconnect starts fresh.
         let egfx_declined = Arc::new(AtomicBool::new(false));
-        // Link-aware setup (2026-07-05): freeze the kernel-measured TCP RTT the
-        // vendored server sampled at accept, and seed the encoder's starting
-        // bitrate from it — ceiling/3 on a slow link so the first seconds don't
-        // overshoot a distant pipe (the controller climbs back if there's
-        // headroom). Adaptive-off keeps the plain ceiling.
+        // Link-aware setup: freeze the kernel-measured TCP RTT the vendored server
+        // sampled at accept (divergence 15). Two uses, both keyed off that RTT:
+        //   (a) LAN-aware auto-ceiling (2026-10-08): on a measured-local link, with
+        //       `--bitrate` left at its default, raise this connection's ceiling to
+        //       the LAN bitrate — the conservative 6 Mbit default is Wi-Fi-safe but
+        //       leaves quality on the table on a wired LAN (muddiness on motion is
+        //       QP climbing under the cap, not the network).
+        //   (b) slow-link seed (2026-07-05): with adaptive on, seed a DISTANT link
+        //       at ceiling/3 so the first seconds don't overshoot the pipe (the
+        //       controller climbs back if there's headroom).
+        // (a) and (b) are complementary and never both fire on one link: (a) only on
+        // a local RTT, (b) only on a slow one.
         let link_rtt_ms = self.link_rtt_ms.load(Ordering::Relaxed);
+        let ceiling_bps = lan_effective_ceiling(
+            self.bitrate_bps,
+            self.bitrate_is_default,
+            link_rtt_ms,
+            self.lan_rtt_ms,
+            self.lan_bitrate_bps,
+        );
+        if ceiling_bps > self.bitrate_bps {
+            info!(
+                link_rtt_ms,
+                lan_rtt_ms = self.lan_rtt_ms,
+                ceiling_bps,
+                default_bps = self.bitrate_bps,
+                "local link measured at connect — raising the H.264 bitrate ceiling for this connection \
+                 (set --bitrate to override, or MACRDP_LAN_BITRATE=0 to disable)"
+            );
+        }
         let initial_target_bps = if self.adaptive_enabled {
             let seeded = seeded_initial_bitrate(
-                self.bitrate_bps,
+                ceiling_bps,
                 self.adaptive_floor_bps,
                 link_rtt_ms,
                 self.adaptive_seed_rtt_ms,
             );
-            if seeded < self.bitrate_bps {
+            if seeded < ceiling_bps {
                 info!(
                     link_rtt_ms,
                     seed_bps = seeded,
-                    ceiling_bps = self.bitrate_bps,
+                    ceiling_bps,
                     "slow link at connect — seeding adaptive bitrate at ceiling/3 (climbs back if the link has headroom)"
                 );
             }
             seeded
         } else {
-            self.bitrate_bps
+            ceiling_bps
         };
         *lock_ctx(&self.ctx) = Some(ConnectionContext {
             avc444: false,
@@ -2484,6 +2552,7 @@ impl GfxServerFactory for Gfx {
             last_throttle_ship: Instant::now(),
             demigrated: false,
             adaptive_target_bps: initial_target_bps,
+            ceiling_bps,
             adaptive_last_control: Instant::now(),
             adaptive_last_retransmits: self.congestion_retransmits.load(Ordering::Relaxed),
             idr_backed_off: false,
@@ -3474,6 +3543,47 @@ mod tests {
         assert_eq!(
             seeded_initial_bitrate(1_200_000, 9_000_000, 200, 50),
             1_200_000
+        );
+    }
+
+    #[test]
+    fn lan_effective_ceiling_raises_only_on_a_measured_local_link_at_default() {
+        // LAN link (rtt 1 <= threshold 5) + bitrate left at default → raised.
+        assert_eq!(
+            lan_effective_ceiling(6_000_000, true, 1, 5, 50_000_000),
+            50_000_000
+        );
+        // Exactly at the threshold still counts as LAN.
+        assert_eq!(
+            lan_effective_ceiling(6_000_000, true, 5, 5, 50_000_000),
+            50_000_000
+        );
+        // Operator set --bitrate explicitly → respected exactly, never overridden,
+        // even on a LAN and even if lower than the LAN default.
+        assert_eq!(
+            lan_effective_ceiling(12_000_000, false, 1, 5, 50_000_000),
+            12_000_000
+        );
+        assert_eq!(
+            lan_effective_ceiling(3_000_000, false, 1, 5, 50_000_000),
+            3_000_000
+        );
+        // Not a LAN (rtt above threshold) → configured default kept.
+        assert_eq!(
+            lan_effective_ceiling(6_000_000, true, 40, 5, 50_000_000),
+            6_000_000
+        );
+        // Unknown RTT (0 = kernel had no sample) → never auto-raise.
+        assert_eq!(
+            lan_effective_ceiling(6_000_000, true, 0, 5, 50_000_000),
+            6_000_000
+        );
+        // Mechanism disabled (lan_bitrate 0) → configured kept regardless.
+        assert_eq!(lan_effective_ceiling(6_000_000, true, 1, 5, 0), 6_000_000);
+        // Never drops below the configured value (LAN default misconfigured low).
+        assert_eq!(
+            lan_effective_ceiling(8_000_000, true, 1, 5, 4_000_000),
+            8_000_000
         );
     }
 

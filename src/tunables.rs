@@ -103,6 +103,7 @@ pub const ALL: &[Tunable] = &[
     // Video encoding.
     t("MACRDP_GPU_CONVERT", Bool, "1", "videotoolbox", "Convert captured frames to YUV on the GPU (same maths as the CPU path); 0 converts on the CPU."),
     t("MACRDP_H264_FULL_RANGE", Bool, "1", "videotoolbox", "Encode full-range NV12 (0 = let VideoToolbox produce video range)."),
+    t("MACRDP_H264_PROFILE", Str, "high", "videotoolbox", "H.264 profile: high (default; CABAC + 8x8 transform, sharpest motion), main, or baseline (most compatible). Changing regions look muddy on baseline; high needs no rebuild to revert."),
     t("MACRDP_H264_LENGTH_PREFIXED", Bool, "0", "h264", "Emit length-prefixed (AVCC) NAL units instead of Annex-B, for ironrdp-decoder interop."),
     t("MACRDP_H264", Bool, "1", "args", "Negotiate H.264 over EGFX. 0 keeps every session on legacy bitmaps (diagnosis)."),
     t("MACRDP_AVC_REGIONS", Bool, "1", "h264", "Send each H.264 frame with its changed regions (0 = one full-surface region, as upstream)."),
@@ -112,6 +113,8 @@ pub const ALL: &[Tunable] = &[
     t("MACRDP_ADAPTIVE_QUEUE_HIGH_MS", Float, "100", "h264", "Adaptive controller: client queue depth treated as congestion."),
     t("MACRDP_ADAPTIVE_EWMA_ALPHA", Float, "0.3", "h264", "Adaptive controller: smoothing factor for RTT and queue samples."),
     t("MACRDP_ADAPTIVE_SEED_RTT_MS", Int, "50", "h264", "Start a link at or above this RTT at a third of the bitrate ceiling (0 disables)."),
+    t("MACRDP_LAN_RTT_MS", Int, "5", "h264", "Accept-time kernel RTT (ms) at or below which a link counts as LAN for the auto bitrate ceiling."),
+    t("MACRDP_LAN_BITRATE", Int, "50", "h264", "On a LAN-class link (see MACRDP_LAN_RTT_MS), raise the H.264 ceiling to this many Mbit/s when --bitrate is left at its default. 0 disables; an explicit --bitrate always wins."),
     t("MACRDP_UDP_ADAPTIVE_BITRATE", Bool, "0", "h264", "Enable the adaptive bitrate controller (same as --adaptive-bitrate)."),
     t("MACRDP_UDP_ADAPTIVE_INTERVAL_MS", Int, "300", "h264", "Adaptive controller: evaluation interval."),
     t("MACRDP_UDP_ADAPTIVE_FLOOR_BPS", Int, "ceiling/8, min 500000", "h264", "Adaptive controller: lowest bitrate."),
