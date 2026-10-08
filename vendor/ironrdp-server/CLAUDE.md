@@ -1997,3 +1997,16 @@ channel set is byte-identical. First user: the client microphone (MS-RDPEAI).
 capability request now advertises the Printer capability, and `RdpdrHandle::print_job`
 sends one job to a redirected printer (create with an empty path, chunked writes,
 close). The Mac side (`src/rdpdr/printer.rs`) turns each printer into a CUPS queue.
+
+(29-fork) Middle mouse button mapped from the standard Mouse PDU (MacRemoteDesktop
+fork, 2026-10-08; upstreamable, closes the gap divergence 21 named). `From<MousePdu>`
+had arms for LEFT/RIGHT/VERTICAL_WHEEL and fell through to `Move` for everything else —
+so `PTRFLAGS_BUTTON3` (0x4000 `MIDDLE_BUTTON_OR_WHEEL`, the wheel CLICK, distinct from the
+0x0200 wheel rotation) was silently dropped: the input handler never saw `MiddlePressed`,
+and middle-click did nothing. Added the middle-button arm, and included
+`MIDDLE_BUTTON_OR_WHEEL` in `mouse_events_from_pdu`'s lead-`Move` so a single middle-click
+PDU with no preceding move lands at the right position (same correctness fix as 21 for
+left/right). Back/forward already arrive as `Button4/5` via `From<MouseXPdu>`; the macrdp
+input handler (`src/input/mod.rs`) now implements those as macOS `OtherMouse` events with
+button numbers 3/4 (they were a `trace!` no-op). Net: every mouse button a client sends —
+left, right, middle, back, forward — is now delivered. Upstreamable with 21.
