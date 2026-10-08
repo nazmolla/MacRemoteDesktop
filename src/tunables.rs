@@ -30,6 +30,7 @@ pub enum Kind {
     Int,
     Float,
     Path,
+    Str,
 }
 
 /// One registered variable.
@@ -60,7 +61,7 @@ const fn t(
     }
 }
 
-use Kind::{Bool, Float, Int, Path};
+use Kind::{Bool, Float, Int, Path, Str};
 
 /// Every `MACRDP_*` variable macrdp reads.
 pub const ALL: &[Tunable] = &[
@@ -118,8 +119,11 @@ pub const ALL: &[Tunable] = &[
     t("MACRDP_UDP_ADAPTIVE_DECREASE", Float, "0.7", "h264", "Adaptive controller: multiplicative decrease on congestion."),
     t("MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE", Int, "2", "h264", "Adaptive controller: UDP retransmits per interval tolerated before backing off."),
     // Blank-presentation recovery (mstsc reconnect blank; docs/known-quirks.md).
-    t("MACRDP_BLANK_RECOVERY", Bool, "0", "h264", "Detect a client that decodes but never presents, and recover it (reactivate, then drop). Opt-in: its signal misfires on some presenting clients."),
+    t("MACRDP_BLANK_RECOVERY", Bool, "1", "h264", "Detect a client that decodes but never presents (the mstsc reconnect-blank: it retains the stale EGFX surface) and heal it in place with a bare deactivation-reactivation. On by default: the recovery is non-destructive and the presented-clean latch disarms it for any client that painted the desktop at connect, so a presenting client is not force-dropped. 0 disables."),
     t("MACRDP_BLANK_RECOVERY_REACTIVATE", Bool, "1", "h264", "Recover with a bare deactivation-reactivation first (0 = drop the connection)."),
+    t("MACRDP_BROKER_BIND", Str, "0.0.0.0:3389", "broker", "Public RDP bind address for the multi-user broker (--broker)."),
+    t("MACRDP_AGENT_PORT_BASE", Int, "39000", "broker", "Base loopback port for per-user session agents; each binds base + uid%1000."),
+    t("MACRDP_PRINTERS", Bool, "1", "rdpdr", "Printer redirection: expose each client printer as a local CUPS queue."),
     t("MACRDP_BLANK_RECOVERY_MIN_QOE", Int, "24", "h264", "All-zero QoE reports needed before recovering."),
     t("MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS", Int, "3", "h264", "Consecutive nonzero render reports that count as presenting."),
     t("MACRDP_BLANK_RECOVERY_ESTABLISHED_REPORTS", Int, "40", "h264", "Nonzero run after which a session counts as established."),

@@ -820,5 +820,5 @@ pub(super) async fn shutdown_signal() {
 
 /// Client printers become local queues unless `MACRDP_PRINTERS=0`.
 fn printers_enabled() -> bool {
-    std::env::var("MACRDP_PRINTERS").map_or(true, |v| v != "0")
+    crate::tunables::var("MACRDP_PRINTERS").map_or(true, |v| v != "0")
 }
