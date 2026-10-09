@@ -20,4 +20,4 @@ Noncommercial License 1.0.0 (see LICENSE). Commercial use requires a separate
 paid licence; contact mohamed@nazmi.ca.
 
 Code that comes from macrdp, IronRDP and FreeRDP, and is unchanged, remains
-under its original MIT OR Apache-2.0 terms (LICENSE-MIT, LICENSE-APACHE).
+under its original MIT OR Apache-2.0 terms (licenses/upstream-MIT, licenses/upstream-APACHE).

@@ -5,7 +5,7 @@
 | Dependency licences | `cargo deny check licenses` | Pass. Every crate is MIT, Apache-2.0, BSD, ISC, Zlib or Unicode-3.0; no copyleft. MPL-2.0 and Unicode-DFS-2016 are allowed in `deny.toml` but unused. |
 | Known vulnerabilities | `cargo deny check advisories` (RustSec) | Pass, no advisories. |
 | Bans and sources | `cargo deny check bans sources` | 22 duplicate-version warnings (build size only). |
-| Attribution | `cargo about generate` | `THIRD-PARTY-NOTICES.html`. Ship it with the root `LICENSE-MIT` / `LICENSE-APACHE`. |
+| Attribution | `cargo about generate` | `THIRD-PARTY-NOTICES.html`. Ship it with the root `licenses/upstream-MIT` / `licenses/upstream-APACHE`. |
 | Code review (first pass) | local model over auth, credentials, TLS, auth guard, helpers, smart-card bridge, stats | 23 items flagged, 0 confirmed after manual check (`review-*.md`). A small model's pass is a weak signal; a deeper review is still worth doing. |
 | DAST | `dast.py`, `tls_probe.py`, sdl-freerdp, lsof (2026-10-02) | Pass, see below. |
 | Trademark ("Portico") | not yet run | Check USPTO / CIPO. |

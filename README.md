@@ -137,7 +137,7 @@ The source is available under the [PolyForm Noncommercial License 1.0.0](LICENSE
 
 **Commercial use needs a paid licence.** If you want to use it at or for a business, contact **mohamed@nazmi.ca**.
 
-Code taken from upstream [macrdp](https://github.com/clintcan/macrdp) and IronRDP stays under its original [MIT](LICENSE-MIT) / [Apache-2.0](LICENSE-APACHE) terms. See [NOTICE](NOTICE) for which parts are which.
+Code taken from upstream [macrdp](https://github.com/clintcan/macrdp) and IronRDP stays under its original [MIT](licenses/upstream-MIT) / [Apache-2.0](licenses/upstream-APACHE) terms. See [NOTICE](NOTICE) for which parts are which.
 
 **Contributions:** this project does not accept pull requests or other code contributions. Bug reports are welcome.
 
