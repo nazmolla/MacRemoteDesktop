@@ -10,3 +10,14 @@ licensed under MIT OR Apache-2.0.
 
 Portions of src/avc444.rs are ported from FreeRDP
 (https://github.com/FreeRDP/FreeRDP), licensed under Apache-2.0.
+
+Licensing of this fork
+----------------------
+Required Notice: Copyright (c) 2026 Mohamed Abdelsalam (mohamed@nazmi.ca)
+
+The changes and additions made in this fork are licensed under the PolyForm
+Noncommercial License 1.0.0 (see LICENSE). Commercial use requires a separate
+paid licence; contact mohamed@nazmi.ca.
+
+Code that comes from macrdp, IronRDP and FreeRDP, and is unchanged, remains
+under its original MIT OR Apache-2.0 terms (LICENSE-MIT, LICENSE-APACHE).
