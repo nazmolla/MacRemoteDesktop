@@ -7,7 +7,7 @@ Design: `docs/superpowers/specs/2026-09-29-negotiated-mac-rdp-design.md`.
 This fork is the product. It will not be merged back into clintcan/macrdp or
 IronRDP, and upstream sync is no longer a goal (owner decision, 2026-09-30).
 The vendored IronRDP crates are owned code: change them as needed and record
-the change in the crate's own `CLAUDE.md` divergence log and here.
+the change in the crate's own local `CLAUDE.md` divergence log (untracked) and here.
 
 Pulling a specific upstream fix is still possible (`git fetch upstream`,
 then cherry-pick), but expect conflicts in the files listed below.
@@ -41,3 +41,4 @@ then cherry-pick), but expect conflicts in the files listed below.
 | F24 | `display-host/macrdpdisplay.m`, `src/virtual_display/{host,host_proto,mod}.rs`, `src/capture.rs`, `src/negotiator/handler.rs`, `packaging/make-app.sh`, `src/app/args.rs`, `src/tunables.rs` | Virtual display owned by a `macrdpdisplay` helper process (on by default since 2026-10-02, verified on Windows; `MACRDP_DISPLAY_HOST=0` or a missing helper keeps it in-process); a display that can't reach the wanted mode is replaced at a connection's first display sync, never on a reactivation | One display per process and a frozen mode list after explicit selection (docs/research/2026-10-01-virtual-display-stability.md) | No |
 | F25 | `vendor/ironrdp-acceptor` | divergence (6): client monitor list on `ClientDisplayInfo` | Phase 4a multi-monitor spanning | Yes |
 | F26 | `vendor/ironrdp-server` (divergence 27), `src/audin.rs`, `src/audin_pdu.rs` | Generic extra-DVC seam; client microphone channel (MS-RDPEAI, 16-bit PCM). Audio currently logged; the macOS virtual microphone is next | Phase 4 microphone | Seam: yes |
+| F29 | `LICENSE`, `NOTICE`, `README.md` | Fork-authored changes are licensed PolyForm Noncommercial 1.0.0 (commercial use by paid licence, contact mohamed@nazmi.ca); unchanged upstream/IronRDP/FreeRDP code stays MIT OR Apache-2.0 (texts in `licenses/`). No outside contributions accepted. No donation links; upstream's Ko-fi is credited. Agent guidance files (CLAUDE.md) are untracked and git-ignored | Decided 2026-10-09: free for individuals, paid for companies | n/a (fork-only) |

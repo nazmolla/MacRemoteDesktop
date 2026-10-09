@@ -22,3 +22,8 @@ Cargo.lock.bak
 
 perf-results/
 spikes/multisession/probe/probe
+
+# Local agent guidance (kept on disk, not published)
+CLAUDE.md
+**/CLAUDE.md
+.claude/
