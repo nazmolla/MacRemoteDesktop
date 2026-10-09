@@ -4,13 +4,15 @@
 # This replaces the single-user per-user LaunchAgent (install-launchagent.sh);
 # run `bootout` on that first if it's loaded, or it will also bind the port.
 #
-# Requires sudo. Env overrides: APP_DIR (default /Applications).
+# Requires sudo. Env overrides: APP_DIR (default /Applications), BROKER_BIND
+# (public address, default 0.0.0.0:3389), SKIP_AGENT_BOOTSTRAP=1.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG_DIR="${PKG_DIR:-$REPO_ROOT/packaging}"
 APP_DIR="${APP_DIR:-/Applications}"
 PRODUCT="${PRODUCT:-Viga}"
+BROKER_BIND="${BROKER_BIND:-0.0.0.0:3389}"
 PRODUCT_ID="${PRODUCT_ID:-viga}"
 BUNDLE_PREFIX="${BUNDLE_PREFIX:-ca.nazmi}"
 LABEL="${LABEL:-$BUNDLE_PREFIX.portico}"   # TCC-keyed bundle id; keep stable.
@@ -35,7 +37,7 @@ chown root:wheel "$POLICY" "$AGENT_ENV"; chmod 644 "$POLICY" "$AGENT_ENV"
 
 render() { # template dest
     sed -e "s#__LABEL__#$LABEL#g" -e "s#__APP_DIR__#$APP_DIR#g" \
-        -e "s#__PRODUCT_ID__#$PRODUCT_ID#g" -e "s#__PRODUCT__#$PRODUCT#g" \
+        -e "s#__BROKER_BIND__#$BROKER_BIND#g" -e "s#__PRODUCT_ID__#$PRODUCT_ID#g" -e "s#__PRODUCT__#$PRODUCT#g" \
         "$1" > "$2"; chown root:wheel "$2"; chmod 644 "$2"; echo "==> wrote $2"
 }
 
@@ -59,7 +61,7 @@ done
 cat <<EOF
 
 Multi-user stack installed.
-  Broker:   $BROKER_PLIST  (public 0.0.0.0:3389)
+  Broker:   $BROKER_PLIST  (public $BROKER_BIND)
   Agent:    $AGENT_PLIST   (per-session, loopback 39000+uid%1000)
   Policy:   $POLICY
 Edit $POLICY (or use the menu-bar app) to set PRIMARY_USER and MULTI_USER=1.

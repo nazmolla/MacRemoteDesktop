@@ -35,7 +35,7 @@
         <string>info</string>
         <!-- Public bind (standard RDP port; root can bind it). -->
         <key>MACRDP_BROKER_BIND</key>
-        <string>0.0.0.0:3389</string>
+        <string>__BROKER_BIND__</string>
         <!-- Root-owned owner policy: PRIMARY_USER / MULTI_USER / ALLOWED_USERS. -->
         <key>VIGA_POLICY_FILE</key>
         <string>/Library/Application Support/__PRODUCT__/policy.env</string>
