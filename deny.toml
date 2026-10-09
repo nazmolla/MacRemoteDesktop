@@ -72,7 +72,7 @@ allow-git = [
 
 [licenses]
 # NOT run in the daily CI gate (see the header note); kept so a local
-# `cargo deny check licenses` is meaningful. macrdp itself is MIT OR Apache-2.0;
+# `cargo deny check licenses` is meaningful. macrdp upstream is MIT OR Apache-2.0 (this fork: PolyForm Noncommercial, see LICENSE);
 # this is the permissive set its dependency tree uses.
 version = 2
 confidence-threshold = 0.9

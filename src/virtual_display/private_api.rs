@@ -98,6 +98,48 @@ pub(super) fn screen_is_locked() -> Option<bool> {
     }
 }
 
+/// Whether THIS process's GUI session is the one on the physical console,
+/// read from `CGSessionCopyCurrentDictionary()`'s `kCGSSessionOnConsoleKey`
+/// (CFBoolean). Same undocumented SkyLight call as [`screen_is_locked`].
+///
+/// Load-bearing for multi-user: a virtual display can only be *activated* in
+/// the console session (WindowServer refuses `_CGXVirtualDisplayCreate` with
+/// "not allowed in off-console session" for a background Fast-User-Switching
+/// session — verified in the macOS 27 VM), and that refusal needs the private
+/// `com.apple.private.SkyLight.virtualdisplay` entitlement to lift, which third
+/// parties can't get. So the negotiator must pick the native-framebuffer
+/// (mirror + resize) path for a background session instead. Returns `None` if
+/// the lookup fails (treated by callers as "assume console", the safe default
+/// that preserves the existing single-session behaviour).
+pub(super) fn session_is_on_console() -> Option<bool> {
+    // SAFETY: identical contract to `screen_is_locked` above — `name` outlives
+    // dlsym; the symbol is only called when found, with its no-argument
+    // signature; the returned +1 dictionary is null-checked, read with a
+    // CFString key that outlives the lookup, and released exactly once.
+    unsafe {
+        let rtld_default = -2isize as *mut c_void;
+        let name = CString::new("CGSessionCopyCurrentDictionary").unwrap();
+        let sym = libc::dlsym(rtld_default, name.as_ptr());
+        if sym.is_null() {
+            return None;
+        }
+        let copy_dict: unsafe extern "C" fn() -> CFTypeRef = std::mem::transmute(sym);
+        let dict = copy_dict();
+        if dict.is_null() {
+            return None;
+        }
+        let key = CFString::new("kCGSSessionOnConsoleKey");
+        let value = CFDictionaryGetValue(dict, key.as_concrete_TypeRef() as CFTypeRef);
+        let on_console = if value.is_null() {
+            None
+        } else {
+            Some(CFBooleanGetValue(value) != 0)
+        };
+        CFRelease(dict);
+        on_console
+    }
+}
+
 /// `CGSConfigureDisplayEnabled(config, display, enabled)` — undocumented
 /// SkyLight symbol re-exported from CoreGraphics on macOS 26. Called
 /// between `CGBeginDisplayConfiguration` / `CGCompleteDisplayConfiguration`

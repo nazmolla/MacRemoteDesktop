@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Multi-user SESSION AGENT (LaunchAgent). Installed to
+  /Library/LaunchAgents/<label>.agent.plist so launchd starts ONE copy inside
+  EVERY logged-in GUI session — console and background (Fast User Switching) —
+  because of LimitLoadToSessionType=Aqua. Each copy runs as that user and, with
+  --session-agent, binds a loopback-only port derived from its own uid
+  (127.0.0.1:39000+uid%1000); the broker finds it from the uid. The agent does
+  the full RDP handshake + PAM/NLA auth, and capture: on the console it gets a
+  virtual display, in a background session it auto-falls back to
+  native-framebuffer capture + resize (see virtual_display::session_is_on_console).
+  TCC (Screen Recording + Accessibility) must be granted to __PRODUCT__.app
+  (system TCC or an MDM PPPC profile), which carries to every session. __LABEL__,
+  __APP_DIR__, __PRODUCT__, __PRODUCT_ID__ substituted by install-multiuser.sh.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__.agent</string>
+
+    <!-- Aqua only: one agent per logged-in GUI session (the in-session launch
+         that makes SCK capture THAT session, unlike `launchctl asuser`). -->
+    <key>LimitLoadToSessionType</key>
+    <array><string>Aqua</string></array>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__APP_DIR__/__PRODUCT__.app/Contents/MacOS/__PRODUCT_ID__</string>
+        <string>--session-agent</string>
+        <string>--config</string>
+        <string>/Library/Application Support/__PRODUCT__/agent.env</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/__PRODUCT_ID__-agent.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>

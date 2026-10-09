@@ -3,9 +3,8 @@
 
 # macrdp
 
-[![Latest release](https://img.shields.io/github/v/release/clintcan/macrdp?sort=semver&label=release)](https://github.com/clintcan/macrdp/releases/latest)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
-[![Ko-fi](https://img.shields.io/badge/Ko--fi-buy%20me%20a%20coffee-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/clintcan)
+[![Latest release](https://img.shields.io/github/v/release/nazmolla/MacRemoteDesktop?sort=semver&label=release)](https://github.com/nazmolla/MacRemoteDesktop/releases/latest)
+[![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue)](#license)
 
 A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac↔Windows file copy, **read-write drive redirection** (mount the client's drives in Finder), **smart-card redirection** (use the client's smart card from macOS apps), system audio forwarding, and optional H.264 video (EGFX/AVC420, hardware-encoded). NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
 
@@ -121,7 +120,6 @@ Both are **ad-hoc signed, not notarized** — open the app once via **right-clic
 | **[Audit log & SIEM](docs/audit-log.md)** | The security audit events (accept / reject / auth / disconnect) — every field and how to interpret them — plus [forwarding the JSON stream](docs/siem-forwarding.md) to a SIEM/SOC collector (Vector / Fluent Bit / rsyslog) and a runnable [OpenSearch SIEM tutorial](docs/siem-tutorial.md) that detects an RDP brute-force end-to-end. |
 | **[vs. other OSS RDP servers](docs/oss-rdp-server-comparison.md)** | Two parts. **Part 1** — the evidence behind every "first" claim in these docs, verified adversarially against FreeRDP/xrdp and re-checked in the source, including what macrdp is **not** first at and how to re-verify when upstreams move. **Part 2** — an honest head-to-head against the other native macOS RDP servers (`x6nux/macrdp`, `RDPonMAC`), written steelmanning theirs, including where they beat us. |
 | **[Release history](docs/release-history.md)** | Per-release narrative of what shipped and what was live-verified. |
-| [CLAUDE.md](CLAUDE.md) | Developer/agent index — current release, plus pointers to the feature list, architecture, macOS gotchas and known quirks. |
 
 ## Why this was made
 
@@ -129,12 +127,18 @@ This was done to scratch an itch. There are practically no active open source RD
 
 ## Support this project
 
-macrdp is free and open source. If it's helped you out, you can buy me a coffee to help me get through the bumps — totally optional, no pressure.
+Free for personal and other noncommercial use.
 
-- ☕ **[Buy me a coffee on Ko-fi](https://ko-fi.com/clintcan)**
+The original macrdp is by Clint Canada ([Ko-fi](https://ko-fi.com/clintcan)).
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option. Being permissively licensed, a productized/notarized build may be sold commercially with support — that's selling the product, not a license exemption.
+The source is available under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, modify and share it for noncommercial purposes: personal use, hobby projects, research, education and charities.
+
+**Commercial use needs a paid licence.** If you want to use it at or for a business, contact **mohamed@nazmi.ca**.
+
+Code taken from upstream [macrdp](https://github.com/clintcan/macrdp) and IronRDP stays under its original [MIT](LICENSE-MIT) / [Apache-2.0](LICENSE-APACHE) terms. See [NOTICE](NOTICE) for which parts are which.
+
+**Contributions:** this project does not accept pull requests or other code contributions. Bug reports are welcome.
 
 [IronRDP]: https://github.com/Devolutions/IronRDP

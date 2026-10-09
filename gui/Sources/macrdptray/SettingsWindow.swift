@@ -132,7 +132,7 @@ extension AppController {
 /// The settings categories — shown all-at-once in the sidebar AND as a "Section"
 /// menu in the main menu bar (each drives `SettingsModel.section`).
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case status, connection, video, audio, display, input, redirection, advanced, permissions
+    case status, connection, video, audio, display, input, redirection, multiuser, advanced, permissions
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -143,6 +143,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .display: return "Display"
         case .input: return "Input"
         case .redirection: return "Redirection"
+        case .multiuser: return "Multi-user"
         case .advanced: return "Advanced"
         case .permissions: return "Permissions"
         }
@@ -156,6 +157,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .display: return "display"
         case .input: return "keyboard"
         case .redirection: return "arrow.left.arrow.right"
+        case .multiuser: return "person.2"
         case .advanced: return "gearshape.2"
         case .permissions: return "lock.shield"
         }
@@ -209,6 +211,7 @@ struct SettingsView: View {
         case .display: DisplayTab(model: model)
         case .input: InputTab(model: model)
         case .redirection: RedirectionTab(model: model)
+        case .multiuser: MultiUserTab(model: model)
         case .advanced: AdvancedTab(model: model)
         case .permissions: PermissionsTab(model: model)
         }
@@ -277,6 +280,69 @@ private struct ConnectionTab: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+private struct MultiUserTab: View {
+    @ObservedObject var model: SettingsModel
+    @State private var multiUser = false
+    @State private var primaryUser = ""
+    @State private var allowedUsers = ""
+    @State private var loaded = false
+    @State private var status = ""
+    var body: some View {
+        Form {
+            Section("Multiple users") {
+                Toggle("Enable multi-user", isOn: $multiUser)
+                Text("Off: only the primary user (or whoever is on the console) is served; "
+                    + "other users are turned away. On: a user connecting while another is "
+                    + "active gets their own session. Additional (non-console) users are served "
+                    + "at their session's native resolution with no audio — a macOS limitation "
+                    + "that applies to every third-party remote-desktop app.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Section("Primary user") {
+                TextField("account short name (optional)", text: $primaryUser)
+                    .textFieldStyle(.roundedBorder)
+                Text("Always gets the full treatment: its own virtual display, dynamic "
+                    + "resolution, HiDPI and audio. Leave blank for no designated primary.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Section("Allow-list (optional)") {
+                TextField("comma-separated short names", text: $allowedUsers)
+                    .textFieldStyle(.roundedBorder)
+                Text("If set, only these accounts may connect at all. Blank = any account that "
+                    + "passes authentication.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Section {
+                Button("Save Policy… (requires admin)") {
+                    let ok = model.controller.writePolicy(
+                        primaryUser: primaryUser.trimmingCharacters(in: .whitespaces),
+                        multiUser: multiUser,
+                        allowedUsers: allowedUsers.trimmingCharacters(in: .whitespaces))
+                    status = ok
+                        ? "Saved — the broker applies it on the next connection."
+                        : "Not saved (cancelled or the multi-user stack isn't installed)."
+                }
+                if !status.isEmpty {
+                    Text(status).font(.caption).foregroundColor(.secondary)
+                }
+                Text("The broker reads /Library/Application Support/Viga/policy.env on each "
+                    + "connection, so changes take effect without a restart. Requires the "
+                    + "multi-user stack (packaging/install-multiuser.sh).")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear {
+            guard !loaded else { return }
+            let p = model.controller.readPolicy()
+            multiUser = (p["MULTI_USER"] ?? "0") == "1"
+            primaryUser = p["PRIMARY_USER"] ?? ""
+            allowedUsers = p["ALLOWED_USERS"] ?? ""
+            loaded = true
+        }
     }
 }
 

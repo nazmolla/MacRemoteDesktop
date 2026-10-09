@@ -333,7 +333,7 @@ mod macos {
     use ironrdp_pdu::input::fast_path::SynchronizeFlags;
     use ironrdp_server::{KeyboardEvent, MouseEvent};
     use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
-    use tracing::{debug, trace, warn};
+    use tracing::{debug, warn};
 
     mod ax;
     mod focus;
@@ -1218,12 +1218,13 @@ mod macos {
                 MouseEvent::MiddleReleased => self.button(CGMouseButton::Center, false),
                 MouseEvent::VerticalScroll { value } => self.scroll(i32::from(value), 0),
                 MouseEvent::Scroll { x, y } => self.scroll(y, x),
-                MouseEvent::Button4Pressed
-                | MouseEvent::Button4Released
-                | MouseEvent::Button5Pressed
-                | MouseEvent::Button5Released => {
-                    trace!(?event, "extra mouse buttons not implemented");
-                }
+                // Side buttons. macOS NSEvent button numbers: 3 = back,
+                // 4 = forward (0=left, 1=right, 2=middle). Apps that honor
+                // them (browsers, Finder) navigate back/forward.
+                MouseEvent::Button4Pressed => self.other_button(3, true),
+                MouseEvent::Button4Released => self.other_button(3, false),
+                MouseEvent::Button5Pressed => self.other_button(4, true),
+                MouseEvent::Button5Released => self.other_button(4, false),
                 MouseEvent::RelMove { x, y } => self.move_rel(x, y),
             }
         }
@@ -1292,6 +1293,32 @@ mod macos {
             else {
                 return;
             };
+            ev.post(CGEventTapLocation::HID);
+        }
+
+        /// Post a higher-numbered mouse button (back = 3, forward = 4, or any
+        /// further button a multi-button mouse sends). macOS routes these as
+        /// `OtherMouse{Down,Up}` carrying the button number in
+        /// `MOUSE_EVENT_BUTTON_NUMBER`; the `CGMouseButton` arg is ignored for
+        /// OtherMouse once that field is set. No double-click/drag tracking —
+        /// side buttons are momentary navigation, not selection.
+        fn other_button(&mut self, button_number: i64, down: bool) {
+            let etype = if down {
+                CGEventType::OtherMouseDown
+            } else {
+                CGEventType::OtherMouseUp
+            };
+            let Ok(ev) = CGEvent::new_mouse_event(
+                self.source.clone(),
+                etype,
+                CGPoint::new(self.last_x, self.last_y),
+                CGMouseButton::Center,
+            ) else {
+                warn!("CGEvent side-button create failed");
+                return;
+            };
+            ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button_number);
+            ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
             ev.post(CGEventTapLocation::HID);
         }
 

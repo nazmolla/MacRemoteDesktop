@@ -160,6 +160,17 @@ impl From<MousePdu> for MouseEvent {
             } else {
                 MouseEvent::RightReleased
             }
+        } else if value.flags.contains(PointerFlags::MIDDLE_BUTTON_OR_WHEEL) {
+            // PTRFLAGS_BUTTON3 (0x4000): the middle button (wheel click) was
+            // pressed/released — distinct from VERTICAL_WHEEL (0x0200) rotation
+            // below. Without this arm a middle-click PDU matched none of the
+            // button flags and fell through to `Move`, so middle-click was
+            // silently dropped (input handler never saw MiddlePressed).
+            if value.flags.contains(PointerFlags::DOWN) {
+                MouseEvent::MiddlePressed
+            } else {
+                MouseEvent::MiddleReleased
+            }
         } else if value.flags.contains(PointerFlags::VERTICAL_WHEEL) {
             // NO correction here — see the retired divergence (17). ironrdp-pdu
             // used to decode the 9-bit WheelRotationMask as sign-magnitude
@@ -198,10 +209,9 @@ impl From<MousePdu> for MouseEvent {
 /// without this its taps register at the previous cursor position (clicks
 /// "not working" / aim off). Plain move and wheel PDUs are unchanged.
 pub(crate) fn mouse_events_from_pdu(pdu: MousePdu) -> impl Iterator<Item = MouseEvent> {
-    let lead = if pdu
-        .flags
-        .intersects(PointerFlags::LEFT_BUTTON | PointerFlags::RIGHT_BUTTON)
-    {
+    let lead = if pdu.flags.intersects(
+        PointerFlags::LEFT_BUTTON | PointerFlags::RIGHT_BUTTON | PointerFlags::MIDDLE_BUTTON_OR_WHEEL,
+    ) {
         Some(MouseEvent::Move {
             x: pdu.x_position,
             y: pdu.y_position,

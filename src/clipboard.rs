@@ -162,18 +162,25 @@ fn plan_remote_fetch(formats: &[ClipboardFormat], rich: bool) -> RemotePlan {
     }
 }
 
-/// Everything fetched so far for the current remote copy.
+/// Everything fetched so far for the current remote copy. The image is kept as
+/// the RAW DIB bytes (not decoded) — the DIB→PNG conversion is expensive for a
+/// full-screen screenshot (Print Screen), and decoding it inline on the single
+/// shared RDP dispatch task would stall video until it finished. `publish_fetched`
+/// offloads the decode to a blocking thread instead.
 #[derive(Debug, Default)]
 struct Collected {
     text: Option<String>,
     html: Option<String>,
     rtf: Option<Vec<u8>>,
-    png: Option<Vec<u8>>,
+    image_dib: Option<Vec<u8>>,
 }
 
 impl Collected {
     fn is_empty(&self) -> bool {
-        self.text.is_none() && self.html.is_none() && self.rtf.is_none() && self.png.is_none()
+        self.text.is_none()
+            && self.html.is_none()
+            && self.rtf.is_none()
+            && self.image_dib.is_none()
     }
 }
 
@@ -740,20 +747,51 @@ impl MacCliprdrBackend {
             text = got.text.as_ref().map(String::len),
             html = got.html.as_ref().map(String::len),
             rtf = got.rtf.as_ref().map(Vec::len),
-            image = got.png.as_ref().map(Vec::len),
+            image_dib = got.image_dib.as_ref().map(Vec::len),
             "writing remote clipboard to NSPasteboard"
         );
         #[cfg(target_os = "macos")]
-        let mark = &*self.remote_write_cc;
+        let mark = self.remote_write_cc.clone();
         #[cfg(not(target_os = "macos"))]
-        let mark = &std::sync::atomic::AtomicI64::new(-1);
-        pb::write_items(
-            got.text.as_deref(),
-            got.html.as_deref(),
-            got.rtf.as_deref(),
-            got.png.as_deref(),
-            mark,
-        );
+        let mark = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+
+        // Fast path: no image → nothing expensive to decode, publish inline.
+        let Some(dib) = got.image_dib else {
+            pb::write_items(
+                got.text.as_deref(),
+                got.html.as_deref(),
+                got.rtf.as_deref(),
+                None,
+                &mark,
+            );
+            return;
+        };
+
+        // Image present: decode the DIB on a blocking thread so the shared RDP
+        // dispatch task (video, audio, clipboard) is never stalled by a
+        // full-screen Print-Screen bitmap, then publish the complete item. The
+        // text/html/rtf ride along so a copy that carried both (e.g. Chrome
+        // "Copy Image", which also puts HTML on the clipboard) stays one item.
+        let (text, html, rtf) = (got.text, got.html, got.rtf);
+        tokio::spawn(async move {
+            let png = tokio::task::spawn_blocking(move || dib_to_png(&dib))
+                .await
+                .ok()
+                .and_then(|r| match r {
+                    Ok(png) => Some(png),
+                    Err(e) => {
+                        warn!("DIB decode failed: {e}");
+                        None
+                    }
+                });
+            pb::write_items(
+                text.as_deref(),
+                html.as_deref(),
+                rtf.as_deref(),
+                png.as_deref(),
+                &mark,
+            );
+        });
     }
 
     /// Serve a single FileContentsRequest against the path snapshot built
@@ -1230,10 +1268,9 @@ impl CliprdrBackend for MacCliprdrBackend {
                     }
                 }
             }
-            Some(Want::Image(_)) => match dib_to_png(data) {
-                Ok(png) => self.fetch.got.png = Some(png),
-                Err(e) => warn!("DIB decode failed: {e}"),
-            },
+            // Keep the raw DIB; decoding (expensive for a Print-Screen-sized
+            // bitmap) is deferred to publish_fetched off the dispatch task.
+            Some(Want::Image(_)) => self.fetch.got.image_dib = Some(data.to_vec()),
             Some(Want::Html(_)) => match crate::clipboard_rich::decode_cf_html(data) {
                 Some(html) => self.fetch.got.html = Some(html),
                 None => warn!(

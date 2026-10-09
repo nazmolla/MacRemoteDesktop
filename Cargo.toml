@@ -3,7 +3,7 @@ name = "macrdp"
 version = "0.9.9"
 edition = "2021"
 description = "Native RDP server for macOS"
-license = "MIT OR Apache-2.0"
+license-file = "LICENSE"
 publish = false
 
 [[bin]]

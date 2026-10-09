@@ -12,6 +12,21 @@ pub(super) struct Args {
     #[arg(long, default_value = "127.0.0.1:3390")]
     pub(super) bind: SocketAddr,
 
+    /// Run as a per-user **session agent** behind the multi-user broker: bind a
+    /// loopback-only port derived from this process's own uid
+    /// (`127.0.0.1:(39000 + uid % 1000)`), overriding `--bind`. One shared Aqua
+    /// LaunchAgent plist can then serve every logged-in user — each copy binds
+    /// its own port and the broker finds it from the uid. macOS multi-user.
+    #[arg(long)]
+    pub(super) session_agent: bool,
+
+    /// Run as the multi-user **broker** (root LaunchDaemon): route public
+    /// connections to per-user session agents by mstshash cookie. Handled in
+    /// `main` before any capture/display setup; listed here so `--help` shows it
+    /// and clap accepts it. See `src/broker/`.
+    #[arg(long)]
+    pub(super) broker: bool,
+
     /// Desktop width in pixels. Defaults to the primary display's native width
     /// (queried via ScreenCaptureKit). Overriding to a non-native size makes
     /// SCK scale internally; we then disable dirty-rect updates and ship a
@@ -1025,7 +1040,21 @@ pub(super) fn resolve() -> Result<(Args, Vec<String>)> {
     // If launched with `--config <file>` (the LaunchAgent path), the file is the
     // sole source of truth — rebuild Args from it.
     if let Some(cfg_path) = args.config.clone() {
+        let session_agent = args.session_agent; // CLI flag survives a config rebuild
         args = args_from_config(&cfg_path)?;
+        args.session_agent = args.session_agent || session_agent;
+    }
+    // Session-agent mode: bind the uid-derived loopback port so the broker can
+    // reach exactly this user's agent. Overrides whatever --bind/config set.
+    if args.session_agent {
+        let base: u16 = crate::tunables::var("MACRDP_AGENT_PORT_BASE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(39000);
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let port = base.wrapping_add((uid % 1000) as u16);
+        args.bind = SocketAddr::from(([127, 0, 0, 1], port));
     }
     let negotiation_reasons = if crate::tunables::var("MACRDP_NEGOTIATE").as_deref() == Ok("0") {
         vec!["negotiation disabled (MACRDP_NEGOTIATE=0): flags only".to_owned()]

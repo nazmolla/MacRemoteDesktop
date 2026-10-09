@@ -104,6 +104,19 @@ impl Encoder {
         // region rects, so the client never shows the extra row.
         let height = height + (height & 1);
         let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
+        // Color handling is driven by what the wire can express, not by any
+        // client display gamut (base RDP carries none) and not by the Mac's own
+        // monitor: the one place color IS signalled is the H.264 VUI, which we
+        // tag BT.709 (primaries/transfer/matrix, in create_session) at the range
+        // chosen here. Log it per encoder so the color decision is attributable.
+        tracing::info!(
+            color_primaries = "BT.709",
+            transfer = "BT.709",
+            matrix = "BT.709",
+            range = if full_range { "full" } else { "video" },
+            bitrate_bps,
+            "H.264 color: tagging the bitstream VUI (clients color-manage from this tag; no gamut conversion applied)"
+        );
         Ok(Self {
             inner: session,
             rx: Some(rx),
@@ -379,6 +392,10 @@ mod ffi {
         pub(super) static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
+        // Main/High add CABAC + (High) the 8x8 transform — markedly better
+        // quality on motion at the same bitrate than Baseline, which has neither.
+        pub(super) static kVTProfileLevel_H264_Main_AutoLevel: CFStringRef;
+        pub(super) static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
         // Color-space signaling so the encoded SPS VUI describes its color
         // space explicitly instead of leaving the decoder to guess (which is
@@ -581,11 +598,34 @@ mod ffi {
             // change (keystroke / caret) renders "one behind" until you type
             // again. Best-effort: ignore if a VT version rejects the value.
             let _ = set_i32(session, kVTCompressionPropertyKey_MaxFrameDelayCount, 0);
-            set_string(
-                session,
-                kVTCompressionPropertyKey_ProfileLevel,
-                kVTProfileLevel_H264_Baseline_AutoLevel,
-            )?;
+            // H.264 profile. Default High: CABAC + the 8x8 transform give
+            // markedly sharper MOTION at the same bitrate than Baseline (which
+            // has neither), which is the muddiness on changing regions. Baseline
+            // was the original conservative choice; every modern RDP AVC420
+            // decoder (mstsc, Windows App, FreeRDP) handles High. Revert with
+            // MACRDP_H264_PROFILE=baseline (or =main) if a client chokes — no
+            // rebuild needed. Falls back to the next AutoLevel VT accepts.
+            let (profile, profile_name) =
+                match crate::tunables::var("MACRDP_H264_PROFILE").as_deref() {
+                    Ok("baseline") => (kVTProfileLevel_H264_Baseline_AutoLevel, "baseline"),
+                    Ok("main") => (kVTProfileLevel_H264_Main_AutoLevel, "main"),
+                    _ => (kVTProfileLevel_H264_High_AutoLevel, "high"),
+                };
+            if set_string(session, kVTCompressionPropertyKey_ProfileLevel, profile).is_err() {
+                // Some VT versions / HW may reject High; fall back to Baseline
+                // rather than fail the whole encoder.
+                tracing::warn!(
+                    profile_name,
+                    "VideoToolbox rejected the H.264 profile — falling back to baseline"
+                );
+                set_string(
+                    session,
+                    kVTCompressionPropertyKey_ProfileLevel,
+                    kVTProfileLevel_H264_Baseline_AutoLevel,
+                )?;
+            } else {
+                tracing::info!(profile = profile_name, "H.264 profile selected");
+            }
             // Tag the bitstream's color space explicitly (BT.709). Without this
             // VideoToolbox leaves the SPS VUI under-specified and each decoder
             // guesses: FreeRDP guessed right, mstsc guessed wrong and raised the

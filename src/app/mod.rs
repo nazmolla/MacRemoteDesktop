@@ -89,6 +89,23 @@ pub(crate) async fn run() -> Result<()> {
 
     init_logging(&args, &negotiation_reasons);
 
+    // Multi-user: report which kind of GUI session this agent landed in. On the
+    // console the full virtual-display path is available; a background
+    // (Fast-User-Switching) session can't activate a virtual display, so the
+    // negotiator falls back to native-framebuffer capture + resize (see
+    // `virtual_display::virtual_display_available`). Audio still works in a
+    // background session — ScreenCaptureKit delivers system audio off-console
+    // (verified in the VM) — but SCK audio is system-wide, so with several
+    // active users it is NOT per-session isolated. Purely informational.
+    #[cfg(target_os = "macos")]
+    match virtual_display::session_is_on_console() {
+        Some(true) => info!("session: on the physical console — full virtual-display path available"),
+        Some(false) => info!(
+            "session: background (off-console) — native-framebuffer capture + resize + system audio (not per-session isolated); no virtual display"
+        ),
+        None => {}
+    }
+
     // Sweep leftovers from a PRIOR macrdp that died uncleanly (SIGKILL / panic /
     // power-loss skip Drop AND the signal handler, stranding NFS mounts + paste
     // temp dirs). Dead-pid-gated so it's safe with another instance live; on a
@@ -434,6 +451,10 @@ pub(crate) async fn run() -> Result<()> {
             args.adaptive_bitrate,
             congestion_retransmits.clone(),
             link_rtt_ms.clone(),
+            // LAN-aware auto-ceiling applies only when --bitrate was left at its
+            // clap default (6). Any explicit value — even a coincidental 6 — is
+            // respected exactly; to force 6 on a LAN, set MACRDP_LAN_BITRATE=0.
+            args.bitrate == 6,
         )
     });
 
@@ -803,5 +824,5 @@ pub(super) async fn shutdown_signal() {
 
 /// Client printers become local queues unless `MACRDP_PRINTERS=0`.
 fn printers_enabled() -> bool {
-    std::env::var("MACRDP_PRINTERS").map_or(true, |v| v != "0")
+    crate::tunables::var("MACRDP_PRINTERS").map_or(true, |v| v != "0")
 }
